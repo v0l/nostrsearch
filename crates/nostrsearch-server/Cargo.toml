@@ -1,0 +1,25 @@
+[package]
+name = "nostrsearch-server"
+description = "REST search API + shard fan-out over the Nostr Tantivy indices"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nostrsearch-core = { path = "../nostrsearch-core" }
+tantivy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+chrono.workspace = true
+hex.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
+nostrsearch-indexer = { path = "../nostrsearch-indexer" }

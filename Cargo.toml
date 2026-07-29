@@ -1,0 +1,46 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/nostrsearch-core",
+    "crates/nostrsearch-indexer",
+    "crates/nostrsearch-server",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/v0l/nostrsearch"
+
+[workspace.dependencies]
+# --- core ---
+tantivy = "0.24"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+hex = "0.4"
+bech32 = "0.11"
+chrono = { version = "0.4", features = ["serde"] }
+
+# --- async / server ---
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.8" }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+futures = "0.3"
+
+# --- ingest ---
+zstd = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "gzip"] }
+tokio-util = { version = "0.7", features = ["io", "codec"] }
+bytes = "1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = 3
+# keep symbols for profiling the hot path
+debug = false
+panic = "abort"

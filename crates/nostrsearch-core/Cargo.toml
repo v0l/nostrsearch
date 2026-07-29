@@ -1,0 +1,15 @@
+[package]
+name = "nostrsearch-core"
+description = "Core Nostr event schema, Tantivy index definition, and NIP-50 query planning"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tantivy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+hex.workspace = true
+chrono.workspace = true

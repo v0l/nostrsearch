@@ -1,0 +1,23 @@
+[package]
+name = "nostrsearch-indexer"
+description = "Parallel JSONL ingest + time-sharded Tantivy index writer for Nostr events"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nostrsearch-core = { path = "../nostrsearch-core" }
+tantivy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+zstd.workspace = true
+bytes.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
