@@ -14,10 +14,10 @@ thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tokio.workspace = true
-zstd.workspace = true
 bytes.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 tracing-subscriber.workspace = true
+nostr-archive-cursor = { git = "https://github.com/v0l/nostr-archive-cursor.git", default-features = false, features = ["sync"] }
 
 [dev-dependencies]
 tempfile = "3"

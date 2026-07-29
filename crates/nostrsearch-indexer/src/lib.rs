@@ -2,13 +2,14 @@
 //!
 //! Turns hole.v0l.io JSONL dumps into time-sharded Tantivy indices.
 //!
-//! Pipeline:
+//! Event reading is delegated to `nostr-archive-cursor` (`NostrCursor`), which
+//! walks a directory of `.jsonl`/`.json`/`.zst`/`.gz`/`.bz2` dumps with
+//! parallel chunked reads and event-id dedup. This crate owns the write side:
 //!
 //! ```text
-//! .jsonl(.zst) ──► parse (parallel) ──► route by created_at ──► ShardWriter
-//!                                                            (one per month,
-//!                                                             own IndexWriter,
-//!                                                             scheduled commit)
+//! NostrCursor ──► route by created_at ──► ShardWriter
+//!                                        (one per month, own IndexWriter,
+//!                                         scheduled commit)
 //! ```
 //!
 //! Key properties vs. the naive single-index approach:
@@ -21,7 +22,5 @@
 //!   between them keeps memory flat over a 763 GiB corpus.
 
 pub mod shard_writer;
-pub mod source;
 
 pub use shard_writer::{ShardManager, ShardWriterConfig};
-pub use source::{EventStream, JsonlSource};

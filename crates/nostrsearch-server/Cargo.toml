@@ -23,3 +23,4 @@ hex.workspace = true
 [dev-dependencies]
 tempfile = "3"
 nostrsearch-indexer = { path = "../nostrsearch-indexer" }
+nostr-archive-cursor = { git = "https://github.com/v0l/nostr-archive-cursor.git", default-features = false, features = ["sync"] }

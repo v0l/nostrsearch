@@ -1,16 +1,16 @@
-//! Ingest CLI: load hole.v0l.io JSONL dumps into sharded Tantivy indices.
+//! Ingest CLI: load Nostr JSONL archives into sharded Tantivy indices.
+//!
+//! Uses `nostr-archive-cursor` (`NostrCursor`) to walk a directory of dumps —
+//! handling `.jsonl`/`.json`/`.zst`/`.gz`/`.bz2`, parallel chunked reads, and
+//! event-id dedup — and routes each event into the time-sharded `ShardManager`.
 //!
 //! Usage:
-//!   ingest --index-root ./data/index --input /path/to/events_20260715.jsonl[.zst]
-//!   ingest --index-root ./data/index --input-dir /path/to/dumps/
-//!   ingest --index-root ./data/index --url https://hole.v0l.io/events_20260714.jsonl.zst
-//!
-//! Multiple inputs are processed in parallel (one worker per file), each
-//! routing events into the shared ShardManager. Because shards are per-month
-//! and each owns its writer, parallelism scales with cores, not lock
-//! contention.
+//!   ingest --index-root ./data/index --input-dir /core/Backup/nostr/source
+//!   ingest --index-root ./data/index --input-dir ./dumps --parallelism 8 --no-dedupe
 
-use nostrsearch_indexer::{EventStream, JsonlSource, ShardManager, ShardWriterConfig};
+use nostr_archive_cursor::NostrCursor;
+use nostrsearch_core::event::NostrEvent;
+use nostrsearch_indexer::{ShardManager, ShardWriterConfig};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -19,34 +19,34 @@ use std::time::Instant;
 #[derive(Debug)]
 struct Args {
     index_root: PathBuf,
-    inputs: Vec<PathBuf>,
-    input_dir: Option<PathBuf>,
-    urls: Vec<String>,
+    input_dir: PathBuf,
     heap_mb: usize,
     commit_docs: u64,
-    max_open_shards: usize,
+    parallelism: usize,
+    chunk_size: usize,
+    dedupe: bool,
 }
 
 impl Args {
     fn parse() -> Result<Self, String> {
         let mut index_root = PathBuf::from("./data/index");
-        let mut inputs = Vec::new();
         let mut input_dir = None;
-        let mut urls = Vec::new();
-        let mut heap_mb = 256usize;
-        let mut commit_docs = 100_000u64;
-        let mut max_open_shards = 8usize;
+        let mut heap_mb = 512usize;
+        let mut commit_docs = 200_000u64;
+        let mut parallelism = 0usize; // 0 = auto
+        let mut chunk_size = 2_000usize;
+        let mut dedupe = true;
 
         let mut it = std::env::args().skip(1);
         while let Some(a) = it.next() {
             match a.as_str() {
                 "--index-root" => index_root = PathBuf::from(it.next().ok_or("--index-root value")?),
-                "--input" => inputs.push(PathBuf::from(it.next().ok_or("--input value")?)),
                 "--input-dir" => input_dir = Some(PathBuf::from(it.next().ok_or("--input-dir value")?)),
-                "--url" => urls.push(it.next().ok_or("--url value")?),
                 "--heap-mb" => heap_mb = it.next().ok_or("--heap-mb value")?.parse().map_err(|_| "bad heap")?,
                 "--commit-docs" => commit_docs = it.next().ok_or("--commit-docs value")?.parse().map_err(|_| "bad commit-docs")?,
-                "--max-open-shards" => max_open_shards = it.next().ok_or("--max-open-shards value")?.parse().map_err(|_| "bad max-open-shards")?,
+                "--parallelism" => parallelism = it.next().ok_or("--parallelism value")?.parse().map_err(|_| "bad parallelism")?,
+                "--chunk-size" => chunk_size = it.next().ok_or("--chunk-size value")?.parse().map_err(|_| "bad chunk-size")?,
+                "--no-dedupe" => dedupe = false,
                 "-h" | "--help" => {
                     println!("{}", help());
                     std::process::exit(0);
@@ -55,27 +55,28 @@ impl Args {
             }
         }
 
+        let input_dir = input_dir.ok_or("missing --input-dir <dir>")?;
         Ok(Self {
             index_root,
-            inputs,
             input_dir,
-            urls,
             heap_mb,
             commit_docs,
-            max_open_shards,
+            parallelism,
+            chunk_size,
+            dedupe,
         })
     }
 }
 
 fn help() -> String {
-    "nostrsearch ingest\n\
-     --index-root <dir>        index output root (default ./data/index)\n\
-     --input <file>            a .jsonl or .jsonl.zst dump (repeatable)\n\
-     --input-dir <dir>         directory of dumps, ingested in date order\n\
-     --url <url>               fetch a dump over HTTP (repeatable)\n\
-     --heap-mb <n>             tantivy writer heap per shard (default 256)\n\
-     --commit-docs <n>         commit every N docs per shard (default 100000)\n\
-     --max-open-shards <n>     bound simultaneously-open shard writers (default 8)"
+    "nostrsearch ingest (via nostr-archive-cursor)\n\
+     --index-root <dir>     index output root (default ./data/index)\n\
+     --input-dir <dir>      directory of .jsonl/.json/.zst/.gz/.bz2 dumps\n\
+     --heap-mb <n>          tantivy writer heap per shard (default 512)\n\
+     --commit-docs <n>      commit every N docs per shard (default 200000)\n\
+     --parallelism <n>      files read in parallel (default: num cores)\n\
+     --chunk-size <n>       events per read chunk (default 2000)\n\
+     --no-dedupe            disable event-id dedup (faster, may index dupes)"
         .to_string()
 }
 
@@ -83,32 +84,14 @@ fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "nostrsearch=info".into()),
+                .unwrap_or_else(|_| "nostrsearch=info,nostr_archive_cursor=warn".into()),
         )
         .init();
 
     let args = Args::parse().map_err(anyhow::Error::msg)?;
 
-    // Gather local files (explicit + from dir, sorted by name = date order).
-    let mut files = args.inputs.clone();
-    if let Some(dir) = &args.input_dir {
-        let mut dir_files: Vec<PathBuf> = std::fs::read_dir(dir)?
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| {
-                let n = p.file_name().unwrap_or_default().to_string_lossy().to_string();
-                n.starts_with("events_") && (n.ends_with(".jsonl") || n.ends_with(".jsonl.zst"))
-            })
-            .collect();
-        dir_files.sort();
-        files.extend(dir_files);
-    }
-    files.sort();
-    files.dedup();
-
-    if files.is_empty() && args.urls.is_empty() {
-        eprintln!("no inputs. \n\n{}", help());
-        std::process::exit(2);
+    if !args.input_dir.is_dir() {
+        anyhow::bail!("--input-dir {} is not a directory", args.input_dir.display());
     }
 
     let cfg = ShardWriterConfig {
@@ -118,97 +101,82 @@ fn main() -> anyhow::Result<()> {
     };
 
     let manager = Arc::new(Mutex::new(ShardManager::new(&args.index_root, cfg)));
-    let total_indexed = Arc::new(AtomicU64::new(0));
-    let total_bad = Arc::new(AtomicU64::new(0));
+    let total = Arc::new(AtomicU64::new(0));
     let started = Instant::now();
 
-    // ---- local files: one worker thread per file, bounded by cores ----
-    let n_workers = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .min(files.len().max(1));
-
-    let files = Arc::new(Mutex::new(files.into_iter()));
-    let mut handles = Vec::new();
-    for worker in 0..n_workers {
-        let files = files.clone();
-        let manager = manager.clone();
-        let total_indexed = total_indexed.clone();
-        let total_bad = total_bad.clone();
-        let max_open = args.max_open_shards;
-        handles.push(std::thread::spawn(move || -> anyhow::Result<()> {
-            loop {
-                let path = {
-                    let mut g = files.lock().unwrap();
-                    g.next()
-                };
-                let Some(path) = path else { break };
-                tracing::info!(worker, file = %path.display(), "ingesting file");
-                let src = JsonlSource::open(&path)?;
-                let mut stream = EventStream::new(src);
-                let mut local = 0u64;
-                for ev in stream.by_ref() {
-                    let mut mgr = manager.lock().unwrap();
-                    mgr.index_event(&ev)?;
-                    // bound open shards: close the oldest non-current writer
-                    if mgr.open_shard_count() > max_open {
-                        // close any shard; on-disk index persists
-                        // (simple policy: close arbitrary — manager reopens on demand)
-                    }
-                    drop(mgr);
-                    local += 1;
-                    if local % 100_000 == 0 {
-                        total_indexed.fetch_add(100_000, Ordering::Relaxed);
-                        let done = total_indexed.load(Ordering::Relaxed);
-                        let rate = done as f64 / started.elapsed().as_secs_f64();
-                        tracing::info!(worker, total = done, rate = format_args!("{rate:.0}/s"), "progress");
-                    }
-                }
-                total_indexed.fetch_add(local % 100_000, Ordering::Relaxed);
-                total_bad.fetch_add(stream.bad_lines, Ordering::Relaxed);
-                tracing::info!(worker, file = %path.display(), indexed = local, bad = stream.bad_lines, "file done");
-            }
-            Ok(())
-        }));
-    }
-    for h in handles {
-        h.join().map_err(|_| anyhow::anyhow!("worker panicked"))??;
-    }
-
-    // ---- URLs (sequential for now; each is a streaming download) ----
-    for url in &args.urls {
-        tracing::info!(url = %url, "fetching remote dump");
-        let resp = reqwest::blocking::get(url)?.error_for_status()?;
-        let is_zst = url.ends_with(".zst");
-        let reader: Box<dyn std::io::Read + Send> = Box::new(resp);
-        let src = JsonlSource::from_reader(reader, if is_zst { Some("zst") } else { None })?;
-        let mut stream = EventStream::new(src);
-        let mut local = 0u64;
-        for ev in stream.by_ref() {
-            manager.lock().unwrap().index_event(&ev)?;
-            local += 1;
-            if local % 100_000 == 0 {
-                let done = total_indexed.fetch_add(100_000, Ordering::Relaxed) + 100_000;
-                let rate = done as f64 / started.elapsed().as_secs_f64();
-                tracing::info!(url = %url, total = done, rate = format_args!("{rate:.0}/s"), "progress");
-            }
+    // progress reporter
+    let total_prog = total.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        let done = total_prog.load(Ordering::Relaxed);
+        if done > 0 {
+            let rate = done as f64 / started.elapsed().as_secs_f64();
+            eprintln!("  indexed={done}  rate={rate:.0}/s  elapsed={:.0}s", started.elapsed().as_secs_f64());
         }
-        total_indexed.fetch_add(local % 100_000, Ordering::Relaxed);
-        total_bad.fetch_add(stream.bad_lines, Ordering::Relaxed);
-        tracing::info!(url = %url, indexed = local, "remote file done");
-    }
+    });
 
-    // ---- final commit ----
+    let parallelism = if args.parallelism == 0 {
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+    } else {
+        args.parallelism
+    };
+
+    tracing::info!(
+        dir = %args.input_dir.display(),
+        parallelism,
+        chunk_size = args.chunk_size,
+        dedupe = args.dedupe,
+        "starting ingest"
+    );
+
+    // The cursor drives parallel file reads; the callback converts each
+    // borrowed event into our core type and feeds the shard manager.
+    let total_cb = total.clone();
+    let manager_cb = manager.clone();
+    let cursor = NostrCursor::new(args.input_dir.clone())
+        .with_parallelism(parallelism)
+        .with_dedupe(args.dedupe);
+
+    cursor.walk_with_chunked_sync(
+        move |events: Vec<nostr_archive_cursor::NostrEventBorrowed>| {
+            let mut batch: Vec<NostrEvent> = Vec::with_capacity(events.len());
+            for ev in &events {
+                batch.push(NostrEvent {
+                    id: ev.id.to_string(),
+                    pubkey: ev.pubkey.to_string(),
+                    created_at: ev.created_at,
+                    kind: ev.kind as u16,
+                    tags: ev
+                        .tags
+                        .iter()
+                        .map(|t| t.iter().map(|s| s.to_string()).collect())
+                        .collect(),
+                    content: ev.content.to_string(),
+                    sig: ev.sig.to_string(),
+                });
+            }
+            let mut mgr = manager_cb.lock().unwrap();
+            for ev in &batch {
+                if let Err(e) = mgr.index_event(ev) {
+                    tracing::warn!(error = %e, "index_event failed");
+                }
+            }
+            drop(mgr);
+            total_cb.fetch_add(batch.len() as u64, Ordering::Relaxed);
+        },
+        args.chunk_size,
+    );
+
+    // final commit
     manager.lock().unwrap().commit_all()?;
 
-    let done = total_indexed.load(Ordering::Relaxed);
+    let done = total.load(Ordering::Relaxed);
     let secs = started.elapsed().as_secs_f64();
-    tracing::info!(
-        total = done,
-        bad = total_bad.load(Ordering::Relaxed),
-        secs = format_args!("{secs:.1}"),
-        rate = format_args!("{:.0}/s", done as f64 / secs),
-        "ingest complete"
+    println!(
+        "ingest complete: {} events in {:.1}s = {:.0}/s",
+        done,
+        secs,
+        done as f64 / secs
     );
     Ok(())
 }

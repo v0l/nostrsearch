@@ -2,11 +2,14 @@
 //!
 //! Uses a small sample of the real dump (or synthetic fallback if absent).
 
+use nostr_archive_cursor::NostrCursor;
+use nostrsearch_core::event::NostrEvent;
 use nostrsearch_core::query::SearchFilter;
 use nostrsearch_core::scoring::ScoreWeights;
-use nostrsearch_indexer::{EventStream, JsonlSource, ShardManager, ShardWriterConfig};
+use nostrsearch_indexer::{ShardManager, ShardWriterConfig};
 use nostrsearch_server::ShardRegistry;
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 fn sample_path() -> Option<PathBuf> {
     let p = PathBuf::from("/tmp/e2e_sample.jsonl");
@@ -26,22 +29,51 @@ fn index_and_search_real_events() {
             commit_every_docs: 5_000,
             ..Default::default()
         };
-        let mut mgr = ShardManager::new(&index_root, cfg);
-
         if let Some(path) = sample_path() {
-            let src = JsonlSource::open(&path).unwrap();
-            for ev in EventStream::new(src) {
-                if ev.kind == 1 && kind1_content.is_none() && ev.content.split_whitespace().count() >= 3
-                {
-                    kind1_content = Some(ev.content.clone());
-                }
-                mgr.index_event(&ev).unwrap();
-                indexed += 1;
-            }
+            // drive ingest via nostr-archive-cursor over the sample's dir
+            let dir = path.parent().unwrap().to_path_buf();
+            let mgr = Arc::new(Mutex::new(ShardManager::new(&index_root, cfg)));
+            let mgr_cb = mgr.clone();
+            let seen = Arc::new(Mutex::new(0usize));
+            let seen_cb = seen.clone();
+            let k1 = Arc::new(Mutex::new(None::<String>));
+            let k1_cb = k1.clone();
+            NostrCursor::new(dir)
+                .with_parallelism(1)
+                .with_dedupe(false)
+                .walk_with_chunked_sync(
+                    move |events: Vec<nostr_archive_cursor::NostrEventBorrowed>| {
+                        let mut m = mgr_cb.lock().unwrap();
+                        for ev in &events {
+                            let owned = NostrEvent {
+                                id: ev.id.to_string(),
+                                pubkey: ev.pubkey.to_string(),
+                                created_at: ev.created_at,
+                                kind: ev.kind as u16,
+                                tags: ev.tags.iter().map(|t| t.iter().map(|s| s.to_string()).collect()).collect(),
+                                content: ev.content.to_string(),
+                                sig: ev.sig.to_string(),
+                            };
+                            if owned.kind == 1 && owned.content.split_whitespace().count() >= 3 {
+                                let mut g = k1_cb.lock().unwrap();
+                                if g.is_none() {
+                                    *g = Some(owned.content.clone());
+                                }
+                            }
+                            m.index_event(&owned).unwrap();
+                            *seen_cb.lock().unwrap() += 1;
+                        }
+                    },
+                    1000,
+                );
+            indexed = *seen.lock().unwrap();
+            kind1_content = k1.lock().unwrap().clone();
+            mgr.lock().unwrap().commit_all().unwrap();
         } else {
             // synthetic fallback
+            let mut mgr = ShardManager::new(&index_root, cfg);
             for i in 0..1000u64 {
-                let ev = nostrsearch_core::event::NostrEvent {
+                let ev = NostrEvent {
                     id: format!("{:064x}", i),
                     pubkey: "b".repeat(64),
                     created_at: 1_700_000_000 + i,
@@ -54,8 +86,8 @@ fn index_and_search_real_events() {
                 indexed += 1;
             }
             kind1_content = Some("hello nostr note number 5 about bitcoin".into());
+            mgr.commit_all().unwrap();
         }
-        mgr.commit_all().unwrap();
     }
     assert!(indexed > 0, "indexed some events");
     eprintln!("indexed {indexed} events");
