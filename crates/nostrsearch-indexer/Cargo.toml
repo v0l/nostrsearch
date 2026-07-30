@@ -21,6 +21,7 @@ tracing-subscriber.workspace = true
 nostr-archive-cursor = { git = "https://github.com/v0l/nostr-archive-cursor.git", default-features = false, features = ["sync", "db-rocksdb"] }
 nostr-sdk = "0.44"
 rustls = { version = "0.23", features = ["ring"] }
+libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"

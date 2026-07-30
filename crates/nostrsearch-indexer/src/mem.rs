@@ -51,6 +51,43 @@ pub fn cgroup_limit_mb() -> Option<u64> {
     None
 }
 
+/// Dirty and writeback page counts, in MB, plus kernel slab.
+///
+/// Clean page cache is reclaimed under pressure, so it cannot by itself cause
+/// an OOM kill. Dirty pages cannot be reclaimed until written back, so a writer
+/// that dirties pages faster than the disk retires them will hit `memory.max`
+/// even though the counter looks like harmless cache.
+pub fn cgroup_dirty_mb() -> Option<(u64, u64, u64)> {
+    let stat = std::fs::read_to_string("/sys/fs/cgroup/memory.stat").ok()?;
+    let (mut dirty, mut wb, mut slab) = (0, 0, 0);
+    for line in stat.lines() {
+        let mut it = line.split_whitespace();
+        match (it.next(), it.next().and_then(|v| v.parse::<u64>().ok())) {
+            (Some("file_dirty"), Some(v)) => dirty = v / 1_048_576,
+            (Some("file_writeback"), Some(v)) => wb = v / 1_048_576,
+            (Some("slab"), Some(v)) => slab = v / 1_048_576,
+            _ => {}
+        }
+    }
+    Some((dirty, wb, slab))
+}
+
+/// Force writeback of the filesystem containing `path`, so dirty pages become
+/// clean and therefore reclaimable before the cgroup hits its limit.
+#[cfg(target_os = "linux")]
+pub fn syncfs(path: &std::path::Path) {
+    use std::os::unix::io::AsRawFd;
+    if let Ok(f) = std::fs::File::open(path) {
+        // SAFETY: fd is valid for the duration of the call.
+        unsafe {
+            libc::syncfs(f.as_raw_fd());
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn syncfs(_path: &std::path::Path) {}
+
 /// What the cgroup actually accounts against `memory.max`, in MB.
 ///
 /// This is the number the OOM killer uses, and it is **not** RSS: it includes

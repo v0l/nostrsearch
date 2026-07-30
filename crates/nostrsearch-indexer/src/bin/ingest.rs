@@ -182,6 +182,18 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
         if let Some(l) = limit_mb {
             tracing::info!(limit_mb = l, "cgroup memory limit");
         }
+        // Force periodic writeback of the index filesystem. Dirty pages are
+        // charged to the cgroup and cannot be reclaimed until they reach disk,
+        // so a writer that dirties faster than writeback retires can be
+        // OOM-killed while its own memory is modest.
+        let sync_root = args.index_root.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                nostrsearch_indexer::mem::syncfs(&sync_root);
+            }
+        });
+
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_secs(5));
             let done = total_prog.load(Ordering::Relaxed);
@@ -196,7 +208,12 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
                         let pct = limit_mb
                             .map(|l| format!(" {:.0}% of {}MB", cur as f64 / l as f64 * 100.0, l))
                             .unwrap_or_default();
-                        format!("  cgroup={cur}MB (anon={anon}MB cache={file}MB){pct}")
+                        let d = nostrsearch_indexer::mem::cgroup_dirty_mb()
+                            .map(|(dirty, wb, slab)| {
+                                format!(" dirty={dirty}MB wb={wb}MB slab={slab}MB")
+                            })
+                            .unwrap_or_default();
+                        format!("  cgroup={cur}MB (anon={anon}MB cache={file}MB{d}){pct}")
                     })
                     .unwrap_or_default();
                 eprintln!(
