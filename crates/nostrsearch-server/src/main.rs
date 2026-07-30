@@ -81,6 +81,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── Writer task: single owner of the Pipeline (index + stats + WoT) ─────
+    let mut writer_handle = None;
     let sink = if is_writer {
         let cfg = PipelineConfig {
             index_root: index_root.clone(),
@@ -92,11 +93,13 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or(100_000),
             wot_out: Some(env_path("WOT_OUT", "./data/wot.bin")),
         };
-        Some(nostrsearch_server::spawn_writer(
+        let (sink, handle) = nostrsearch_server::spawn_writer(
             cfg,
             10_000,
             std::time::Duration::from_secs(30),
-        )?)
+        )?;
+        writer_handle = Some(handle);
+        Some(sink)
     } else {
         None
     };
@@ -143,6 +146,42 @@ async fn main() -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
+    .with_graceful_shutdown(shutdown_signal())
     .await?;
+
+    // Flush the index before exiting, otherwise everything since the last
+    // commit interval is lost from the search index on every deploy.
+    if let Some(h) = writer_handle {
+        tracing::info!("flushing writer before exit");
+        h.shutdown().await;
+    }
+    tracing::info!("nostrsearch node stopped");
     Ok(())
+}
+
+/// Resolve on SIGTERM (container stop) or Ctrl-C.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => tracing::info!("received SIGINT"),
+        _ = terminate => tracing::info!("received SIGTERM"),
+    }
 }

@@ -34,7 +34,7 @@ async fn relay_write_is_archived_and_searchable_in_one_process() -> anyhow::Resu
     let archive = ArchiveState::open_with_index(&archive_dir)?;
     let db = archive.db.clone().expect("indexed archive");
 
-    let sink = nostrsearch_server::spawn_writer(
+    let (sink, _writer) = nostrsearch_server::spawn_writer(
         PipelineConfig {
             index_root: index_root.clone(),
             shard: ShardWriterConfig::default(),

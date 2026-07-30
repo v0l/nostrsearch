@@ -65,22 +65,45 @@ impl EventSink {
     }
 }
 
+/// Handle for shutting the writer down cleanly.
+///
+/// Without this, a SIGTERM (what Docker/k8s send on every deploy) kills the
+/// runtime mid-interval and everything indexed since the last commit is lost
+/// from the search index — the events survive in the archive, but the index
+/// silently drifts from it on each restart.
+pub struct WriterHandle {
+    shutdown: tokio::sync::watch::Sender<bool>,
+    join: tokio::task::JoinHandle<()>,
+}
+
+impl WriterHandle {
+    /// Signal the writer to flush and stop, then wait for it.
+    pub async fn shutdown(self) {
+        let _ = self.shutdown.send(true);
+        if let Err(e) = self.join.await {
+            tracing::warn!(error = %e, "writer task join failed");
+        }
+    }
+}
+
 /// Spawn the single writer task that owns the [`Pipeline`].
 ///
-/// Returns the sink producers use. The task commits on an interval so search
-/// readers (which use `ReloadPolicy::OnCommitWithDelay`) pick up new events.
+/// Returns the sink producers use plus a [`WriterHandle`] for a clean flush.
+/// The task commits on an interval so search readers (which use
+/// `ReloadPolicy::OnCommitWithDelay`) pick up new events.
 pub fn spawn_writer(
     cfg: PipelineConfig,
     queue_size: usize,
     commit_every: std::time::Duration,
-) -> anyhow::Result<EventSink> {
+) -> anyhow::Result<(EventSink, WriterHandle)> {
     let mut pipeline = Pipeline::new(cfg)?;
     // Live tail semantics: everything from here on is realtime.
     pipeline.go_live();
 
     let (tx, mut rx) = mpsc::channel::<NostrEvent>(queue_size);
+    let (sd_tx, mut sd_rx) = tokio::sync::watch::channel(false);
 
-    tokio::spawn(async move {
+    let join = tokio::spawn(async move {
         let mut tick = tokio::time::interval(commit_every);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await; // consume the immediate first tick
@@ -106,16 +129,27 @@ pub fn spawn_writer(
                         dirty = false;
                     }
                 }
+                _ = sd_rx.changed() => {
+                    if *sd_rx.borrow() {
+                        tracing::info!("writer shutting down; draining queue");
+                        // Drain anything already queued so a deploy doesn't
+                        // drop in-flight events.
+                        while let Ok(ev) = rx.try_recv() {
+                            pipeline.process(&ev);
+                        }
+                        break;
+                    }
+                }
             }
         }
 
         if let Err(e) = pipeline.finish() {
             tracing::warn!(error = %e, "final flush failed");
         }
-        tracing::info!("writer task stopped");
+        tracing::info!("writer task stopped (flushed)");
     });
 
-    Ok(EventSink(tx))
+    Ok((EventSink(tx), WriterHandle { shutdown: sd_tx, join }))
 }
 
 /// Nostr database for the relay: archives to the corpus **and** forwards to the
