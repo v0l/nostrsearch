@@ -181,11 +181,19 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
             if done > 0 {
                 let rate = done as f64 / started.elapsed().as_secs_f64();
                 let (rss, peak) = nostrsearch_indexer::mem::rss_mb();
-                let pct = limit_mb
-                    .map(|l| format!(" ({:.0}% of {}MB limit)", rss as f64 / l as f64 * 100.0, l))
+                // cgroup usage, not RSS, is what the OOM killer measures: it
+                // includes page cache, which heavy dump reads and index writes
+                // fill even while RSS stays flat.
+                let cg = nostrsearch_indexer::mem::cgroup_usage_mb()
+                    .map(|(cur, anon, file)| {
+                        let pct = limit_mb
+                            .map(|l| format!(" {:.0}% of {}MB", cur as f64 / l as f64 * 100.0, l))
+                            .unwrap_or_default();
+                        format!("  cgroup={cur}MB (anon={anon}MB cache={file}MB){pct}")
+                    })
                     .unwrap_or_default();
                 eprintln!(
-                    "  processed={done}  rate={rate:.0}/s  elapsed={:.0}s  rss={rss}MB peak={peak}MB{pct}",
+                    "  processed={done}  rate={rate:.0}/s  elapsed={:.0}s  rss={rss}MB peak={peak}MB{cg}",
                     started.elapsed().as_secs_f64()
                 );
             }

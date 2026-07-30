@@ -50,3 +50,34 @@ pub fn cgroup_limit_mb() -> Option<u64> {
     }
     None
 }
+
+/// What the cgroup actually accounts against `memory.max`, in MB.
+///
+/// This is the number the OOM killer uses, and it is **not** RSS: it includes
+/// the page cache. A process reading dumps and writing an index can sit at a
+/// few GB of RSS while the cgroup approaches its limit purely through cached
+/// file pages, then get killed with no apparent growth in RSS.
+///
+/// Returns `(current_mb, anon_mb, file_mb)` where `anon` is real process memory
+/// and `file` is page cache.
+pub fn cgroup_usage_mb() -> Option<(u64, u64, u64)> {
+    let current = std::fs::read_to_string("/sys/fs/cgroup/memory.current")
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()?
+        / 1_048_576;
+
+    let (mut anon, mut file) = (0, 0);
+    if let Ok(stat) = std::fs::read_to_string("/sys/fs/cgroup/memory.stat") {
+        for line in stat.lines() {
+            let mut it = line.split_whitespace();
+            match (it.next(), it.next().and_then(|v| v.parse::<u64>().ok())) {
+                (Some("anon"), Some(v)) => anon = v / 1_048_576,
+                (Some("file"), Some(v)) => file = v / 1_048_576,
+                _ => {}
+            }
+        }
+    }
+    Some((current, anon, file))
+}

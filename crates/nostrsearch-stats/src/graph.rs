@@ -54,6 +54,11 @@ impl GraphStore {
         // Values are packed pubkeys; compression saves little and costs CPU on
         // a hot ingest path.
         opts.set_compression_type(rocksdb::DBCompressionType::None);
+        // Bypass the page cache for flush and compaction. Under a cgroup the
+        // OOM killer counts page cache, and dirty pages cannot be reclaimed
+        // until written back, so a high-throughput writer can be killed while
+        // its RSS is still small.
+        opts.set_use_direct_io_for_flush_and_compaction(true);
         let db = DB::open(&opts, path.as_ref())
             .with_context(|| format!("opening graph store at {}", path.as_ref().display()))?;
         Ok(Self { db })
