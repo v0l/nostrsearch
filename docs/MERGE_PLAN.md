@@ -276,11 +276,12 @@ author + an untrusted spammer): before the warm-start fix the spam outranked
 the trusted author (0.6775 vs 0.5550, all tiers 0); after, the trusted author
 scores **1.6649 vs 0.6775** — exactly the `1 + 0.5×tier(4)` = 3× boost.
 
-**Deploy wiring:** Dockerfile builds `ingest` + `stats` + server. Compose:
-`ingest` (archive one-shot, now also computing stats/WoT inline), **`firehose`**
-(long-running live tail), `stats` (stats-only pre-compute), `server`. k8s:
-`ingest-job.yaml` (updated args), **`firehose-deployment.yaml`**,
-`stats-job.yaml`, with RWO single-writer caveats documented.
+**Deploy wiring:** Dockerfile builds `ingest` + `stats` + `archive` + server.
+Because the server is now the unified node, the per-role deploy variants
+collapsed to one of each: compose has `server` (the node) plus an opt-in
+`ingest` profile for bulk backfill, and k8s is a single `k8s/nostrsearch.yaml`
+(Namespace + PVC + Service + Deployment) with the optional roles as commented
+env vars and the backfill Job commented at the bottom.
 
 ### nostrhole absorbed (implemented)
 

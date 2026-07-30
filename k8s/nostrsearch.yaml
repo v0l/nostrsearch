@@ -1,0 +1,215 @@
+# nostrsearch — single deployment manifest.
+#
+#   kubectl apply -f k8s/nostrsearch.yaml
+#
+# This runs the unified node: ONE process serving the search API, the archive
+# HTTP endpoints, the nostr archive relay, and the live firehose, all over a
+# shared Tantivy index, one archive database, and one stats/WoT engine.
+#
+# Everything optional is an env var below — uncomment to turn a role on or off.
+# Bulk archive backfill is a separate one-shot Job, commented out at the bottom.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: nostrsearch
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: nostrsearch-index
+  namespace: nostrsearch
+  labels:
+    app.kubernetes.io/name: nostrsearch
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 200Gi
+  # storageClassName: standard   # set to your cluster's storage class
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nostrsearch
+  namespace: nostrsearch
+  labels:
+    app.kubernetes.io/name: nostrsearch
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: nostrsearch
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nostrsearch
+  namespace: nostrsearch
+  labels:
+    app.kubernetes.io/name: nostrsearch
+spec:
+  # Only ONE replica may write: it holds the Tantivy writer and the archive's
+  # exclusive RocksDB index lock. Scaling out requires read-only replicas
+  # (drop ENABLE_RELAY + RELAYS) on a ReadWriteMany volume.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nostrsearch
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nostrsearch
+    spec:
+      # The node flushes the search index on SIGTERM; without enough grace the
+      # last commit interval of events is lost from the index.
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: nostrsearch
+          image: registry.v0l.io/nostrsearch:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            # ── Core ────────────────────────────────────────────────────────
+            - name: INDEX_ROOT
+              value: /data/index
+            - name: BIND
+              value: 0.0.0.0:8080
+            - name: RUST_LOG
+              value: nostrsearch=info,tower_http=info
+
+            # ── Archive (serves the raw .jsonl.zst corpus at /archive) ──────
+            # Comment out to run search-only against an existing index.
+            - name: ARCHIVE_DIR
+              value: /data/archive
+
+            # ── Indexing: live firehose ─────────────────────────────────────
+            # Comma-separated upstream relays. Events are archived, indexed and
+            # folded into stats by this same process. Comment out to stop
+            # ingesting (the node then serves search/archive read-only).
+            - name: RELAYS
+              value: "wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net"
+
+            # ── Indexing: inbound relay (accept writes at /) ────────────────
+            # Comment out to refuse inbound writes.
+            - name: ENABLE_RELAY
+              value: "1"
+            # Restrict which kinds the relay accepts:
+            # - name: RELAY_KINDS
+            #   value: "0,1,3,7,30023"
+
+            # ── Stats / web-of-trust ────────────────────────────────────────
+            - name: STATE_DIR
+              value: /data/stats
+            - name: WOT_OUT
+              value: /data/wot.bin
+            # Events between WoT rebuilds (default 100000). Lower = fresher
+            # trust scoring, more CPU spent re-materializing.
+            # - name: WOT_REFRESH_EVERY
+            #   value: "100000"
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "500m"
+              memory: 4Gi
+            limits:
+              # Search is mmap-heavy; give the page cache room.
+              memory: 24Gi
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: nostrsearch-index
+
+# ── Optional: one-shot bulk archive backfill ──────────────────────────────────
+#
+# Loads historical JSONL dumps into the index and seeds the web-of-trust graph.
+# Worth running before first serving: WoT cannot bootstrap from the live
+# firehose alone (a live tail sees only a handful of kind-3 contact lists, far
+# below the follower thresholds), so without a backfill everything indexes at
+# tier 0 and ranking is pure BM25 + recency.
+#
+# Only one process may write at a time, so scale the Deployment down first:
+#
+#   kubectl -n nostrsearch scale deploy/nostrsearch --replicas=0
+#   kubectl apply -f k8s/nostrsearch.yaml   # with the Job uncommented
+#   kubectl -n nostrsearch logs -f job/nostrsearch-ingest
+#   kubectl -n nostrsearch scale deploy/nostrsearch --replicas=1
+#
+# ---
+# apiVersion: batch/v1
+# kind: Job
+# metadata:
+#   name: nostrsearch-ingest
+#   namespace: nostrsearch
+# spec:
+#   backoffLimit: 0
+#   template:
+#     spec:
+#       restartPolicy: Never
+#       securityContext:
+#         runAsNonRoot: true
+#         runAsUser: 10001
+#         fsGroup: 10001
+#       containers:
+#         - name: ingest
+#           image: registry.v0l.io/nostrsearch:latest
+#           command: ["./bin/ingest"]
+#           args:
+#             - "--index-root"
+#             - "/data/index"
+#             - "--input-dir"
+#             - "/dumps"
+#             - "--state-dir"
+#             - "/data/stats"
+#             - "--wot-out"
+#             - "/data/wot.bin"
+#           env:
+#             - name: RUST_LOG
+#               value: nostrsearch=info,nostr_archive_cursor=info
+#           volumeMounts:
+#             - name: data
+#               mountPath: /data
+#             - name: dumps
+#               mountPath: /dumps
+#               readOnly: true
+#           resources:
+#             requests:
+#               memory: 4Gi
+#             limits:
+#               memory: 16Gi
+#       volumes:
+#         - name: data
+#           persistentVolumeClaim:
+#             claimName: nostrsearch-index
+#         - name: dumps
+#           # Point at wherever your dumps live.
+#           emptyDir: {}
