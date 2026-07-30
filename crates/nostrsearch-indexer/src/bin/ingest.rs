@@ -35,6 +35,7 @@ struct Args {
     parallelism: usize,
     chunk_size: usize,
     dedupe: bool,
+    max_open_shards: usize,
 }
 
 impl Args {
@@ -55,6 +56,7 @@ impl Args {
         let mut parallelism = 0usize;
         let mut chunk_size = 2_000usize;
         let mut dedupe = true;
+        let mut max_open_shards = nostrsearch_indexer::env::max_open_shards();
 
         let mut it = std::env::args().skip(1);
         while let Some(a) = it.next() {
@@ -73,6 +75,7 @@ impl Args {
                 "--parallelism" => parallelism = it.next().ok_or("--parallelism value")?.parse().map_err(|_| "bad parallelism")?,
                 "--chunk-size" => chunk_size = it.next().ok_or("--chunk-size value")?.parse().map_err(|_| "bad chunk-size")?,
                 "--no-dedupe" => dedupe = false,
+                "--max-open-shards" => max_open_shards = it.next().ok_or("--max-open-shards value")?.parse().map_err(|_| "bad max-open-shards")?,
                 "-h" | "--help" => {
                     println!("{}", help());
                     std::process::exit(0);
@@ -97,6 +100,7 @@ impl Args {
             parallelism,
             chunk_size,
             dedupe,
+            max_open_shards,
         })
     }
 }
@@ -120,7 +124,9 @@ fn help() -> String {
      --commit-docs <n>         commit every N docs per shard (default 200000)\n\
      --parallelism <n>         archive files read in parallel (default: num cores)\n\
      --chunk-size <n>          events per read chunk (default 2000)\n\
-     --no-dedupe               disable archive event-id dedup"
+     --no-dedupe               disable archive event-id dedup\n\
+     --max-open-shards <n>     shard writers held open ($MAX_OPEN_SHARDS, 8);\n\
+     \x20                        total writer heap is n x --heap-mb"
         .to_string()
 }
 
@@ -143,6 +149,7 @@ fn main() -> anyhow::Result<()> {
         shard: ShardWriterConfig {
             heap_bytes: args.heap_mb * 1_000_000,
             commit_every_docs: args.commit_docs,
+            max_open_shards: args.max_open_shards,
             ..Default::default()
         },
         state_dir: args.state_dir.clone(),

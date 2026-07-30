@@ -67,7 +67,11 @@ services:
       - "--input-dir"
       - "/dumps"
       - "--heap-mb"
-      - "512"
+      - "128"
+      # Total writer heap is max-open-shards x heap-mb; without a cap a
+      # multi-year corpus opens ~70 shard writers and gets OOM-killed.
+      - "--max-open-shards"
+      - "8"
       - "--commit-docs"
       - "200000"
       # Stats/WoT are computed from the same stream and hot-swapped into scoring.

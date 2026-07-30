@@ -41,21 +41,31 @@ pub struct ShardWriterConfig {
     pub commit_every: Duration,
     /// Number of writer threads per shard.
     pub writer_threads: usize,
+    /// Maximum shards held open at once. Each open shard costs `heap_bytes` of
+    /// writer heap, so an unbounded backfill over a multi-year corpus (~70
+    /// monthly shards) would need `70 x heap_bytes` and get OOM-killed. When
+    /// the cap is exceeded the least-recently-written shard is committed and
+    /// closed; it reopens transparently if more events route to it.
+    pub max_open_shards: usize,
 }
 
 impl Default for ShardWriterConfig {
     fn default() -> Self {
         Self {
-            heap_bytes: 256 * 1_000_000, // 256 MB per hot shard
+            heap_bytes: 128 * 1_000_000, // 128 MB per hot shard
             commit_every_docs: 100_000,
             commit_every: Duration::from_secs(30),
             writer_threads: 2,
+            // 8 x 128 MB = ~1 GB of writer heap regardless of corpus span.
+            max_open_shards: 8,
         }
     }
 }
 
 /// A single open shard: index + writer + commit bookkeeping.
 struct OpenShard {
+    /// Value of `ShardManager::tick` when this shard was last written to.
+    last_used: u64,
     index: Index,
     writer: IndexWriter,
     schema: NostrSchema,
@@ -72,6 +82,7 @@ impl OpenShard {
         NostrSchema::register_tokenizers(&index);
         let writer = index.writer_with_num_threads(cfg.writer_threads, cfg.heap_bytes)?;
         Ok(Self {
+            last_used: 0,
             index,
             writer,
             schema: ns,
@@ -109,6 +120,8 @@ pub struct ShardManager {
     root: PathBuf,
     cfg: ShardWriterConfig,
     shards: HashMap<ShardId, OpenShard>,
+    /// Monotonic counter used to pick the least-recently-written shard.
+    tick: u64,
     /// WoT tier lookup hook — maps pubkey hex → tier. Pluggable so the WoT
     /// graph can be injected without the indexer depending on it.
     wot_lookup: Option<Box<dyn Fn(&str) -> u8 + Send + Sync>>,
@@ -120,6 +133,7 @@ impl ShardManager {
             root: root.into(),
             cfg,
             shards: HashMap::new(),
+            tick: 0,
             wot_lookup: None,
         }
     }
@@ -138,12 +152,38 @@ impl ShardManager {
     fn shard_for(&mut self, ts: u64) -> Result<&mut OpenShard, ShardError> {
         let id = ShardId::from_timestamp(ts);
         if !self.shards.contains_key(&id) {
+            // Bound writer-heap usage before opening another one.
+            self.evict_if_needed()?;
             let dir = self.shard_dir(id);
             tracing::info!(shard = %id, path = %dir.display(), "opening shard");
             let shard = OpenShard::open(&dir, &self.cfg)?;
             self.shards.insert(id, shard);
         }
-        Ok(self.shards.get_mut(&id).unwrap())
+        self.tick += 1;
+        let tick = self.tick;
+        let shard = self.shards.get_mut(&id).unwrap();
+        shard.last_used = tick;
+        Ok(shard)
+    }
+
+    /// Commit and close the least-recently-written shard while over the cap.
+    fn evict_if_needed(&mut self) -> Result<(), ShardError> {
+        let cap = self.cfg.max_open_shards.max(1);
+        while self.shards.len() >= cap {
+            let victim = self
+                .shards
+                .iter()
+                .min_by_key(|(_, s)| s.last_used)
+                .map(|(id, _)| *id);
+            match victim {
+                Some(id) => {
+                    tracing::info!(shard = %id, open = self.shards.len(), "evicting shard writer");
+                    self.close_shard(id)?;
+                }
+                None => break,
+            }
+        }
+        Ok(())
     }
 
     /// Index one event. `deleted`/`superseded` are computed by the caller's
@@ -279,5 +319,67 @@ mod tests {
         });
         let reader = index.reader().unwrap();
         assert_eq!(reader.searcher().num_docs(), 2);
+    }
+}
+
+#[cfg(test)]
+mod eviction_tests {
+    use super::*;
+
+    fn ev_at(year: i32, month: u32, id: &str) -> NostrEvent {
+        // first second of the given month
+        let ts = chrono::NaiveDate::from_ymd_opt(year, month, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp() as u64;
+        NostrEvent {
+            id: id.into(),
+            pubkey: "b".repeat(64),
+            created_at: ts,
+            kind: 1,
+            tags: vec![],
+            content: "hello".into(),
+            sig: "c".repeat(128),
+        }
+    }
+
+    /// Writing across many months must not hold every shard writer open —
+    /// each costs `heap_bytes`, so an unbounded backfill over a multi-year
+    /// corpus exhausts memory and gets OOM-killed.
+    #[test]
+    fn open_shards_are_capped_and_evicted() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = ShardWriterConfig {
+            heap_bytes: 15 * 1_000_000, // tantivy minimum-ish, keep test light
+            max_open_shards: 3,
+            writer_threads: 1,
+            ..Default::default()
+        };
+        let mut mgr = ShardManager::new(dir.path(), cfg);
+
+        // 12 distinct monthly shards
+        for m in 1..=12u32 {
+            mgr.index_event(&ev_at(2024, m, &format!("{m:064x}")))
+                .expect("index");
+            assert!(
+                mgr.open_shard_count() <= 3,
+                "open shards {} exceeded cap after month {}",
+                mgr.open_shard_count(),
+                m
+            );
+        }
+
+        // Evicted shards must still hold their data.
+        mgr.commit_all().unwrap();
+        let mut found = 0;
+        for m in 1..=12u32 {
+            let d = dir.path().join(format!("2024-{m:02}"));
+            if d.exists() {
+                found += 1;
+            }
+        }
+        assert_eq!(found, 12, "every month should have been written to disk");
     }
 }

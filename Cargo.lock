@@ -1704,6 +1704,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "chrono",
  "nostr-archive-cursor",
  "nostr-sdk",
  "nostrsearch-core",

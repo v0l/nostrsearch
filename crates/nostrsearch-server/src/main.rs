@@ -72,7 +72,10 @@ async fn main() -> anyhow::Result<()> {
     let sink = if is_writer {
         let cfg = PipelineConfig {
             index_root: index_root.clone(),
-            shard: ShardWriterConfig::default(),
+            shard: ShardWriterConfig {
+                max_open_shards: env::max_open_shards(),
+                ..Default::default()
+            },
             state_dir: Some(env::state_dir()),
             wot_refresh_every: env::wot_refresh_every(),
             min_refresh_interval: env::min_refresh_interval(),
