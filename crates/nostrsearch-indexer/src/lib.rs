@@ -21,6 +21,9 @@
 //! - **Backpressure-aware.** Parsing outruns indexing; a bounded channel
 //!   between them keeps memory flat over a 763 GiB corpus.
 
+pub mod firehose;
+pub mod pipeline;
 pub mod shard_writer;
 
+pub use pipeline::{Pipeline, PipelineConfig};
 pub use shard_writer::{ShardManager, ShardWriterConfig};

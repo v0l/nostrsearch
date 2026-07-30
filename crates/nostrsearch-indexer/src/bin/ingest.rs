@@ -1,25 +1,35 @@
-//! Ingest CLI: load Nostr JSONL archives into sharded Tantivy indices.
+//! Unified ingest CLI: one pipeline for **static JSONL archives** and the
+//! **live relay firehose**, feeding both the Tantivy index and the stats/WoT
+//! engine.
 //!
-//! Uses `nostr-archive-cursor` (`NostrCursor`) to walk a directory of dumps —
-//! handling `.jsonl`/`.json`/`.zst`/`.gz`/`.bz2`, parallel chunked reads, and
-//! event-id dedup — and routes each event into the time-sharded `ShardManager`.
+//! - `--input-dir <dir>`   backfill from JSONL dumps (via nostr-archive-cursor)
+//! - `--relays <url>`      tail the live firehose (repeatable)
+//! - both                  backfill first, then switch to live tailing
+//!
+//! Web-of-trust is bootstrapped from the same stream and hot-swapped into the
+//! index scoring signal every `--wot-refresh-every` events.
 //!
 //! Usage:
-//!   ingest --index-root ./data/index --input-dir /core/Backup/nostr/source
-//!   ingest --index-root ./data/index --input-dir ./dumps --parallelism 8 --no-dedupe
+//!   ingest --index-root ./data/index --input-dir ./dumps
+//!   ingest --index-root ./data/index --relays wss://relay.damus.io --relays wss://nos.lol
+//!   ingest --index-root ./data/index --input-dir ./dumps --relays wss://relay.damus.io
 
 use nostr_archive_cursor::NostrCursor;
 use nostrsearch_core::event::NostrEvent;
-use nostrsearch_indexer::{ShardManager, ShardWriterConfig};
+use nostrsearch_indexer::{Pipeline, PipelineConfig, ShardWriterConfig};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-#[derive(Debug)]
 struct Args {
     index_root: PathBuf,
-    input_dir: PathBuf,
+    input_dir: Option<PathBuf>,
+    relays: Vec<String>,
+    archive_dir: Option<PathBuf>,
+    state_dir: Option<PathBuf>,
+    wot_out: Option<PathBuf>,
+    wot_refresh_every: u64,
     heap_mb: usize,
     commit_docs: u64,
     parallelism: usize,
@@ -31,9 +41,14 @@ impl Args {
     fn parse() -> Result<Self, String> {
         let mut index_root = PathBuf::from("./data/index");
         let mut input_dir = None;
+        let mut relays = Vec::new();
+        let mut archive_dir = None;
+        let mut state_dir = Some(PathBuf::from("./data/stats"));
+        let mut wot_out = Some(PathBuf::from("./data/wot.bin"));
+        let mut wot_refresh_every = 1_000_000u64;
         let mut heap_mb = 512usize;
         let mut commit_docs = 200_000u64;
-        let mut parallelism = 0usize; // 0 = auto
+        let mut parallelism = 0usize;
         let mut chunk_size = 2_000usize;
         let mut dedupe = true;
 
@@ -42,6 +57,13 @@ impl Args {
             match a.as_str() {
                 "--index-root" => index_root = PathBuf::from(it.next().ok_or("--index-root value")?),
                 "--input-dir" => input_dir = Some(PathBuf::from(it.next().ok_or("--input-dir value")?)),
+                "--relays" | "--relay" => relays.push(it.next().ok_or("--relays value")?),
+                "--archive-dir" => archive_dir = Some(PathBuf::from(it.next().ok_or("--archive-dir value")?)),
+                "--state-dir" => state_dir = Some(PathBuf::from(it.next().ok_or("--state-dir value")?)),
+                "--no-state" => state_dir = None,
+                "--wot-out" => wot_out = Some(PathBuf::from(it.next().ok_or("--wot-out value")?)),
+                "--no-wot-out" => wot_out = None,
+                "--wot-refresh-every" => wot_refresh_every = it.next().ok_or("--wot-refresh-every value")?.parse().map_err(|_| "bad wot-refresh-every")?,
                 "--heap-mb" => heap_mb = it.next().ok_or("--heap-mb value")?.parse().map_err(|_| "bad heap")?,
                 "--commit-docs" => commit_docs = it.next().ok_or("--commit-docs value")?.parse().map_err(|_| "bad commit-docs")?,
                 "--parallelism" => parallelism = it.next().ok_or("--parallelism value")?.parse().map_err(|_| "bad parallelism")?,
@@ -55,10 +77,17 @@ impl Args {
             }
         }
 
-        let input_dir = input_dir.ok_or("missing --input-dir <dir>")?;
+        if input_dir.is_none() && relays.is_empty() {
+            return Err("provide --input-dir <dir> and/or --relays <url>".into());
+        }
         Ok(Self {
             index_root,
             input_dir,
+            relays,
+            archive_dir,
+            state_dir,
+            wot_out,
+            wot_refresh_every,
             heap_mb,
             commit_docs,
             parallelism,
@@ -69,18 +98,28 @@ impl Args {
 }
 
 fn help() -> String {
-    "nostrsearch ingest (via nostr-archive-cursor)\n\
-     --index-root <dir>     index output root (default ./data/index)\n\
-     --input-dir <dir>      directory of .jsonl/.json/.zst/.gz/.bz2 dumps\n\
-     --heap-mb <n>          tantivy writer heap per shard (default 512)\n\
-     --commit-docs <n>      commit every N docs per shard (default 200000)\n\
-     --parallelism <n>      files read in parallel (default: num cores)\n\
-     --chunk-size <n>       events per read chunk (default 2000)\n\
-     --no-dedupe            disable event-id dedup (faster, may index dupes)"
+    "nostrsearch unified ingest (archive + firehose → index + stats/WoT)\n\
+     --index-root <dir>        index output root (default ./data/index)\n\
+     --input-dir <dir>         JSONL dumps to backfill (.jsonl/.json/.zst/.gz/.bz2)\n\
+     --relays <url>            live firehose relay (repeatable)\n\
+     --archive-dir <dir>       ALSO archive firehose events as .jsonl.zst + id index\n\
+     \x20                        (absorbs nostrhole: produces the hole.v0l.io corpus)\n\
+     --state-dir <dir>         analysis state store (default ./data/stats)  | --no-state\n\
+     --wot-out <file>          also write WoT snapshot here (default ./data/wot.bin) | --no-wot-out\n\
+     --wot-refresh-every <n>   re-materialize + hot-swap WoT every N events (default 1000000)\n\
+     --heap-mb <n>             tantivy writer heap per shard (default 512)\n\
+     --commit-docs <n>         commit every N docs per shard (default 200000)\n\
+     --parallelism <n>         archive files read in parallel (default: num cores)\n\
+     --chunk-size <n>          events per read chunk (default 2000)\n\
+     --no-dedupe               disable archive event-id dedup"
         .to_string()
 }
 
 fn main() -> anyhow::Result<()> {
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -90,85 +129,122 @@ fn main() -> anyhow::Result<()> {
 
     let args = Args::parse().map_err(anyhow::Error::msg)?;
 
-    if !args.input_dir.is_dir() {
-        anyhow::bail!("--input-dir {} is not a directory", args.input_dir.display());
-    }
-
-    let cfg = ShardWriterConfig {
-        heap_bytes: args.heap_mb * 1_000_000,
-        commit_every_docs: args.commit_docs,
-        ..Default::default()
+    let cfg = PipelineConfig {
+        index_root: args.index_root.clone(),
+        shard: ShardWriterConfig {
+            heap_bytes: args.heap_mb * 1_000_000,
+            commit_every_docs: args.commit_docs,
+            ..Default::default()
+        },
+        state_dir: args.state_dir.clone(),
+        wot_refresh_every: args.wot_refresh_every,
+        wot_out: args.wot_out.clone(),
     };
+    let pipeline = Arc::new(Mutex::new(Pipeline::new(cfg)?));
 
-    let manager = Arc::new(Mutex::new(ShardManager::new(&args.index_root, cfg)));
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    rt.block_on(run(args, pipeline))
+}
+
+async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
     let total = Arc::new(AtomicU64::new(0));
     let started = Instant::now();
 
     // progress reporter
-    let total_prog = total.clone();
-    std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_secs(5));
-        let done = total_prog.load(Ordering::Relaxed);
-        if done > 0 {
-            let rate = done as f64 / started.elapsed().as_secs_f64();
-            eprintln!("  indexed={done}  rate={rate:.0}/s  elapsed={:.0}s", started.elapsed().as_secs_f64());
+    {
+        let total_prog = total.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let done = total_prog.load(Ordering::Relaxed);
+            if done > 0 {
+                let rate = done as f64 / started.elapsed().as_secs_f64();
+                eprintln!("  processed={done}  rate={rate:.0}/s  elapsed={:.0}s", started.elapsed().as_secs_f64());
+            }
+        });
+    }
+
+    // ── Phase 1: backfill from the archive (blocking) ──────────────────────
+    if let Some(input_dir) = args.input_dir.clone() {
+        if !input_dir.is_dir() {
+            anyhow::bail!("--input-dir {} is not a directory", input_dir.display());
         }
-    });
+        let parallelism = if args.parallelism == 0 {
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+        } else {
+            args.parallelism
+        };
+        tracing::info!(dir = %input_dir.display(), parallelism, "starting archive backfill");
 
-    let parallelism = if args.parallelism == 0 {
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
-    } else {
-        args.parallelism
-    };
+        let pipe = pipeline.clone();
+        let total_cb = total.clone();
+        let chunk_size = args.chunk_size;
+        let dedupe = args.dedupe;
+        tokio::task::spawn_blocking(move || {
+            let cursor = NostrCursor::new(input_dir)
+                .with_parallelism(parallelism)
+                .with_dedupe(dedupe);
+            cursor.walk_with_chunked_sync(
+                move |events: Vec<nostr_archive_cursor::NostrEventBorrowed>| {
+                    let batch: Vec<NostrEvent> = events.iter().map(to_core).collect();
+                    let mut p = pipe.lock().unwrap();
+                    for ev in &batch {
+                        p.process(ev);
+                    }
+                    drop(p);
+                    total_cb.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                },
+                chunk_size,
+            );
+        })
+        .await?;
 
-    tracing::info!(
-        dir = %args.input_dir.display(),
-        parallelism,
-        chunk_size = args.chunk_size,
-        dedupe = args.dedupe,
-        "starting ingest"
-    );
+        // finalize backfill and (if no firehose) commit + exit
+        pipeline.lock().unwrap().go_live();
+        pipeline.lock().unwrap().commit()?;
+        tracing::info!("archive backfill complete");
+    }
 
-    // The cursor drives parallel file reads; the callback converts each
-    // borrowed event into our core type and feeds the shard manager.
-    let total_cb = total.clone();
-    let manager_cb = manager.clone();
-    let cursor = NostrCursor::new(args.input_dir.clone())
-        .with_parallelism(parallelism)
-        .with_dedupe(args.dedupe);
+    // ── Phase 2: live firehose tail (runs until stopped) ───────────────────
+    if !args.relays.is_empty() {
+        // If we skipped backfill, still switch the pipeline into live mode.
+        if args.input_dir.is_none() {
+            pipeline.lock().unwrap().go_live();
+        }
 
-    cursor.walk_with_chunked_sync(
-        move |events: Vec<nostr_archive_cursor::NostrEventBorrowed>| {
-            let mut batch: Vec<NostrEvent> = Vec::with_capacity(events.len());
-            for ev in &events {
-                batch.push(NostrEvent {
-                    id: ev.id.to_string(),
-                    pubkey: ev.pubkey.to_string(),
-                    created_at: ev.created_at,
-                    kind: ev.kind as u16,
-                    tags: ev
-                        .tags
-                        .iter()
-                        .map(|t| t.iter().map(|s| s.to_string()).collect())
-                        .collect(),
-                    content: ev.content.to_string(),
-                    sig: ev.sig.to_string(),
-                });
-            }
-            let mut mgr = manager_cb.lock().unwrap();
-            for ev in &batch {
-                if let Err(e) = mgr.index_event(ev) {
-                    tracing::warn!(error = %e, "index_event failed");
+        // periodic commit for durability while tailing
+        {
+            let pipe = pipeline.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+                loop {
+                    tick.tick().await;
+                    if let Err(e) = pipe.lock().unwrap().commit() {
+                        tracing::warn!(error = %e, "periodic commit failed");
+                    }
                 }
-            }
-            drop(mgr);
-            total_cb.fetch_add(batch.len() as u64, Ordering::Relaxed);
-        },
-        args.chunk_size,
-    );
+            });
+        }
 
-    // final commit
-    manager.lock().unwrap().commit_all()?;
+        let pipe = pipeline.clone();
+        let total_cb = total.clone();
+        let mut fh = nostrsearch_indexer::firehose::FirehoseConfig::new(args.relays.clone());
+        if let Some(dir) = &args.archive_dir {
+            fh = fh.with_archive(dir);
+        }
+        tracing::info!(
+            relays = args.relays.len(),
+            archive = args.archive_dir.is_some(),
+            "starting firehose tail"
+        );
+        nostrsearch_indexer::firehose::run(&fh, move |ev| {
+            pipe.lock().unwrap().process(ev);
+            total_cb.fetch_add(1, Ordering::Relaxed);
+        })
+        .await?;
+    } else {
+        // archive-only run: final flush
+        pipeline.lock().unwrap().finish()?;
+    }
 
     let done = total.load(Ordering::Relaxed);
     let secs = started.elapsed().as_secs_f64();
@@ -179,4 +255,16 @@ fn main() -> anyhow::Result<()> {
         done as f64 / secs
     );
     Ok(())
+}
+
+fn to_core(ev: &nostr_archive_cursor::NostrEventBorrowed) -> NostrEvent {
+    NostrEvent {
+        id: ev.id.to_string(),
+        pubkey: ev.pubkey.to_string(),
+        created_at: ev.created_at,
+        kind: ev.kind as u16,
+        tags: ev.tags.iter().map(|t| t.iter().map(|s| s.to_string()).collect()).collect(),
+        content: ev.content.to_string(),
+        sig: ev.sig.to_string(),
+    }
 }

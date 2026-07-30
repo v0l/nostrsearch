@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 nostrsearch-core = { path = "../nostrsearch-core" }
+nostrsearch-stats = { path = "../nostrsearch-stats" }
 tantivy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -17,7 +18,9 @@ tokio.workspace = true
 bytes.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 tracing-subscriber.workspace = true
-nostr-archive-cursor = { git = "https://github.com/v0l/nostr-archive-cursor.git", default-features = false, features = ["sync"] }
+nostr-archive-cursor = { git = "https://github.com/v0l/nostr-archive-cursor.git", default-features = false, features = ["sync", "db-rocksdb"] }
+nostr-sdk = "0.44"
+rustls = { version = "0.23", features = ["ring"] }
 
 [dev-dependencies]
 tempfile = "3"
