@@ -24,6 +24,7 @@ pub trait DynAnalysis: Send + Sync {
     fn epoch(&self) -> u32;
     fn deps(&self) -> &'static [&'static str];
     fn refresh_interval(&self) -> Option<Duration>;
+    fn attach(&mut self, ctx: &crate::AttachCtx) -> Result<()>;
     fn wants(&self, ev: &NostrEvent) -> bool;
     fn observe(&mut self, ev: &NostrEvent, ctx: &AnalysisCtx) -> bool;
     fn refresh(&mut self);
@@ -50,6 +51,9 @@ where
     }
     fn refresh_interval(&self) -> Option<Duration> {
         Analysis::refresh_interval(self)
+    }
+    fn attach(&mut self, ctx: &crate::AttachCtx) -> Result<()> {
+        Analysis::attach(self, ctx)
     }
     fn wants(&self, ev: &NostrEvent) -> bool {
         Analysis::wants(self, ev)
@@ -181,6 +185,23 @@ impl Registry {
                 }
                 _ => e.progress = Progress::fresh(cur_epoch),
             }
+        }
+        // External storage must be attached before any observe.
+        self.attach_all(store.dir())?;
+        Ok(())
+    }
+
+    /// Open the shared on-disk graph and hand it to every analysis.
+    ///
+    /// Analyses that need the adjacency keep it in RocksDB rather than holding
+    /// billions of edges in RAM, and they share one store so the graph is not
+    /// duplicated per analysis. [`load`](Registry::load) calls this; call it
+    /// directly when running without a [`StatStore`].
+    pub fn attach_all(&mut self, dir: &std::path::Path) -> Result<()> {
+        let graph = std::sync::Arc::new(crate::graph::GraphStore::open(dir.join("graph"))?);
+        let ctx = crate::AttachCtx { graph };
+        for e in &mut self.entries {
+            e.analysis.attach(&ctx)?;
         }
         Ok(())
     }

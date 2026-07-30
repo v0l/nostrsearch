@@ -27,6 +27,11 @@ impl StatStore {
         Ok(Self { dir })
     }
 
+    /// Root directory of the store (external state, e.g. the graph, lives here).
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
     fn state_path(&self, name: &str) -> PathBuf {
         self.dir.join(format!("{name}.state.bin"))
     }

@@ -13,11 +13,12 @@
 //! involved; periodic recompute is the pragmatic default. A future incremental
 //! impl would keep this same trait surface and just shorten the interval.)
 
+use crate::graph::SharedGraph;
 use crate::types::Pubkey;
-use crate::{Analysis, AnalysisCtx, World};
+use crate::{Analysis, AnalysisCtx, AttachCtx, World};
 use nostrsearch_core::event::NostrEvent;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Duration;
 
 const KIND_CONTACTS: &[u16] = &[3];
@@ -26,22 +27,22 @@ const ITERATIONS: usize = 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pagerank {
-    /// author → followed set (newest-wins), the raw graph.
-    follows: HashMap<Pubkey, HashSet<Pubkey>>,
-    seen_at: HashMap<Pubkey, u64>,
     /// Last computed ranks (refreshed on a schedule, not per event).
     ranks: HashMap<Pubkey, f32>,
     /// Refresh cadence in seconds.
     interval_secs: u64,
+    /// The adjacency is read from the shared on-disk graph that `follow_graph`
+    /// maintains; pagerank keeps no copy of its own.
+    #[serde(skip)]
+    store: Option<SharedGraph>,
 }
 
 impl Default for Pagerank {
     fn default() -> Self {
         Self {
-            follows: HashMap::new(),
-            seen_at: HashMap::new(),
             ranks: HashMap::new(),
             interval_secs: 24 * 3600,
+            store: None,
         }
     }
 }
@@ -83,44 +84,40 @@ impl Analysis for Pagerank {
         Some(Duration::from_secs(self.interval_secs))
     }
 
-    fn observe(&mut self, ev: &NostrEvent, _ctx: &AnalysisCtx) -> bool {
-        let author = match Pubkey::from_hex(&ev.pubkey) {
-            Some(a) => a,
-            None => return false,
-        };
-        if let Some(&ts) = self.seen_at.get(&author) {
-            if ev.created_at <= ts {
-                return false;
-            }
-        }
-        let follows: HashSet<Pubkey> = ev.tag_values("p").filter_map(Pubkey::from_hex).collect();
-        self.seen_at.insert(author, ev.created_at);
-        self.follows.insert(author, follows);
-        true
+    fn attach(&mut self, ctx: &AttachCtx) -> anyhow::Result<()> {
+        self.store = Some(ctx.graph.clone());
+        Ok(())
     }
 
-    fn merge(&mut self, other: Self) {
-        for (author, ts) in other.seen_at {
-            let take = self.seen_at.get(&author).map(|&c| ts > c).unwrap_or(true);
-            if take {
-                if let Some(f) = other.follows.get(&author) {
-                    self.seen_at.insert(author, ts);
-                    self.follows.insert(author, f.clone());
-                }
-            }
-        }
+    /// No per-event work: `follow_graph` already writes every contact list to
+    /// the shared store, so pagerank reads it at refresh time instead of
+    /// keeping a second copy of the adjacency.
+    fn observe(&mut self, _ev: &NostrEvent, _ctx: &AnalysisCtx) -> bool {
+        false
     }
 
-    /// Expensive: power-iterate pagerank over the accumulated graph.
+    fn merge(&mut self, _other: Self) {
+        // Adjacency is shared on disk; ranks are recomputed by `refresh`.
+    }
+
+    /// Expensive: power-iterate pagerank over the shared on-disk graph.
+    ///
+    /// Two streaming passes build a dense node index and the out-adjacency, so
+    /// only the index and rank vectors are resident (sized by pubkeys, not
+    /// edges); the edges themselves stay in RocksDB.
     fn refresh(&mut self) {
-        // Build a dense node index over everyone who appears (author or followed).
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+
+        // Pass 1: dense node index over everyone who appears.
         let mut idx: HashMap<Pubkey, usize> = HashMap::new();
-        for (a, fs) in &self.follows {
-            idx.entry(*a).or_insert_with(|| 0);
-            for f in fs {
-                idx.entry(*f).or_insert_with(|| 0);
+        store.for_each(|author, f| {
+            idx.entry(author).or_insert(0);
+            for p in &f.follows {
+                idx.entry(*p).or_insert(0);
             }
-        }
+        });
         let n = idx.len();
         if n == 0 {
             self.ranks.clear();
@@ -129,14 +126,14 @@ impl Analysis for Pagerank {
         for (i, v) in idx.values_mut().enumerate() {
             *v = i;
         }
-        // out-adjacency by index
+        // Pass 2: out-adjacency by index.
         let mut out: Vec<Vec<usize>> = vec![Vec::new(); n];
-        for (a, fs) in &self.follows {
-            let ai = idx[a];
-            for f in fs {
-                out[ai].push(idx[f]);
+        store.for_each(|author, f| {
+            let ai = idx[&author];
+            for p in &f.follows {
+                out[ai].push(idx[p]);
             }
-        }
+        });
 
         let base = (1.0 - DAMPING) / n as f32;
         let mut rank = vec![1.0f32 / n as f32; n];
@@ -183,36 +180,48 @@ impl Analysis for Pagerank {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::GraphStore;
+    use std::sync::Arc;
 
-    fn pk(seed: u8) -> String {
-        format!("{:02x}", seed).repeat(32)
-    }
-    fn contacts(author: u8, follows: &[u8]) -> NostrEvent {
-        NostrEvent {
-            id: format!("{:02x}", author).repeat(32),
-            pubkey: pk(author),
-            created_at: 10,
-            kind: 3,
-            tags: follows.iter().map(|p| vec!["p".into(), pk(*p)]).collect(),
-            content: String::new(),
-            sig: "c".repeat(128),
-        }
+    fn pk(seed: u8) -> Pubkey {
+        crate::types::Hash32([seed; 32])
     }
 
     #[test]
     fn hub_ranks_highest_after_refresh() {
-        let ctx = AnalysisCtx::bare(0);
-        let mut pr = Pagerank::default();
-        // everyone follows node 9 → it should rank highest
+        let mut dir = std::env::temp_dir();
+        dir.push(format!(
+            "nspr-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let store = Arc::new(GraphStore::open(&dir).unwrap());
+
+        // `follow_graph` owns writes; pagerank only reads the shared store.
         for a in 1..=5u8 {
-            pr.observe(&contacts(a, &[9]), &ctx);
+            store.put(&pk(a), 10, &[pk(9)]).unwrap();
         }
+
+        let mut pr = Pagerank::default();
+        pr.attach(&AttachCtx {
+            graph: store.clone(),
+        })
+        .unwrap();
         pr.refresh();
+
         let mut world = World::new();
         pr.contribute(&mut world);
-        let hub = Pubkey::from_hex(&pk(9)).unwrap();
-        let leaf = Pubkey::from_hex(&pk(1)).unwrap();
-        assert!(world.pagerank(&hub) > world.pagerank(&leaf));
-        assert!(world.wot_tier(&hub) >= world.wot_tier(&leaf));
+        assert!(
+            world.pagerank(&pk(9)) > world.pagerank(&pk(1)),
+            "the hub everyone follows should rank highest"
+        );
+        assert!(world.wot_tier(&pk(9)) >= world.wot_tier(&pk(1)));
+
+        drop(pr);
+        drop(store);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

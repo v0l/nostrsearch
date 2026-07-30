@@ -22,6 +22,7 @@
 
 pub mod analyses;
 pub mod ctx;
+pub mod graph;
 pub mod metrics;
 pub mod progress;
 pub mod registry;
@@ -31,6 +32,7 @@ pub mod types;
 pub mod wot;
 
 pub use ctx::{AnalysisCtx, PublisherFilter, PubkeyStat, World};
+pub use graph::{GraphStore, SharedGraph};
 pub use metrics::{
     AnalysisMetrics, BufferObserver, MetricsEvent, MetricsObserver, NullObserver, Phase,
     PipelineMetrics,
@@ -43,6 +45,13 @@ pub use types::{EventId, Hash32, Pubkey};
 pub use wot::{SharedWot, WotIndex};
 
 use crate::ctx::World as WorldTy;
+
+/// Shared resources handed to [`Analysis::attach`].
+pub struct AttachCtx {
+    /// The on-disk follow graph, shared by every analysis that needs it so
+    /// there is exactly one copy.
+    pub graph: crate::graph::SharedGraph,
+}
 use nostrsearch_core::event::NostrEvent;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -60,6 +69,13 @@ pub trait Analysis: Send + Sync {
 
     /// Stable identifier — used as the file/endpoint name.
     fn name(&self) -> &'static str;
+
+    /// Attach shared external storage. Called by the registry after `load`
+    /// and before any `observe`, so analyses whose state is too large for RAM
+    /// (the follow graph) can keep it on disk instead of serializing it.
+    fn attach(&mut self, _ctx: &AttachCtx) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// Recompute epoch. Bump when the analysis logic changes enough that
     /// persisted state is invalid — the runner discards saved state and

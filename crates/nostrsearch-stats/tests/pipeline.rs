@@ -47,11 +47,13 @@ fn dependency_staging_publisher_filter_and_metrics() {
     let events = corpus();
     let obs = Arc::new(BufferObserver::new(256));
 
+    let gdir = tempdir();
     let mut reg = Registry::new();
     reg.set_observer(obs.clone());
     reg.register(FollowGraph::default())
         .register(Pagerank::default())
         .register(KindBreakdown::filtered(PublisherFilter::min_followers(10)));
+    reg.attach_all(&gdir).unwrap();
 
     // follow_graph + pagerank in stage 0, filtered kind_breakdown in stage 1.
     let stages = reg.stages().unwrap();
