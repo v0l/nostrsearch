@@ -112,11 +112,13 @@ spec:
             #   value: "0,1,3,7,30023"
 
             # ── Stats / web-of-trust ────────────────────────────────────────
-            # Shard writers held open at once. Total writer heap is roughly
-            # this x the per-shard heap, so it bounds memory over a corpus
-            # spanning many months (the archive covers ~70 monthly shards).
+            # Shard writers held open at once; total writer heap is roughly
+            # this x the per-shard heap (~4GB at 64 x 64MB). Keep it at or
+            # above the number of months the corpus spans — dumps are often
+            # not date-ordered, and a smaller cap evicts writers that are
+            # immediately needed again, paying a commit + fsync each time.
             - name: MAX_OPEN_SHARDS
-              value: "8"
+              value: "64"
             - name: STATE_DIR
               value: /data/stats
             - name: WOT_OUT
@@ -199,9 +201,9 @@ spec:
 #             - "/data/wot.bin"
 #             # Bound writer heap: max-open-shards x heap-mb.
 #             - "--max-open-shards"
-#             - "8"
+#             - "64"
 #             - "--heap-mb"
-#             - "128"
+#             - "64"
 #           env:
 #             - name: RUST_LOG
 #               value: nostrsearch=info,nostr_archive_cursor=info

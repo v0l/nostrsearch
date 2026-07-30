@@ -222,7 +222,13 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
                 .with_dedupe(dedupe);
             cursor.walk_with_chunked_sync(
                 move |events: Vec<nostr_archive_cursor::NostrEventBorrowed>| {
-                    let batch: Vec<NostrEvent> = events.iter().map(to_core).collect();
+                    let mut batch: Vec<NostrEvent> = events.iter().map(to_core).collect();
+                    // Group each chunk by time so events land shard-by-shard.
+                    // Archives are not necessarily date-ordered, and writing in
+                    // arbitrary month order thrashes the open-shard set: each
+                    // switch can evict a writer that is needed again a moment
+                    // later, paying a commit + fsync every time.
+                    batch.sort_unstable_by_key(|e| e.created_at);
                     let mut p = pipe.lock().unwrap();
                     for ev in &batch {
                         p.process(ev);

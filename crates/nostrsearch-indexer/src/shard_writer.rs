@@ -42,22 +42,30 @@ pub struct ShardWriterConfig {
     /// Number of writer threads per shard.
     pub writer_threads: usize,
     /// Maximum shards held open at once. Each open shard costs `heap_bytes` of
-    /// writer heap, so an unbounded backfill over a multi-year corpus (~70
-    /// monthly shards) would need `70 x heap_bytes` and get OOM-killed. When
-    /// the cap is exceeded the least-recently-written shard is committed and
-    /// closed; it reopens transparently if more events route to it.
+    /// writer heap, so the product bounds writer memory. When the cap is
+    /// exceeded the least-recently-written shard is committed and closed, and
+    /// reopens transparently if more events route to it.
+    ///
+    /// Set this at or above the number of months the corpus spans. Eviction is
+    /// a safety valve, not a steady state: dumps are often not date-ordered, so
+    /// a cap below the corpus span makes every few events evict a shard that is
+    /// immediately needed again, and each eviction costs a commit + fsync.
     pub max_open_shards: usize,
 }
 
 impl Default for ShardWriterConfig {
     fn default() -> Self {
         Self {
-            heap_bytes: 128 * 1_000_000, // 128 MB per hot shard
+            heap_bytes: 64 * 1_000_000, // 64 MB per hot shard
             commit_every_docs: 100_000,
             commit_every: Duration::from_secs(30),
             writer_threads: 2,
-            // 8 x 128 MB = ~1 GB of writer heap regardless of corpus span.
-            max_open_shards: 8,
+            // Archives are not necessarily date-ordered: a dump directory can
+            // interleave every month of the corpus, in which case a small cap
+            // evicts a shard that is needed again immediately and every
+            // eviction pays a full commit + fsync. Hold a whole multi-year
+            // corpus open instead — 64 x 64 MB is ~4 GB.
+            max_open_shards: 64,
         }
     }
 }
@@ -122,6 +130,8 @@ pub struct ShardManager {
     shards: HashMap<ShardId, OpenShard>,
     /// Monotonic counter used to pick the least-recently-written shard.
     tick: u64,
+    /// Total evictions, used to detect thrashing.
+    evictions: u64,
     /// WoT tier lookup hook — maps pubkey hex → tier. Pluggable so the WoT
     /// graph can be injected without the indexer depending on it.
     wot_lookup: Option<Box<dyn Fn(&str) -> u8 + Send + Sync>>,
@@ -134,6 +144,7 @@ impl ShardManager {
             cfg,
             shards: HashMap::new(),
             tick: 0,
+            evictions: 0,
             wot_lookup: None,
         }
     }
@@ -177,7 +188,19 @@ impl ShardManager {
                 .map(|(id, _)| *id);
             match victim {
                 Some(id) => {
-                    tracing::info!(shard = %id, open = self.shards.len(), "evicting shard writer");
+                    self.evictions += 1;
+                    // Sustained eviction means the cap is below the corpus span
+                    // and every eviction is paying a commit for nothing.
+                    if self.evictions == 100 {
+                        tracing::warn!(
+                            max_open_shards = cap,
+                            "evicting shard writers repeatedly — the archive spans more months \
+                             than the open-shard cap, so each eviction pays a commit and is \
+                             immediately reopened; raise --max-open-shards to the number of \
+                             months in the corpus"
+                        );
+                    }
+                    tracing::debug!(shard = %id, open = self.shards.len(), "evicting shard writer");
                     self.close_shard(id)?;
                 }
                 None => break,

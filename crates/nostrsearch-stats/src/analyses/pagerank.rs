@@ -22,6 +22,12 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 const KIND_CONTACTS: &[u16] = &[3];
+
+/// Node cap for the in-RAM power iteration (~64 bytes per node for the index
+/// alone, before adjacency). 5M nodes is roughly 1GB of index.
+fn default_max_nodes() -> usize {
+    5_000_000
+}
 const DAMPING: f32 = 0.85;
 const ITERATIONS: usize = 20;
 
@@ -31,6 +37,9 @@ pub struct Pagerank {
     ranks: HashMap<Pubkey, f32>,
     /// Refresh cadence in seconds.
     interval_secs: u64,
+    /// Refuse to run the in-RAM power iteration above this many nodes.
+    #[serde(default = "default_max_nodes")]
+    max_nodes: usize,
     /// The adjacency is read from the shared on-disk graph that `follow_graph`
     /// maintains; pagerank keeps no copy of its own.
     #[serde(skip)]
@@ -42,12 +51,19 @@ impl Default for Pagerank {
         Self {
             ranks: HashMap::new(),
             interval_secs: 24 * 3600,
+            max_nodes: default_max_nodes(),
             store: None,
         }
     }
 }
 
 impl Pagerank {
+    /// Cap on nodes before the refresh refuses to run.
+    pub fn with_max_nodes(mut self, n: usize) -> Self {
+        self.max_nodes = n;
+        self
+    }
+
     pub fn with_interval(mut self, d: Duration) -> Self {
         self.interval_secs = d.as_secs().max(1);
         self
@@ -111,6 +127,13 @@ impl Analysis for Pagerank {
         };
 
         // Pass 1: dense node index over everyone who appears.
+        //
+        // NOTE: this pass and the next materialize the whole graph in RAM
+        // (~64 bytes per pubkey for the index, plus 24 bytes per node and 8
+        // per edge for the adjacency). That is fine for a modest graph and
+        // fatal for a corpus-scale one, so the node count is capped and the
+        // refresh is skipped rather than allowed to OOM the process. A
+        // scalable version needs interned ids and an on-disk CSR.
         let mut idx: HashMap<Pubkey, usize> = HashMap::new();
         store.for_each(|author, f| {
             idx.entry(author).or_insert(0);
@@ -118,6 +141,16 @@ impl Analysis for Pagerank {
                 idx.entry(*p).or_insert(0);
             }
         });
+
+        if idx.len() > self.max_nodes {
+            tracing::warn!(
+                nodes = idx.len(),
+                max_nodes = self.max_nodes,
+                "pagerank graph exceeds max_nodes; skipping refresh (raise PAGERANK_MAX_NODES \
+                 or leave pagerank disabled — follow_graph still provides WoT tiers)"
+            );
+            return;
+        }
         let n = idx.len();
         if n == 0 {
             self.ranks.clear();
