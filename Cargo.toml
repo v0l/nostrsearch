@@ -4,6 +4,7 @@ members = [
     "crates/nostrsearch-core",
     "crates/nostrsearch-indexer",
     "crates/nostrsearch-server",
+    "crates/nostrsearch-stats",
 ]
 
 [workspace.package]

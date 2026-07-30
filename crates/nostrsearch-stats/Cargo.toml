@@ -1,0 +1,16 @@
+[package]
+name = "nostrsearch-stats"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+nostrsearch-core = { path = "../nostrsearch-core" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+hex = { workspace = true }
+bincode = "1.3"
