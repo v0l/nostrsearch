@@ -1,9 +1,12 @@
 name: nostrsearch
 
 services:
-  # ── Search API server ──────────────────────────────────────────────────────
-  # Serves the REST search API over the time-sharded Tantivy indices in
-  # /data/index. Long-running; scales vertically (more cores/RAM on one node).
+  # ── Unified node ───────────────────────────────────────────────────────────
+  # ONE process: search API + archive HTTP + nostr archive relay + live
+  # firehose, all over a shared Tantivy index, one archive database, and one
+  # stats/WoT engine. Writes are serialized through a single writer task, and
+  # the search reader auto-reloads on commit, so relay/firehose events become
+  # searchable within the commit interval.
   server:
     image: registry.v0l.io/nostrsearch:latest
     build:
@@ -16,14 +19,15 @@ services:
       INDEX_ROOT: /data/index
       BIND: 0.0.0.0:8080
       RUST_LOG: nostrsearch=info,tower_http=info
-      # Publish the raw .jsonl.zst corpus at /archive (nostrhole's HTTP role).
-      # Opened index-free, so this can run while the firehose holds the
-      # archive's exclusive RocksDB index lock.
+      # Publish the raw .jsonl.zst corpus at /archive and archive into it.
       ARCHIVE_DIR: /data/archive
-      # Set ENABLE_RELAY=1 to also accept inbound writes at / (nostr relay).
-      # That requires the index lock, so only enable it if the firehose
-      # service is NOT running with --archive-dir.
-      # ENABLE_RELAY: "1"
+      STATE_DIR: /data/stats
+      WOT_OUT: /data/wot.bin
+      # Accept inbound writes at / (nostr archive relay). Relay events are
+      # archived AND indexed AND folded into stats by the same process.
+      ENABLE_RELAY: "1"
+      # Comma-separated upstream relays enable the live firehose in-process.
+      RELAYS: "wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net"
     volumes:
       - index-data:/data
     # Search is mmap-heavy; give the page cache room. Tune to the host.
@@ -81,16 +85,14 @@ services:
         limits:
           memory: 16G
 
-  # ── Live firehose ingest (absorbs nostrhole) ───────────────────────────────
-  # Same unified pipeline in live mode: ONE relay subscription that writes to
-  # all three sinks — the .jsonl.zst archive (the hole.v0l.io corpus), the
-  # Tantivy search index, and the stats/WoT engine. Long-running.
+  # ── Standalone firehose (ALTERNATIVE to the node's built-in firehose) ──────
+  # The `server` node already runs the firehose in-process when RELAYS is set,
+  # which is the normal deployment. Use this only if you want the writer in a
+  # separate container — in which case the server MUST run without RELAYS and
+  # without ENABLE_RELAY, since only one process may hold the Tantivy writer
+  # and the archive's RocksDB index lock.
   #
   #   docker compose --profile firehose up -d firehose
-  #
-  # NOTE: writes to the same index volume as `ingest` (don't run both at once)
-  # and holds the archive's exclusive RocksDB index lock, so the server must
-  # run without ENABLE_RELAY while this is up.
   firehose:
     image: registry.v0l.io/nostrsearch:latest
     build:

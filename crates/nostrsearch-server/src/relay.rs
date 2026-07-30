@@ -16,7 +16,6 @@ use axum::extract::{ConnectInfo, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
-use nostr_archive_cursor::DefaultJsonFilesDatabase;
 use nostr_relay_builder::builder::RateLimit;
 use nostr_relay_builder::prelude::{Kind, PolicyResult, QueryPolicy, WritePolicy};
 use nostr_relay_builder::{LocalRelay, RelayBuilder};
@@ -65,7 +64,14 @@ pub struct RelayState {
 
 impl RelayState {
     /// Build a relay writing into the given archive database.
-    pub fn new(db: DefaultJsonFilesDatabase, kinds: Option<Vec<u16>>) -> Self {
+    ///
+    /// In the unified node this is a [`NodeDb`](crate::node::NodeDb), which
+    /// archives *and* forwards to the writer task so relay-published events
+    /// become searchable.
+    pub fn new<D>(db: D, kinds: Option<Vec<u16>>) -> Self
+    where
+        D: nostr_sdk::prelude::NostrDatabase + 'static,
+    {
         let mut builder = RelayBuilder::default()
             .database(db)
             .query_policy(NoQuery)

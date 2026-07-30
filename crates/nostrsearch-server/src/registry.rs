@@ -119,12 +119,21 @@ impl ShardRegistry {
         // Plan against any open shard's index (schema is identical across
         // shards, so the QueryParser only needs one). If no shard exists yet,
         // there is nothing to search.
+        // A registry opened against an empty index has `earliest` at its
+        // default, so no anchor exists yet. Shards created afterwards (by a
+        // writer in this process or another) would then never be found. Re-run
+        // discovery before giving up so a live node picks up the first shard
+        // without a restart.
         let anchor = self
             .shards
             .values()
             .next()
             .cloned()
-            .or_else(|| self.shard(self.earliest));
+            .or_else(|| self.shard(self.earliest))
+            .or_else(|| {
+                let _ = self.discover();
+                self.shard(self.earliest)
+            });
         let Some(anchor) = anchor else {
             return Ok(Vec::new());
         };
@@ -189,18 +198,33 @@ impl ShardRegistry {
         Ok(hits)
     }
 
+    /// Every shard id present on disk, plus any already-open ones.
+    pub fn all_shard_ids(&mut self) -> Vec<ShardId> {
+        let _ = self.discover();
+        let mut ids: std::collections::BTreeSet<ShardId> = self.shards.keys().copied().collect();
+        if self.root.exists() {
+            if let Ok(rd) = std::fs::read_dir(&self.root) {
+                for entry in rd.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if let Some(id) = ShardId::parse(&name) {
+                        ids.insert(id);
+                    }
+                }
+            }
+        }
+        ids.into_iter().collect()
+    }
+
     /// Fetch a single event by id across all shards.
     pub fn get_event(&mut self, event_id: &str) -> Result<Option<SearchHit>, RegistryError> {
         let filter = SearchFilter {
             limit: 1,
             ..Default::default()
         };
-        // brute-force across shards by term on event_id
-        let ids: Vec<ShardId> = self
-            .shards
-            .keys()
-            .copied()
-            .collect();
+        // Brute-force across shards by term on event_id. Enumerate shard dirs
+        // from disk (not just already-open readers) so a node that started
+        // against an empty index still finds events written afterwards.
+        let ids: Vec<ShardId> = self.all_shard_ids();
         for id in ids {
             if let Some(shard) = self.shard(id) {
                 let searcher = shard.reader.searcher();

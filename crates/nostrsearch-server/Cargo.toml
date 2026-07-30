@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 nostrsearch-core = { path = "../nostrsearch-core" }
+nostrsearch-indexer = { path = "../nostrsearch-indexer" }
+nostrsearch-stats = { path = "../nostrsearch-stats" }
 tantivy.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -27,8 +29,7 @@ hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 sha1 = "0.10"
 base64 = "0.22"
+rustls = { version = "0.23", features = ["ring"] }
 
 [dev-dependencies]
 tempfile = "3"
-nostrsearch-indexer = { path = "../nostrsearch-indexer" }
-nostr-archive-cursor = { git = "https://github.com/v0l/nostr-archive-cursor.git", default-features = false, features = ["sync"] }

@@ -40,15 +40,19 @@ spec:
               value: 0.0.0.0:8080
             - name: RUST_LOG
               value: nostrsearch=info,tower_http=info
-            # Publish the raw .jsonl.zst corpus at /archive (nostrhole's HTTP
-            # role). Index-free open, so it coexists with the firehose writer.
+            # Unified node: archive HTTP + archive relay + live firehose all
+            # run in this process over the shared index. Relay/firehose events
+            # are archived, indexed, and folded into stats together.
             - name: ARCHIVE_DIR
               value: /data/archive
-            # ENABLE_RELAY=1 also accepts inbound writes at / (nostr relay),
-            # but takes the archive's exclusive index lock — only enable when
-            # the firehose Deployment is NOT running with --archive-dir.
-            # - name: ENABLE_RELAY
-            #   value: "1"
+            - name: STATE_DIR
+              value: /data/stats
+            - name: WOT_OUT
+              value: /data/wot.bin
+            - name: ENABLE_RELAY
+              value: "1"
+            - name: RELAYS
+              value: "wss://relay.damus.io,wss://nos.lol,wss://relay.primal.net"
           volumeMounts:
             - name: index-data
               mountPath: /data

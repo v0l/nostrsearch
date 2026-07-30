@@ -1736,6 +1736,8 @@ dependencies = [
  "nostr-sdk",
  "nostrsearch-core",
  "nostrsearch-indexer",
+ "nostrsearch-stats",
+ "rustls",
  "serde",
  "serde_json",
  "sha1",

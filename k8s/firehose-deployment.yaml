@@ -1,12 +1,14 @@
-# Live firehose ingest. Runs the SAME unified pipeline as the ingest Job, but
-# in live mode: tails relay websockets and writes new events into the index and
-# the stats/WoT engine continuously.
+# ALTERNATIVE standalone firehose writer.
 #
-# IMPORTANT: the index PVC is ReadWriteOnce and the writer must not run
-# concurrently with the ingest Job. Either:
-#   - run the ingest Job first (backfill), then scale this up; and
-#   - schedule this on the same node as the server (RWO), or switch the PVC to
-#     ReadWriteMany.
+# The nostrsearch-server Deployment already runs the firehose in-process when
+# RELAYS is set, which is the normal deployment. Use this only to run the
+# writer separately — in which case the server Deployment MUST drop RELAYS and
+# ENABLE_RELAY, since only one process may hold the Tantivy writer and the
+# archive's RocksDB index lock.
+#
+# The index PVC is ReadWriteOnce, so this must also not run concurrently with
+# the ingest Job, and needs to be scheduled on the same node as the server
+# (or switch the PVC to ReadWriteMany).
 #
 #   kubectl apply -f k8s/firehose-deployment.yaml
 apiVersion: apps/v1

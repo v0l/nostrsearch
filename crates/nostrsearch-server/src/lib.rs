@@ -5,10 +5,12 @@
 
 pub mod archive;
 pub mod http;
+pub mod node;
 pub mod registry;
 pub mod relay;
 
 pub use archive::ArchiveState;
+pub use node::{EventSink, NodeDb, spawn_firehose, spawn_writer};
 pub use relay::RelayState;
 pub use http::{AppState, SharedState, router};
 pub use registry::{RegistryStats, SearchHit, ShardRegistry};
