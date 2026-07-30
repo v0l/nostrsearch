@@ -69,8 +69,12 @@ RUN apt-get update && \
 
 COPY --from=rust-build /app/bin ./bin
 
-# Index data lives here (mount a volume).
+# All state lives under the mounted volume; the defaults must be writable by
+# the non-root user, so point them at /data rather than the CWD-relative
+# defaults the binaries use outside a container.
 ENV INDEX_ROOT=/data/index \
+    STATE_DIR=/data/stats \
+    WOT_OUT=/data/wot.bin \
     BIND=0.0.0.0:8080 \
     RUST_LOG=nostrsearch=info,tower_http=info
 VOLUME ["/data"]

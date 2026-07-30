@@ -77,7 +77,7 @@ spec:
         fsGroup: 10001
       containers:
         - name: nostrsearch
-          image: registry.v0l.io/nostrsearch:latest
+          image: voidic/nostrsearch:latest
           imagePullPolicy: Always
           ports:
             - name: http
@@ -181,7 +181,7 @@ spec:
 #         fsGroup: 10001
 #       containers:
 #         - name: ingest
-#           image: registry.v0l.io/nostrsearch:latest
+#           image: voidic/nostrsearch:latest
 #           command: ["./bin/ingest"]
 #           args:
 #             - "--index-root"

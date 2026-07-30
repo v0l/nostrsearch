@@ -8,7 +8,7 @@ services:
   # the search reader auto-reloads on commit, so relay/firehose events become
   # searchable within the commit interval.
   server:
-    image: registry.v0l.io/nostrsearch:latest
+    image: voidic/nostrsearch:latest
     build:
       context: .
       dockerfile: Dockerfile
@@ -54,7 +54,7 @@ services:
   # Writes into the same index volume the server reads. Analysis state persists
   # under /data/stats so a later run (or the firehose) warm-starts with WoT.
   ingest:
-    image: registry.v0l.io/nostrsearch:latest
+    image: voidic/nostrsearch:latest
     build:
       context: .
       dockerfile: Dockerfile
