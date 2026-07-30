@@ -16,6 +16,14 @@ services:
       INDEX_ROOT: /data/index
       BIND: 0.0.0.0:8080
       RUST_LOG: nostrsearch=info,tower_http=info
+      # Publish the raw .jsonl.zst corpus at /archive (nostrhole's HTTP role).
+      # Opened index-free, so this can run while the firehose holds the
+      # archive's exclusive RocksDB index lock.
+      ARCHIVE_DIR: /data/archive
+      # Set ENABLE_RELAY=1 to also accept inbound writes at / (nostr relay).
+      # That requires the index lock, so only enable it if the firehose
+      # service is NOT running with --archive-dir.
+      # ENABLE_RELAY: "1"
     volumes:
       - index-data:/data
     # Search is mmap-heavy; give the page cache room. Tune to the host.
@@ -32,13 +40,15 @@ services:
       retries: 3
       start_period: 10s
 
-  # ── One-shot ingest ────────────────────────────────────────────────────────
-  # Loads a directory of Nostr JSONL dumps (.jsonl/.json/.zst/.gz/.bz2) into
-  # the index via nostr-archive-cursor, then exits. Run on demand:
+  # ── One-shot archive ingest ────────────────────────────────────────────────
+  # Unified pipeline in backfill mode: streams a directory of Nostr JSONL dumps
+  # (.jsonl/.json/.zst/.gz/.bz2) into BOTH the Tantivy index and the stats/WoT
+  # engine, then exits. Run on demand:
   #
   #   DUMPS_DIR=/path/to/dumps docker compose --profile ingest run --rm ingest
   #
-  # Writes into the same index volume the server reads.
+  # Writes into the same index volume the server reads. Analysis state persists
+  # under /data/stats so a later run (or the firehose) warm-starts with WoT.
   ingest:
     image: registry.v0l.io/nostrsearch:latest
     build:
@@ -56,6 +66,91 @@ services:
       - "512"
       - "--commit-docs"
       - "200000"
+      # Stats/WoT are computed from the same stream and hot-swapped into scoring.
+      - "--state-dir"
+      - "/data/stats"
+      - "--wot-out"
+      - "/data/wot.bin"
+    environment:
+      RUST_LOG: nostrsearch=info,nostr_archive_cursor=info
+    volumes:
+      - index-data:/data
+      - ${DUMPS_DIR:-./dumps}:/dumps:ro
+    deploy:
+      resources:
+        limits:
+          memory: 16G
+
+  # ── Live firehose ingest (absorbs nostrhole) ───────────────────────────────
+  # Same unified pipeline in live mode: ONE relay subscription that writes to
+  # all three sinks — the .jsonl.zst archive (the hole.v0l.io corpus), the
+  # Tantivy search index, and the stats/WoT engine. Long-running.
+  #
+  #   docker compose --profile firehose up -d firehose
+  #
+  # NOTE: writes to the same index volume as `ingest` (don't run both at once)
+  # and holds the archive's exclusive RocksDB index lock, so the server must
+  # run without ENABLE_RELAY while this is up.
+  firehose:
+    image: registry.v0l.io/nostrsearch:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles: ["firehose"]
+    restart: unless-stopped
+    entrypoint: ["./bin/ingest"]
+    command:
+      - "--index-root"
+      - "/data/index"
+      - "--relays"
+      - "wss://relay.damus.io"
+      - "--relays"
+      - "wss://nos.lol"
+      - "--relays"
+      - "wss://relay.primal.net"
+      # Archive every received event as .jsonl.zst + id index (nostrhole role).
+      - "--archive-dir"
+      - "/data/archive"
+      - "--state-dir"
+      - "/data/stats"
+      - "--wot-out"
+      - "/data/wot.bin"
+      - "--wot-refresh-every"
+      - "100000"
+    environment:
+      RUST_LOG: nostrsearch=info
+    volumes:
+      - index-data:/data
+    deploy:
+      resources:
+        limits:
+          memory: 8G
+
+  # ── One-shot stats-only / web-of-trust backfill ────────────────────────────
+  # Stats WITHOUT indexing: streams the dumps through the analysis pipeline
+  # (FollowGraph + Pagerank) and writes /data/wot.bin + /data/stats only.
+  # The unified `ingest`/`firehose` services already do this inline, so this is
+  # for computing WoT ahead of a first index build (so the very first documents
+  # are written with real trust tiers instead of 0):
+  #
+  #   DUMPS_DIR=/path/to/dumps docker compose --profile stats run --rm stats
+  #
+  # Analysis state is persisted under /data/stats (resumable / additive).
+  stats:
+    image: registry.v0l.io/nostrsearch:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles: ["stats"]
+    restart: "no"
+    entrypoint: ["./bin/stats"]
+    command:
+      - "--input-dir"
+      - "/dumps"
+      - "--state-dir"
+      - "/data/stats"
+      - "--wot-out"
+      - "/data/wot.bin"
     environment:
       RUST_LOG: nostrsearch=info,nostr_archive_cursor=info
     volumes:

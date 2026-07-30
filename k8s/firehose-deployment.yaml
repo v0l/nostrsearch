@@ -1,0 +1,75 @@
+# Live firehose ingest. Runs the SAME unified pipeline as the ingest Job, but
+# in live mode: tails relay websockets and writes new events into the index and
+# the stats/WoT engine continuously.
+#
+# IMPORTANT: the index PVC is ReadWriteOnce and the writer must not run
+# concurrently with the ingest Job. Either:
+#   - run the ingest Job first (backfill), then scale this up; and
+#   - schedule this on the same node as the server (RWO), or switch the PVC to
+#     ReadWriteMany.
+#
+#   kubectl apply -f k8s/firehose-deployment.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nostrsearch-firehose
+  namespace: nostrsearch
+  labels:
+    app.kubernetes.io/name: nostrsearch
+    app.kubernetes.io/component: firehose
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: nostrsearch
+      app.kubernetes.io/component: firehose
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: nostrsearch
+        app.kubernetes.io/component: firehose
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        fsGroup: 10001
+      containers:
+        - name: firehose
+          image: registry.v0l.io/nostrsearch:latest
+          imagePullPolicy: Always
+          command: ["./bin/ingest"]
+          args:
+            - "--index-root"
+            - "/data/index"
+            - "--relays"
+            - "wss://relay.damus.io"
+            - "--relays"
+            - "wss://nos.lol"
+            - "--relays"
+            - "wss://relay.primal.net"
+            - "--archive-dir"
+            - "/data/archive"
+            - "--state-dir"
+            - "/data/stats"
+            - "--wot-out"
+            - "/data/wot.bin"
+            - "--wot-refresh-every"
+            - "100000"
+          env:
+            - name: RUST_LOG
+              value: nostrsearch=info
+          volumeMounts:
+            - name: index-data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "250m"
+              memory: 2Gi
+            limits:
+              memory: 8Gi
+      volumes:
+        - name: index-data
+          persistentVolumeClaim:
+            claimName: nostrsearch-index

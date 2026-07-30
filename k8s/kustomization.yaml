@@ -2,8 +2,11 @@ apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 namespace: nostrsearch
 
-# The ingest Job is intentionally excluded from the default set — apply it
-# on demand with `kubectl apply -f k8s/ingest-job.yaml`.
+# The ingest/stats Jobs and the firehose Deployment are intentionally excluded
+# from the default set — apply them on demand:
+#   kubectl apply -f k8s/stats-job.yaml            # optional: pre-compute WoT
+#   kubectl apply -f k8s/ingest-job.yaml           # archive backfill
+#   kubectl apply -f k8s/firehose-deployment.yaml  # live tail (RWO: see notes)
 resources:
   - pvc.yaml
   - deployment.yaml

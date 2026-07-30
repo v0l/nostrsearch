@@ -40,6 +40,15 @@ spec:
               value: 0.0.0.0:8080
             - name: RUST_LOG
               value: nostrsearch=info,tower_http=info
+            # Publish the raw .jsonl.zst corpus at /archive (nostrhole's HTTP
+            # role). Index-free open, so it coexists with the firehose writer.
+            - name: ARCHIVE_DIR
+              value: /data/archive
+            # ENABLE_RELAY=1 also accepts inbound writes at / (nostr relay),
+            # but takes the archive's exclusive index lock — only enable when
+            # the firehose Deployment is NOT running with --archive-dir.
+            # - name: ENABLE_RELAY
+            #   value: "1"
           volumeMounts:
             - name: index-data
               mountPath: /data

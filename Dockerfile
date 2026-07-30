@@ -6,28 +6,38 @@
 FROM rust:1-bookworm AS rust-deps
 WORKDIR /src
 # git is required to fetch the nostr-archive-cursor git dependency.
+# clang/libclang are required to build librocksdb-sys (archive id index).
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends git pkg-config libssl-dev && \
+    apt-get install -y --no-install-recommends git pkg-config libssl-dev \
+        clang libclang-dev llvm-dev && \
     rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
 COPY crates/nostrsearch-core/Cargo.toml       crates/nostrsearch-core/Cargo.toml
 COPY crates/nostrsearch-indexer/Cargo.toml    crates/nostrsearch-indexer/Cargo.toml
 COPY crates/nostrsearch-server/Cargo.toml     crates/nostrsearch-server/Cargo.toml
+COPY crates/nostrsearch-stats/Cargo.toml      crates/nostrsearch-stats/Cargo.toml
 # Stub out the crates so cargo builds only dependencies.
 RUN mkdir -p crates/nostrsearch-core/src \
              crates/nostrsearch-indexer/src/bin \
-             crates/nostrsearch-server/src/bin && \
+             crates/nostrsearch-server/src/bin \
+             crates/nostrsearch-stats/src && \
     echo "" > crates/nostrsearch-core/src/lib.rs && \
     echo "" > crates/nostrsearch-indexer/src/lib.rs && \
     echo "fn main() {}" > crates/nostrsearch-indexer/src/bin/ingest.rs && \
+    echo "fn main() {}" > crates/nostrsearch-indexer/src/bin/stats.rs && \
+    echo "fn main() {}" > crates/nostrsearch-indexer/src/bin/archive.rs && \
     echo "" > crates/nostrsearch-server/src/lib.rs && \
     echo "fn main() {}" > crates/nostrsearch-server/src/main.rs && \
+    echo "" > crates/nostrsearch-stats/src/lib.rs && \
     cargo build --release && \
     rm -f target/release/ingest \
+          target/release/stats \
+          target/release/archive \
           target/release/nostrsearch-server \
           target/release/deps/nostrsearch_core-* \
           target/release/deps/nostrsearch_indexer-* \
           target/release/deps/nostrsearch_server-* \
+          target/release/deps/nostrsearch_stats-* \
           target/release/deps/libnostrsearch_*
 
 # ── Application build ─────────────────────────────────────────────────────────
@@ -36,10 +46,13 @@ COPY crates ./crates
 # Touch entry points so Cargo rebuilds the app crates, not the world.
 RUN touch crates/nostrsearch-core/src/lib.rs \
           crates/nostrsearch-indexer/src/lib.rs \
-          crates/nostrsearch-server/src/lib.rs && \
+          crates/nostrsearch-server/src/lib.rs \
+          crates/nostrsearch-stats/src/lib.rs && \
     cargo build --release && \
     mkdir -p /app/bin && \
     cp target/release/ingest /app/bin/ingest && \
+    cp target/release/stats /app/bin/stats && \
+    cp target/release/archive /app/bin/archive && \
     cp target/release/nostrsearch-server /app/bin/nostrsearch-server
 
 # ── Runtime image ─────────────────────────────────────────────────────────────

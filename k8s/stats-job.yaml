@@ -1,26 +1,28 @@
-# One-shot ingest Job. Loads Nostr JSONL dumps into the shared index volume.
-# The dumps must be made available at /dumps (edit the volume below to point at
-# your source — e.g. a separate PVC, hostPath, or an initContainer that fetches
-# them). Because the index PVC is ReadWriteOnce, scale the server Deployment to
-# 0 (or run this on the same node) while ingesting.
+# One-shot stats / web-of-trust backfill Job. Streams the Nostr JSONL dumps
+# through the analysis pipeline (FollowGraph + Pagerank) and writes a WoT
+# snapshot to /data/wot.bin on the shared index volume. Run this BEFORE the
+# ingest Job so indexed documents carry a `wot_tier` scoring signal.
 #
-#   kubectl apply -f k8s/ingest-job.yaml
-#   kubectl -n nostrsearch logs -f job/nostrsearch-ingest
+# Analysis state is persisted under /data/stats (resumable / additive), so
+# adding a new analysis later re-scrapes only that analysis.
+#
+#   kubectl apply -f k8s/stats-job.yaml
+#   kubectl -n nostrsearch logs -f job/nostrsearch-stats
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: nostrsearch-ingest
+  name: nostrsearch-stats
   namespace: nostrsearch
   labels:
     app.kubernetes.io/name: nostrsearch
-    app.kubernetes.io/component: ingest
+    app.kubernetes.io/component: stats
 spec:
   backoffLimit: 0
   template:
     metadata:
       labels:
         app.kubernetes.io/name: nostrsearch
-        app.kubernetes.io/component: ingest
+        app.kubernetes.io/component: stats
     spec:
       restartPolicy: Never
       securityContext:
@@ -28,20 +30,13 @@ spec:
         runAsUser: 10001
         fsGroup: 10001
       containers:
-        - name: ingest
+        - name: stats
           image: registry.v0l.io/nostrsearch:latest
           imagePullPolicy: Always
-          command: ["./bin/ingest"]
+          command: ["./bin/stats"]
           args:
-            - "--index-root"
-            - "/data/index"
             - "--input-dir"
             - "/dumps"
-            - "--heap-mb"
-            - "512"
-            - "--commit-docs"
-            - "200000"
-            # Stats/WoT computed from the same stream, hot-swapped into scoring.
             - "--state-dir"
             - "/data/stats"
             - "--wot-out"
@@ -65,5 +60,5 @@ spec:
           persistentVolumeClaim:
             claimName: nostrsearch-index
         - name: dumps
-          # Point this at wherever your dumps live.
+          # Point this at wherever your dumps live (same as the ingest Job).
           emptyDir: {}
