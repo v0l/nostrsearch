@@ -23,14 +23,47 @@ pub struct AppState {
 pub type SharedState = Arc<AppState>;
 
 pub fn router(state: SharedState) -> Router {
-    Router::new()
+    router_with_archive(state, None)
+}
+
+/// Router with optional archive serving and relay (absorbs nostrhole's HTTP +
+/// relay roles): archive files under `/archive`, nostr relay websocket at `/`.
+pub fn router_with_archive(
+    state: SharedState,
+    archive: Option<crate::archive::ArchiveState>,
+) -> Router {
+    router_full(state, archive, None)
+}
+
+/// Full router: search API + optional archive serving + optional nostr relay.
+pub fn router_full(
+    state: SharedState,
+    archive: Option<crate::archive::ArchiveState>,
+    relay: Option<crate::relay::RelayState>,
+) -> Router {
+    let mut app = Router::new()
         .route("/search", get(search_get).post(search_post))
         .route("/event/{id}", get(get_event))
         .route("/stats", get(stats))
         .route("/healthz", get(healthz))
-        .layer(tower_http::cors::CorsLayer::permissive())
+        .with_state(state);
+
+    if let Some(a) = archive {
+        app = app.nest("/archive", crate::archive::router(a));
+    }
+
+    if let Some(r) = relay {
+        // Nostr relays live at the root path; a websocket upgrade here is
+        // handed to LocalRelay, anything else falls through to the archive
+        // index page (or 400 if archive serving is off).
+        app = app.route(
+            "/",
+            get(crate::relay::ws_handler).with_state(r),
+        );
+    }
+
+    app.layer(tower_http::cors::CorsLayer::permissive())
         .layer(tower_http::trace::TraceLayer::new_for_http())
-        .with_state(state)
 }
 
 async fn healthz() -> &'static str {
