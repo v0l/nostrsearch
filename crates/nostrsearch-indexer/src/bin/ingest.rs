@@ -171,12 +171,23 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
     // progress reporter
     {
         let total_prog = total.clone();
+        let limit_mb = nostrsearch_indexer::mem::cgroup_limit_mb();
+        if let Some(l) = limit_mb {
+            tracing::info!(limit_mb = l, "cgroup memory limit");
+        }
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_secs(5));
             let done = total_prog.load(Ordering::Relaxed);
             if done > 0 {
                 let rate = done as f64 / started.elapsed().as_secs_f64();
-                eprintln!("  processed={done}  rate={rate:.0}/s  elapsed={:.0}s", started.elapsed().as_secs_f64());
+                let (rss, peak) = nostrsearch_indexer::mem::rss_mb();
+                let pct = limit_mb
+                    .map(|l| format!(" ({:.0}% of {}MB limit)", rss as f64 / l as f64 * 100.0, l))
+                    .unwrap_or_default();
+                eprintln!(
+                    "  processed={done}  rate={rate:.0}/s  elapsed={:.0}s  rss={rss}MB peak={peak}MB{pct}",
+                    started.elapsed().as_secs_f64()
+                );
             }
         });
     }

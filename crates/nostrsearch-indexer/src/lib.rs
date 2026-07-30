@@ -22,6 +22,7 @@
 //!   between them keeps memory flat over a 763 GiB corpus.
 
 pub mod env;
+pub mod mem;
 pub mod firehose;
 pub mod pipeline;
 pub mod shard_writer;
