@@ -39,7 +39,9 @@ pub struct ShardWriterConfig {
     pub commit_every_docs: u64,
     /// ...or after this much wall time, whichever comes first.
     pub commit_every: Duration,
-    /// Number of writer threads per shard.
+    /// Number of writer threads per shard. Total indexing threads is this
+    /// times the number of open shards, so keep it at 1 unless very few shards
+    /// are open.
     pub writer_threads: usize,
     /// Maximum shards held open at once. Each open shard costs `heap_bytes` of
     /// writer heap, so the product bounds writer memory. When the cap is
@@ -59,7 +61,11 @@ impl Default for ShardWriterConfig {
             heap_bytes: 64 * 1_000_000, // 64 MB per hot shard
             commit_every_docs: 100_000,
             commit_every: Duration::from_secs(30),
-            writer_threads: 2,
+            // One thread per shard: parallelism comes from having many shards
+            // open, and each extra writer thread adds arena and merge overhead
+            // on top of the nominal heap budget. At 44 open shards, two
+            // threads each meant 88 indexing threads.
+            writer_threads: 1,
             // Archives are not necessarily date-ordered: a dump directory can
             // interleave every month of the corpus, in which case a small cap
             // evicts a shard that is needed again immediately and every

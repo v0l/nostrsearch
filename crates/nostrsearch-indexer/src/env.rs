@@ -92,6 +92,12 @@ pub fn max_open_shards() -> usize {
     u64_or("MAX_OPEN_SHARDS", 8) as usize
 }
 
+/// Indexing threads per shard (`WRITER_THREADS`, 1). Total indexing threads is
+/// this times the number of open shards.
+pub fn writer_threads() -> usize {
+    u64_or("WRITER_THREADS", 1) as usize
+}
+
 pub fn wot_refresh_every() -> u64 {
     u64_or("WOT_REFRESH_EVERY", 100_000)
 }
