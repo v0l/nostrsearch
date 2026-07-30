@@ -1,0 +1,14 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: nostrsearch
+
+# The ingest Job is intentionally excluded from the default set — apply it
+# on demand with `kubectl apply -f k8s/ingest-job.yaml`.
+resources:
+  - pvc.yaml
+  - deployment.yaml
+  - service.yaml
+
+images:
+  - name: registry.v0l.io/nostrsearch
+    newTag: latest
