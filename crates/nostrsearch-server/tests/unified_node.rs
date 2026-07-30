@@ -40,6 +40,8 @@ async fn relay_write_is_archived_and_searchable_in_one_process() -> anyhow::Resu
             shard: ShardWriterConfig::default(),
             state_dir: Some(root.join("stats")),
             wot_refresh_every: 1_000_000,
+            min_refresh_interval: std::time::Duration::from_secs(60),
+            persist_interval: std::time::Duration::from_secs(300),
             wot_out: None,
         },
         1_000,

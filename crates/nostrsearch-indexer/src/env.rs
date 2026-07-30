@@ -12,6 +12,8 @@
 //! | `ARCHIVE_DIR` | `.jsonl.zst` corpus + id index | unset |
 //! | `RELAYS` | comma-separated upstream relays | unset |
 //! | `WOT_REFRESH_EVERY` | events between WoT rebuilds | `100000` |
+//! | `WOT_MIN_REFRESH_SECS` | wall-clock floor between rebuilds | `60` |
+//! | `STATS_PERSIST_SECS` | analysis-state persist cadence | `300` |
 //!
 //! Defaults are CWD-relative so the binaries work from a checkout; the
 //! container image overrides them to absolute paths under the data volume,
@@ -84,6 +86,16 @@ pub fn relays() -> Vec<String> {
 
 pub fn wot_refresh_every() -> u64 {
     u64_or("WOT_REFRESH_EVERY", 100_000)
+}
+
+/// Wall-clock floor between WoT refreshes (`WOT_MIN_REFRESH_SECS`, 60s).
+pub fn min_refresh_interval() -> std::time::Duration {
+    std::time::Duration::from_secs(u64_or("WOT_MIN_REFRESH_SECS", 60))
+}
+
+/// Cadence for persisting analysis state (`STATS_PERSIST_SECS`, 300s).
+pub fn persist_interval() -> std::time::Duration {
+    std::time::Duration::from_secs(u64_or("STATS_PERSIST_SECS", 300))
 }
 
 #[cfg(test)]

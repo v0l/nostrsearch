@@ -147,6 +147,8 @@ fn main() -> anyhow::Result<()> {
         },
         state_dir: args.state_dir.clone(),
         wot_refresh_every: args.wot_refresh_every,
+        min_refresh_interval: nostrsearch_indexer::env::min_refresh_interval(),
+        persist_interval: nostrsearch_indexer::env::persist_interval(),
         wot_out: args.wot_out.clone(),
     };
     let pipeline = Arc::new(Mutex::new(Pipeline::new(cfg)?));

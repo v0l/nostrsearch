@@ -18,6 +18,7 @@ use nostrsearch_core::event::NostrEvent;
 use nostrsearch_stats::analyses::{FollowGraph, Pagerank};
 use nostrsearch_stats::{Registry, SharedWot, StatStore, World, WotIndex};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 /// Configuration for the unified pipeline.
 pub struct PipelineConfig {
@@ -27,6 +28,16 @@ pub struct PipelineConfig {
     pub state_dir: Option<PathBuf>,
     /// Re-materialize WoT and hot-swap the lookup every N processed events.
     pub wot_refresh_every: u64,
+    /// Wall-clock floor between refreshes. At high ingest rates the event
+    /// counter alone fires far too often — materializing the world and
+    /// rebuilding the index every second or two produces an identical snapshot
+    /// while stalling the writer.
+    pub min_refresh_interval: Duration,
+    /// How often analysis state is written to disk. Persisting serializes the
+    /// whole follow/pagerank graph, which is orders of magnitude more expensive
+    /// than materializing WoT, so it gets its own much slower cadence (state is
+    /// always flushed by [`Pipeline::finish`]).
+    pub persist_interval: Duration,
     /// Also write the WoT snapshot here on each refresh (for a separate ingest).
     pub wot_out: Option<PathBuf>,
 }
@@ -38,6 +49,8 @@ impl Default for PipelineConfig {
             shard: ShardWriterConfig::default(),
             state_dir: None,
             wot_refresh_every: 1_000_000,
+            min_refresh_interval: Duration::from_secs(60),
+            persist_interval: Duration::from_secs(300),
             wot_out: None,
         }
     }
@@ -53,6 +66,9 @@ pub struct Pipeline {
     cfg: PipelineConfig,
     live: bool,
     since_refresh: u64,
+    last_refresh: Instant,
+    last_persist: Instant,
+    refreshed_once: bool,
 }
 
 impl Pipeline {
@@ -86,6 +102,10 @@ impl Pipeline {
             cfg,
             live: false,
             since_refresh: 0,
+            // Allow the first refresh immediately.
+            last_refresh: Instant::now() - Duration::from_secs(86_400),
+            last_persist: Instant::now(),
+            refreshed_once: false,
         };
 
         // Warm start: if analysis state was restored, materialize it now so the
@@ -125,21 +145,57 @@ impl Pipeline {
         if let Err(e) = self.manager.index_event(ev) {
             tracing::warn!(error = %e, "index_event failed");
         }
+        // Only the live tail refreshes periodically. During a backfill the
+        // graph is still being assembled, so a mid-run refresh is both
+        // expensive (it re-serializes the whole graph) and wrong: documents
+        // would be written with whatever partial tier happened to exist when
+        // they were indexed, making scoring depend on ingest order. Backfill
+        // instead uses the tier loaded at startup for the whole run and
+        // materializes once at the end (`go_live` / `finish`).
         self.since_refresh += 1;
-        if self.since_refresh >= self.cfg.wot_refresh_every {
-            self.refresh_wot();
+        if self.live && self.since_refresh >= self.cfg.wot_refresh_every {
+            self.maybe_refresh_wot();
         }
     }
 
     /// Re-materialize the world, rebuild + hot-swap the WoT index, persist
     /// analysis state, and (optionally) write the WoT snapshot to disk.
+    /// Refresh only if the wall-clock floor has elapsed. Called from the hot
+    /// path, where the event counter alone would otherwise fire constantly.
+    fn maybe_refresh_wot(&mut self) {
+        if self.last_refresh.elapsed() < self.cfg.min_refresh_interval {
+            // Reset the counter so we don't re-test on every subsequent event.
+            self.since_refresh = 0;
+            return;
+        }
+        self.refresh_wot();
+    }
+
+    /// Re-materialize the world, rebuild + hot-swap the WoT index, and (on its
+    /// own slower cadence) persist analysis state.
     pub fn refresh_wot(&mut self) {
+        self.refresh_inner(false);
+    }
+
+    fn refresh_inner(&mut self, force_persist: bool) {
+        // Nothing folded since the last refresh means the world would be
+        // identical; skip the work. (`go_live` refreshes at the end of a
+        // backfill, so `finish` right after would otherwise repeat it.)
+        if self.refreshed_once && self.since_refresh == 0 {
+            return;
+        }
+        self.refreshed_once = true;
         self.since_refresh = 0;
+        self.last_refresh = Instant::now();
+
+        let t0 = Instant::now();
         let now_wall = Self::now();
         if let Err(e) = self.registry.materialize_all(now_wall, &mut self.world) {
             tracing::warn!(error = %e, "stats materialize failed");
             return;
         }
+        let materialize_ms = t0.elapsed().as_millis();
+
         let idx = WotIndex::from_world(&self.world);
         let entries = idx.len();
         if let Some(path) = &self.cfg.wot_out {
@@ -152,12 +208,28 @@ impl Pipeline {
         }
         self.wot.replace(idx);
         self.registry.emit_tick(self.world.len());
+
+        // Persisting serializes the entire follow/pagerank graph — far more
+        // expensive than the above — so it runs on its own cadence.
+        let mut persist_ms = 0;
         if let Some(store) = &self.store {
-            if let Err(e) = self.registry.persist(store) {
-                tracing::warn!(error = %e, "stats persist failed");
+            if force_persist || self.last_persist.elapsed() >= self.cfg.persist_interval {
+                let t1 = Instant::now();
+                if let Err(e) = self.registry.persist(store) {
+                    tracing::warn!(error = %e, "stats persist failed");
+                }
+                persist_ms = t1.elapsed().as_millis();
+                self.last_persist = Instant::now();
             }
         }
-        tracing::info!(wot_entries = entries, world = self.world.len(), "WoT refreshed");
+
+        tracing::info!(
+            wot_entries = entries,
+            world = self.world.len(),
+            materialize_ms,
+            persist_ms,
+            "WoT refreshed"
+        );
     }
 
     /// Switch from backfill to live mode: finalize backfill, refresh WoT once,
@@ -166,7 +238,7 @@ impl Pipeline {
         if let Err(e) = self.registry.mark_all_backfilled() {
             tracing::warn!(error = %e, "mark_all_backfilled failed");
         }
-        self.refresh_wot();
+        self.refresh_inner(true);
         self.live = true;
         tracing::info!("pipeline switched to live mode");
     }
@@ -179,7 +251,7 @@ impl Pipeline {
 
     /// Final flush: commit shards + refresh/persist stats.
     pub fn finish(&mut self) -> Result<()> {
-        self.refresh_wot();
+        self.refresh_inner(true);
         self.commit()?;
         Ok(())
     }

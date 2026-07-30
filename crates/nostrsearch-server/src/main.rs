@@ -75,6 +75,8 @@ async fn main() -> anyhow::Result<()> {
             shard: ShardWriterConfig::default(),
             state_dir: Some(env::state_dir()),
             wot_refresh_every: env::wot_refresh_every(),
+            min_refresh_interval: env::min_refresh_interval(),
+            persist_interval: env::persist_interval(),
             wot_out: Some(env::wot_out()),
         };
         let (sink, handle) = nostrsearch_server::spawn_writer(
