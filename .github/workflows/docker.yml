@@ -43,7 +43,7 @@ jobs:
 
       - uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          username: voidic
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       # latest + immutable sha tag so a deploy can be rolled back to a
