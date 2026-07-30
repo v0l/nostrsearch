@@ -149,3 +149,54 @@ fn tempdir() -> std::path::PathBuf {
     std::fs::create_dir_all(&p).unwrap();
     p
 }
+
+/// Re-running a backfill over *newer* dumps must keep updating stats.
+///
+/// Exercises `observe_backfill`, the path the `ingest` binary uses. An earlier
+/// version skipped every already-backfilled analysis outright, so a second
+/// ingest over new daily dumps indexed the events but silently never updated
+/// stats/WoT again.
+#[test]
+fn rerunning_backfill_over_newer_events_still_updates_stats() {
+    let dir = tempdir();
+    let store = StatStore::new(&dir).unwrap();
+    let world = nostrsearch_stats::World::new();
+
+    // Round 1: original corpus (star gets 10 followers).
+    {
+        let mut reg = Registry::new();
+        reg.register(FollowGraph::default());
+        reg.load(&store).unwrap();
+        for e in corpus() {
+            reg.observe_backfill(&e, 1_000, &world);
+        }
+        let mut w = nostrsearch_stats::World::new();
+        reg.materialize_all(2_000_000_000, &mut w).unwrap();
+        reg.mark_all_backfilled().unwrap();
+        reg.persist(&store).unwrap();
+        assert_eq!(w.follower_count(&pk_hash(200)), 10);
+    }
+
+    // Round 2: a later dump adds 5 more followers for `star`.
+    let mut later = Vec::new();
+    for i in 10..15u8 {
+        later.push(ev(&id(500 + i as u16), &pk(i), 3, 1_000 + i as u64, &[pk(200)]));
+    }
+
+    let mut reg = Registry::new();
+    reg.register(FollowGraph::default());
+    reg.load(&store).unwrap();
+    assert!(!reg.entries()[0].needs_backfill(), "restored as backfilled");
+
+    for e in &later {
+        reg.observe_backfill(e, 2_000, &world);
+    }
+    let mut w = nostrsearch_stats::World::new();
+    reg.materialize_all(2_000_000_000, &mut w).unwrap();
+
+    assert_eq!(
+        w.follower_count(&pk_hash(200)),
+        15,
+        "a later dump must be folded into the existing follow graph"
+    );
+}

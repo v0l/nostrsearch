@@ -310,7 +310,16 @@ impl Registry {
         };
         let mut touched = false;
         for e in &mut self.entries {
-            if !e.needs_backfill() {
+            // An analysis still doing its initial scan folds everything: the
+            // archive is unordered, so the watermark rule would drop earlier
+            // events as soon as a later one bumped the mark.
+            //
+            // An analysis that already finished falls back to the watermark
+            // rule rather than being skipped — otherwise re-running a backfill
+            // over newly published dumps would index the events but silently
+            // never update stats/WoT again.
+            let initial = e.needs_backfill();
+            if !initial && !e.progress.should_consume(ev.created_at, &id) {
                 continue;
             }
             if e.analysis.wants(ev) {
@@ -322,10 +331,15 @@ impl Registry {
                     e.progress.counters.filtered += 1;
                 }
             }
-            if ev.created_at > e.progress.watermark {
-                e.progress.watermark = ev.created_at;
+            if initial {
+                // Track the high-water mark without the ordered bookkeeping.
+                if ev.created_at > e.progress.watermark {
+                    e.progress.watermark = ev.created_at;
+                }
+                e.progress.events += 1;
+            } else {
+                e.progress.advance(ev.created_at, id);
             }
-            e.progress.events += 1;
             touched = true;
         }
         if touched {

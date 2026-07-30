@@ -18,19 +18,11 @@
 use nostrsearch_core::scoring::ScoreWeights;
 use nostrsearch_indexer::{PipelineConfig, ShardWriterConfig};
 use nostrsearch_server::{AppState, ArchiveState, ShardRegistry};
-use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-fn env_flag(k: &str) -> bool {
-    matches!(
-        std::env::var(k).ok().as_deref(),
-        Some("1") | Some("true") | Some("yes")
-    )
-}
-
-fn env_path(k: &str, default: &str) -> PathBuf {
-    PathBuf::from(std::env::var(k).unwrap_or_else(|_| default.into()))
-}
+// The environment contract is defined once in nostrsearch_indexer::env so the
+// server node, `ingest` and `stats` all agree on the same variables.
+use nostrsearch_indexer::env;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -43,16 +35,11 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let index_root = env_path("INDEX_ROOT", "./data/index");
+    let index_root = env::index_root();
     let bind = std::env::var("BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
-    let archive_dir = std::env::var("ARCHIVE_DIR").ok().filter(|s| !s.is_empty());
-    let relays: Vec<String> = std::env::var("RELAYS")
-        .unwrap_or_default()
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-    let want_relay = env_flag("ENABLE_RELAY");
+    let archive_dir = env::archive_dir();
+    let relays = env::relays();
+    let want_relay = env::flag("ENABLE_RELAY");
     let want_firehose = !relays.is_empty();
     // Any write role means this process owns the archive index + Tantivy writer.
     let is_writer = want_relay || want_firehose;
@@ -86,12 +73,9 @@ async fn main() -> anyhow::Result<()> {
         let cfg = PipelineConfig {
             index_root: index_root.clone(),
             shard: ShardWriterConfig::default(),
-            state_dir: Some(env_path("STATE_DIR", "./data/stats")),
-            wot_refresh_every: std::env::var("WOT_REFRESH_EVERY")
-                .ok()
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(100_000),
-            wot_out: Some(env_path("WOT_OUT", "./data/wot.bin")),
+            state_dir: Some(env::state_dir()),
+            wot_refresh_every: env::wot_refresh_every(),
+            wot_out: Some(env::wot_out()),
         };
         let (sink, handle) = nostrsearch_server::spawn_writer(
             cfg,

@@ -5,7 +5,7 @@ use nostrsearch_core::schema::NostrSchema;
 use nostrsearch_core::scoring::{CompositeCollector, ScoreWeights, ScoredDoc};
 use nostrsearch_core::shard::ShardId;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use tantivy::collector::TopDocs;
 use tantivy::schema::Value;

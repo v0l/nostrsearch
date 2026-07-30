@@ -31,9 +31,11 @@ struct Args {
 
 impl Args {
     fn parse() -> Result<Self, String> {
+        // Same env contract as the server node and `ingest`; flags override.
+        use nostrsearch_indexer::env;
         let mut input_dir = None;
-        let mut state_dir = PathBuf::from("./data/stats");
-        let mut wot_out = PathBuf::from("./data/wot.bin");
+        let mut state_dir = env::state_dir();
+        let mut wot_out = env::wot_out();
         let mut parallelism = 0usize;
         let mut chunk_size = 2_000usize;
         let mut dedupe = true;
@@ -67,9 +69,11 @@ impl Args {
 
 fn help() -> String {
     "nostrsearch stats/WoT backfill (via nostr-archive-cursor)\n\
+     Defaults read from STATE_DIR / WOT_OUT; flags override.\n\
+     \n\
      --input-dir <dir>      directory of .jsonl/.json/.zst/.gz/.bz2 dumps\n\
-     --state-dir <dir>      analysis state store (default ./data/stats)\n\
-     --wot-out <file>       output WoT snapshot for `ingest --wot` (default ./data/wot.bin)\n\
+     --state-dir <dir>      analysis state store ($STATE_DIR, ./data/stats)\n\
+     --wot-out <file>       output WoT snapshot ($WOT_OUT, ./data/wot.bin)\n\
      --parallelism <n>      files read in parallel (default: num cores)\n\
      --chunk-size <n>       events per read chunk (default 2000)\n\
      --no-dedupe            disable event-id dedup"

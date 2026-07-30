@@ -19,7 +19,8 @@ struct Args {
 
 impl Args {
     fn parse() -> Result<Self, String> {
-        let mut dir = None;
+        // Same env contract as the other binaries; --dir overrides.
+        let mut dir = nostrsearch_indexer::env::archive_dir();
         let mut stats = false;
         let mut rebuild_index = false;
 
@@ -36,7 +37,7 @@ impl Args {
                 other => return Err(format!("unknown arg: {other}")),
             }
         }
-        let dir = dir.ok_or("missing --dir <archive dir>")?;
+        let dir = dir.ok_or("missing --dir <archive dir> (or set ARCHIVE_DIR)")?;
         if !(stats || rebuild_index) {
             return Err("pick one of --stats / --rebuild-index".into());
         }

@@ -39,13 +39,17 @@ struct Args {
 
 impl Args {
     fn parse() -> Result<Self, String> {
-        let mut index_root = PathBuf::from("./data/index");
+        // Defaults come from the same environment contract the server node
+        // uses (INDEX_ROOT, STATE_DIR, WOT_OUT, ARCHIVE_DIR, RELAYS), so the
+        // container image configures every entry point once. Flags override.
+        use nostrsearch_indexer::env;
+        let mut index_root = env::index_root();
         let mut input_dir = None;
-        let mut relays = Vec::new();
-        let mut archive_dir = None;
-        let mut state_dir = Some(PathBuf::from("./data/stats"));
-        let mut wot_out = Some(PathBuf::from("./data/wot.bin"));
-        let mut wot_refresh_every = 1_000_000u64;
+        let mut relays = env::relays();
+        let mut archive_dir = env::archive_dir();
+        let mut state_dir = Some(env::state_dir());
+        let mut wot_out = Some(env::wot_out());
+        let mut wot_refresh_every = env::wot_refresh_every();
         let mut heap_mb = 512usize;
         let mut commit_docs = 200_000u64;
         let mut parallelism = 0usize;
@@ -99,7 +103,12 @@ impl Args {
 
 fn help() -> String {
     "nostrsearch unified ingest (archive + firehose → index + stats/WoT)\n\
-     --index-root <dir>        index output root (default ./data/index)\n\
+     \n\
+     Defaults are read from the same env vars as the server node:\n\
+     INDEX_ROOT, STATE_DIR, WOT_OUT, ARCHIVE_DIR, RELAYS, WOT_REFRESH_EVERY.\n\
+     Flags below override them.\n\
+     \n\
+     --index-root <dir>        index output root ($INDEX_ROOT, ./data/index)\n\
      --input-dir <dir>         JSONL dumps to backfill (.jsonl/.json/.zst/.gz/.bz2)\n\
      --relays <url>            live firehose relay (repeatable)\n\
      --archive-dir <dir>       ALSO archive firehose events as .jsonl.zst + id index\n\
