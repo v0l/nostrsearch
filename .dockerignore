@@ -1,0 +1,8 @@
+target
+data
+*.log
+.git
+/tmp
+Dockerfile
+docker-compose.yml
+compose.yml

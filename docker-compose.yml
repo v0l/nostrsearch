@@ -1,0 +1,71 @@
+name: nostrsearch
+
+services:
+  # ── Search API server ──────────────────────────────────────────────────────
+  # Serves the REST search API over the time-sharded Tantivy indices in
+  # /data/index. Long-running; scales vertically (more cores/RAM on one node).
+  server:
+    image: registry.v0l.io/nostrsearch:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      INDEX_ROOT: /data/index
+      BIND: 0.0.0.0:8080
+      RUST_LOG: nostrsearch=info,tower_http=info
+    volumes:
+      - index-data:/data
+    # Search is mmap-heavy; give the page cache room. Tune to the host.
+    deploy:
+      resources:
+        limits:
+          memory: 24G
+        reservations:
+          memory: 4G
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ── One-shot ingest ────────────────────────────────────────────────────────
+  # Loads a directory of Nostr JSONL dumps (.jsonl/.json/.zst/.gz/.bz2) into
+  # the index via nostr-archive-cursor, then exits. Run on demand:
+  #
+  #   DUMPS_DIR=/path/to/dumps docker compose --profile ingest run --rm ingest
+  #
+  # Writes into the same index volume the server reads.
+  ingest:
+    image: registry.v0l.io/nostrsearch:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+    profiles: ["ingest"]
+    restart: "no"
+    entrypoint: ["./bin/ingest"]
+    command:
+      - "--index-root"
+      - "/data/index"
+      - "--input-dir"
+      - "/dumps"
+      - "--heap-mb"
+      - "512"
+      - "--commit-docs"
+      - "200000"
+    environment:
+      RUST_LOG: nostrsearch=info,nostr_archive_cursor=info
+    volumes:
+      - index-data:/data
+      - ${DUMPS_DIR:-./dumps}:/dumps:ro
+    deploy:
+      resources:
+        limits:
+          memory: 16G
+
+volumes:
+  index-data:
+    driver: local
