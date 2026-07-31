@@ -175,9 +175,38 @@ fn main() -> anyhow::Result<()> {
     rt.block_on(run(args, pipeline))
 }
 
+fn hex32(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
 async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
     let total = Arc::new(AtomicU64::new(0));
     let started = Instant::now();
+
+    // Persistent event-id dedupe, so a restarted backfill resumes instead of
+    // duplicating everything (Tantivy has no unique key on writes). Lives
+    // inside the index root so wiping the index also wipes the seen-set.
+    let id_store = if args.dedupe && args.input_dir.is_some() {
+        Some(Arc::new(nostrsearch_indexer::id_store::IdStore::open(
+            &args.index_root.join(".dedupe"),
+        )?))
+    } else {
+        None
+    };
+    // Ids indexed since the last checkpoint. Mutated only while holding the
+    // pipeline mutex; flushed by the checkpoint task, which holds that mutex
+    // across commit + flush so an id is only recorded once its document is
+    // durable. A hard kill therefore re-processes at most one checkpoint
+    // window — redundant work, never holes; duplicates only if a shard
+    // happened to auto-commit inside that window.
+    let pending_ids: Arc<Mutex<Vec<[u8; 32]>>> = Arc::new(Mutex::new(Vec::new()));
 
     // In a container this binary is PID 1, and PID 1 ignores SIGTERM unless a
     // handler is installed — so `kubectl delete` / probe kills hung for the
@@ -185,6 +214,8 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
     // no state flush. Handle it: log, flush what we can, exit 143.
     {
         let pipe = pipeline.clone();
+        let id_store_sig = id_store.clone();
+        let pending_sig = pending_ids.clone();
         tokio::spawn(async move {
             let mut term = match tokio::signal::unix::signal(
                 tokio::signal::unix::SignalKind::terminate(),
@@ -197,9 +228,18 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
             };
             term.recv().await;
             tracing::warn!("SIGTERM received; flushing index and stats before exit");
+            let store = id_store_sig.clone();
+            let pending = pending_sig.clone();
             let flushed = tokio::task::spawn_blocking(move || {
                 let mut p = pipe.lock().unwrap();
-                p.finish()
+                p.finish()?;
+                // Everything is committed; record the seen-ids so the next
+                // run resumes instead of re-processing this window.
+                if let Some(store) = store {
+                    let ids = std::mem::take(&mut *pending.lock().unwrap());
+                    store.flush(ids.iter())?;
+                }
+                anyhow::Ok(())
             })
             .await;
             match flushed {
@@ -282,12 +322,51 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
         let pipe = pipeline.clone();
         let total_cb = total.clone();
         let chunk_size = args.chunk_size;
-        let dedupe = args.dedupe;
         let sort_batches = args.sort_batches;
+
+        // Persistent event-id dedupe, so a restarted backfill resumes instead
+        // of duplicating everything (Tantivy has no unique key on writes).
+        // Ids reach the store only via checkpoints, *after* a Tantivy commit
+        // of the documents they refer to: flushing them earlier would turn a
+        // crash into permanent holes in the index. The window between
+        // checkpoints is re-processed on restart, which is merely redundant
+        // work, never duplicate documents.
+        if let Some(store) = &id_store {
+            let store = store.clone();
+            let pending = pending_ids.clone();
+            let pipe_ck = pipeline.clone();
+            tokio::spawn(async move {
+                let mut tick =
+                    tokio::time::interval(std::time::Duration::from_secs(60));
+                tick.tick().await; // skip immediate fire
+                loop {
+                    tick.tick().await;
+                    let store = store.clone();
+                    let pending = pending.clone();
+                    let pipe_ck = pipe_ck.clone();
+                    let res = tokio::task::spawn_blocking(move || {
+                        let mut p = pipe_ck.lock().unwrap();
+                        p.commit()?;
+                        let ids = std::mem::take(&mut *pending.lock().unwrap());
+                        store.flush(ids.iter())?;
+                        anyhow::Ok(ids.len())
+                    })
+                    .await;
+                    match res {
+                        Ok(Ok(n)) if n > 0 => {
+                            tracing::debug!(ids = n, "dedupe checkpoint")
+                        }
+                        Ok(Ok(_)) => {}
+                        other => tracing::warn!(?other, "dedupe checkpoint failed"),
+                    }
+                }
+            });
+        }
+
+        let ck_store = id_store.clone();
+        let ck_pending = pending_ids.clone();
         tokio::task::spawn_blocking(move || {
-            let cursor = NostrCursor::new(input_dir)
-                .with_parallelism(parallelism)
-                .with_dedupe(dedupe);
+            let cursor = NostrCursor::new(input_dir).with_parallelism(parallelism);
             cursor.walk_with_chunked_sync(
                 move |events: Vec<nostr_archive_cursor::NostrEventBorrowed>| {
                     let mut batch: Vec<NostrEvent> = events.iter().map(to_core).collect();
@@ -300,11 +379,28 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
                         batch.sort_unstable_by_key(|e| e.created_at);
                     }
                     let mut p = pipe.lock().unwrap();
-                    for ev in &batch {
-                        p.process(ev);
+                    match &ck_store {
+                        Some(store) => {
+                            let mut pending = ck_pending.lock().unwrap();
+                            let mut n = 0u64;
+                            for ev in &batch {
+                                let Some(id) = hex32(&ev.id) else { continue };
+                                if store.contains(&id) {
+                                    continue;
+                                }
+                                p.process(ev);
+                                pending.push(id);
+                                n += 1;
+                            }
+                            total_cb.fetch_add(n, Ordering::Relaxed);
+                        }
+                        None => {
+                            for ev in &batch {
+                                p.process(ev);
+                            }
+                            total_cb.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                        }
                     }
-                    drop(p);
-                    total_cb.fetch_add(batch.len() as u64, Ordering::Relaxed);
                 },
                 chunk_size,
             );
@@ -313,6 +409,14 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
 
         // finalize backfill and (if no firehose) commit + exit
         pipeline.lock().unwrap().go_live();
+        // Final checkpoint: go_live committed everything, so all pending ids
+        // are durable in the index and may now be recorded as seen.
+        if let Some(store) = &id_store {
+            let ids = std::mem::take(&mut *pending_ids.lock().unwrap());
+            if let Err(e) = store.flush(ids.iter()) {
+                tracing::warn!(error = %e, "final dedupe flush failed");
+            }
+        }
         pipeline.lock().unwrap().commit()?;
         tracing::info!("archive backfill complete");
     }

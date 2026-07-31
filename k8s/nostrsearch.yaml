@@ -206,6 +206,10 @@ spec:
 #             - "--wot-out"
 #             - "/data/wot.bin"
 #             # Bound writer heap: max-open-shards x heap-mb.
+#             # Ingest keeps a persistent seen-id set in <index>/.dedupe and
+#             # checkpoints it after Tantivy commits, so re-running or
+#             # restarting a backfill resumes instead of duplicating documents.
+#             # Wiping /data/index also wipes the seen-set, keeping them in sync.
 #             - "--max-open-shards"
 #             - "64"
 #             - "--heap-mb"

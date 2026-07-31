@@ -1733,6 +1733,7 @@ dependencies = [
  "nostrsearch-core",
  "nostrsearch-stats",
  "reqwest",
+ "rocksdb",
  "rustls",
  "serde",
  "serde_json",
