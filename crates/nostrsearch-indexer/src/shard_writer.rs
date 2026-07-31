@@ -259,9 +259,32 @@ impl ShardManager {
 
     /// Commit all open shards (call before shutdown or offload).
     pub fn commit_all(&mut self) -> Result<(), ShardError> {
-        for (id, shard) in self.shards.iter_mut() {
-            shard.commit()?;
-            tracing::info!(shard = %id, docs = shard.total_docs, "committed shard");
+        // Commit shards in parallel: each holds an independent writer and the
+        // cost is dominated by per-shard serialization + fsync. Committing ~90
+        // shards sequentially stalled the whole pipeline for 15-20s at every
+        // checkpoint (the caller holds the pipeline lock); in parallel the
+        // stall is the slowest single shard.
+        let results: Vec<(ShardId, u64, Result<(), ShardError>)> =
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = self
+                    .shards
+                    .iter_mut()
+                    .map(|(id, shard)| {
+                        let id = *id;
+                        scope.spawn(move || {
+                            let dirty = shard.docs_since_commit > 0;
+                            let res = shard.commit();
+                            (id, if dirty { shard.total_docs } else { 0 }, res)
+                        })
+                    })
+                    .collect();
+                handles.into_iter().map(|h| h.join().unwrap()).collect()
+            });
+        for (id, docs, res) in results {
+            res?;
+            if docs > 0 {
+                tracing::info!(shard = %id, docs, "committed shard");
+            }
         }
         Ok(())
     }
