@@ -45,3 +45,4 @@ opt-level = 3
 # keep symbols for profiling the hot path
 debug = false
 panic = "abort"
+
