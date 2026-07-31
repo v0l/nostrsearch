@@ -175,6 +175,37 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
     let total = Arc::new(AtomicU64::new(0));
     let started = Instant::now();
 
+    // In a container this binary is PID 1, and PID 1 ignores SIGTERM unless a
+    // handler is installed — so `kubectl delete` / probe kills hung for the
+    // whole grace period and then SIGKILLed us (exit 137) with no log line and
+    // no state flush. Handle it: log, flush what we can, exit 143.
+    {
+        let pipe = pipeline.clone();
+        tokio::spawn(async move {
+            let mut term = match tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::terminate(),
+            ) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(error = %e, "no SIGTERM handler");
+                    return;
+                }
+            };
+            term.recv().await;
+            tracing::warn!("SIGTERM received; flushing index and stats before exit");
+            let flushed = tokio::task::spawn_blocking(move || {
+                let mut p = pipe.lock().unwrap();
+                p.finish()
+            })
+            .await;
+            match flushed {
+                Ok(Ok(())) => tracing::info!("flushed; exiting"),
+                other => tracing::warn!(?other, "flush on SIGTERM failed"),
+            }
+            std::process::exit(143);
+        });
+    }
+
     // progress reporter
     {
         let total_prog = total.clone();

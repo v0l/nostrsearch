@@ -8,6 +8,12 @@
 #
 # Everything optional is an env var below — uncomment to turn a role on or off.
 # Bulk archive backfill is a separate one-shot Job, commented out at the bottom.
+#
+# DO NOT run the backfill by overriding this Deployment's command/args: the
+# liveness probe below expects /healthz, and the ingest binary serves no HTTP,
+# so kubelet kills the container on a fixed schedule (~140s: three failed
+# probes plus the termination grace period) with exit 137 — which looks
+# exactly like an OOM kill but is reported as Reason: Error, not OOMKilled.
 ---
 apiVersion: v1
 kind: Namespace
