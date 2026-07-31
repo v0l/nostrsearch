@@ -37,6 +37,7 @@ struct Args {
     dedupe: bool,
     max_open_shards: usize,
     writer_threads: usize,
+    sort_batches: bool,
 }
 
 impl Args {
@@ -59,6 +60,7 @@ impl Args {
         let mut dedupe = true;
         let mut max_open_shards = nostrsearch_indexer::env::max_open_shards();
         let mut writer_threads = nostrsearch_indexer::env::writer_threads();
+        let mut sort_batches = true;
 
         let mut it = std::env::args().skip(1);
         while let Some(a) = it.next() {
@@ -79,6 +81,7 @@ impl Args {
                 "--no-dedupe" => dedupe = false,
                 "--max-open-shards" => max_open_shards = it.next().ok_or("--max-open-shards value")?.parse().map_err(|_| "bad max-open-shards")?,
                 "--writer-threads" => writer_threads = it.next().ok_or("--writer-threads value")?.parse().map_err(|_| "bad writer-threads")?,
+                "--no-sort" => sort_batches = false,
                 "-h" | "--help" => {
                     println!("{}", help());
                     std::process::exit(0);
@@ -105,6 +108,7 @@ impl Args {
             dedupe,
             max_open_shards,
             writer_threads,
+            sort_batches,
         })
     }
 }
@@ -225,9 +229,17 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
             }
         });
 
+        let stage_pipe = pipeline.clone();
         std::thread::spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_secs(5));
             let done = total_prog.load(Ordering::Relaxed);
+            let stages = stage_pipe
+                .try_lock()
+                .map(|p| {
+                    let (st, ix) = p.stage_secs();
+                    format!("  stats={st:.0}s index={ix:.0}s")
+                })
+                .unwrap_or_default();
             if done > 0 {
                 let rate = done as f64 / started.elapsed().as_secs_f64();
                 let (rss, peak) = nostrsearch_indexer::mem::rss_mb();
@@ -248,7 +260,7 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
                     })
                     .unwrap_or_default();
                 eprintln!(
-                    "  processed={done}  rate={rate:.0}/s  elapsed={:.0}s  rss={rss}MB peak={peak}MB{cg}",
+                    "  processed={done}  rate={rate:.0}/s  elapsed={:.0}s{stages}  rss={rss}MB peak={peak}MB{cg}",
                     started.elapsed().as_secs_f64()
                 );
             }
@@ -271,6 +283,7 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
         let total_cb = total.clone();
         let chunk_size = args.chunk_size;
         let dedupe = args.dedupe;
+        let sort_batches = args.sort_batches;
         tokio::task::spawn_blocking(move || {
             let cursor = NostrCursor::new(input_dir)
                 .with_parallelism(parallelism)
@@ -283,7 +296,9 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
                     // arbitrary month order thrashes the open-shard set: each
                     // switch can evict a writer that is needed again a moment
                     // later, paying a commit + fsync every time.
-                    batch.sort_unstable_by_key(|e| e.created_at);
+                    if sort_batches {
+                        batch.sort_unstable_by_key(|e| e.created_at);
+                    }
                     let mut p = pipe.lock().unwrap();
                     for ev in &batch {
                         p.process(ev);

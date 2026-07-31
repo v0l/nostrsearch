@@ -69,6 +69,11 @@ pub struct Pipeline {
     last_refresh: Instant,
     last_persist: Instant,
     refreshed_once: bool,
+    /// Cumulative time spent folding events into analyses, in nanoseconds.
+    stats_ns: u64,
+    /// Cumulative time spent handing events to Tantivy (including synchronous
+    /// commits), in nanoseconds.
+    index_ns: u64,
 }
 
 impl Pipeline {
@@ -106,6 +111,8 @@ impl Pipeline {
             last_refresh: Instant::now() - Duration::from_secs(86_400),
             last_persist: Instant::now(),
             refreshed_once: false,
+            stats_ns: 0,
+            index_ns: 0,
         };
 
         // Warm start: if analysis state was restored, materialize it now so the
@@ -119,6 +126,12 @@ impl Pipeline {
         }
 
         Ok(me)
+    }
+
+    /// Cumulative (stats, index) time in seconds spent in the hot path, so the
+    /// progress line can show where ingest wall time actually goes.
+    pub fn stage_secs(&self) -> (f64, f64) {
+        (self.stats_ns as f64 / 1e9, self.index_ns as f64 / 1e9)
     }
 
     /// Access the shared WoT handle (e.g. to share the same lookup elsewhere).
@@ -137,14 +150,18 @@ impl Pipeline {
     /// tier. Triggers a WoT refresh every `wot_refresh_every` events.
     pub fn process(&mut self, ev: &NostrEvent) {
         let now = Self::now();
+        let t0 = Instant::now();
         if self.live {
             self.registry.observe(ev, now, &self.world);
         } else {
             self.registry.observe_backfill(ev, now, &self.world);
         }
+        let t1 = Instant::now();
         if let Err(e) = self.manager.index_event(ev) {
             tracing::warn!(error = %e, "index_event failed");
         }
+        self.stats_ns += (t1 - t0).as_nanos() as u64;
+        self.index_ns += t1.elapsed().as_nanos() as u64;
         // Only the live tail refreshes periodically. During a backfill the
         // graph is still being assembled, so a mid-run refresh is both
         // expensive (it re-serializes the whole graph) and wrong: documents

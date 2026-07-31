@@ -11,7 +11,7 @@
 //! | `WOT_OUT` | web-of-trust snapshot path | `./data/wot.bin` |
 //! | `ARCHIVE_DIR` | `.jsonl.zst` corpus + id index | unset |
 //! | `RELAYS` | comma-separated upstream relays | unset |
-//! | `MAX_OPEN_SHARDS` | shard writers held open | `8` |
+//! | `MAX_OPEN_SHARDS` | shard writers held open | `64` |
 //! | `WOT_REFRESH_EVERY` | events between WoT rebuilds | `100000` |
 //! | `WOT_MIN_REFRESH_SECS` | wall-clock floor between rebuilds | `60` |
 //! | `STATS_PERSIST_SECS` | analysis-state persist cadence | `300` |
@@ -85,11 +85,11 @@ pub fn relays() -> Vec<String> {
     list("RELAYS")
 }
 
-/// Shard writers held open at once (`MAX_OPEN_SHARDS`, 8). Total writer heap
+/// Shard writers held open at once (`MAX_OPEN_SHARDS`, 64). Total writer heap
 /// is this times the per-shard heap, so it bounds memory over a corpus that
 /// spans many months.
 pub fn max_open_shards() -> usize {
-    u64_or("MAX_OPEN_SHARDS", 8) as usize
+    u64_or("MAX_OPEN_SHARDS", 64) as usize
 }
 
 /// Indexing threads per shard (`WRITER_THREADS`, 1). Total indexing threads is
