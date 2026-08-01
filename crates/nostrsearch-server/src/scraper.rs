@@ -78,7 +78,7 @@ impl Sink for NodeSink {
             }
             match self.db.save_event(&ev).await {
                 Ok(SaveEventStatus::Success) => {
-                    self.sink.submit(to_core(&ev));
+                    self.sink.send(to_core(&ev)).await;
                     new += 1;
                 }
                 Ok(_) => {}

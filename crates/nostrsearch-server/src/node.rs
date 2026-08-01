@@ -49,8 +49,21 @@ pub fn to_core(ev: &Event) -> NostrEvent {
 pub struct EventSink(mpsc::Sender<NostrEvent>);
 
 impl EventSink {
-    /// Submit an event for indexing + stats. Never blocks the caller for long;
-    /// drops (with a warning) if the writer is saturated.
+    /// Submit an event for indexing + stats, waiting for queue capacity.
+    ///
+    /// Every producer archives *before* submitting, so dropping here would
+    /// leave a permanent hole: the archive says "have it", the scraper will
+    /// never re-fetch it, and the index/stats never see it. Backpressure is
+    /// the correct behavior — a saturated writer slows the relay socket,
+    /// firehose, or scraper instead of silently losing events.
+    pub async fn send(&self, ev: NostrEvent) {
+        if self.0.send(ev).await.is_err() {
+            tracing::warn!("writer task gone; event not indexed");
+        }
+    }
+
+    /// Non-blocking submit for sync contexts. Drops (with a warning) if the
+    /// writer is saturated — prefer [`send`](Self::send) wherever possible.
     pub fn submit(&self, ev: NostrEvent) {
         if let Err(e) = self.0.try_send(ev) {
             match e {
@@ -188,7 +201,7 @@ impl NostrDatabase for NodeDb {
             let status = self.inner.save_event(event).await?;
             // Only index genuinely new events (skip duplicates/rejects).
             if matches!(status, SaveEventStatus::Success) {
-                self.sink.submit(to_core(event));
+                self.sink.send(to_core(event)).await;
             }
             Ok(status)
         })
@@ -272,7 +285,9 @@ async fn run_firehose(
         let mut rx = client.notifications();
         loop {
             match rx.recv().await {
-                Ok(RelayPoolNotification::Event { event, .. }) => sink.submit(to_core(&event)),
+                Ok(RelayPoolNotification::Event { event, .. }) => {
+                    sink.send(to_core(&event)).await
+                }
                 Ok(RelayPoolNotification::Shutdown) => return Ok(()),
                 Ok(_) => {}
                 Err(_) => break,
