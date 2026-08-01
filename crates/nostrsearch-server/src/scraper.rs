@@ -42,6 +42,16 @@ impl NodeSink {
 }
 
 impl Sink for NodeSink {
+    async fn local_items(&self, since: u64, until: u64) -> Vec<(EventId, Timestamp)> {
+        // The archive's time index knows exactly which events we hold for the
+        // window. While its backfill is still running this returns empty,
+        // which degrades to plain id enumeration — correct either way.
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || db.list_ids(since, until))
+            .await
+            .unwrap_or_default()
+    }
+
     async fn missing(&self, ids: Vec<[u8; 32]>) -> Vec<[u8; 32]> {
         let mut out = Vec::new();
         for id in ids {

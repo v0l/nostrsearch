@@ -301,6 +301,18 @@ pub trait Sink: Send + Sync + 'static {
         &self,
         ids: Vec<[u8; 32]>,
     ) -> impl std::future::Future<Output = Vec<[u8; 32]>> + Send;
+    /// Our local (event id, created_at) set for `since..=until`, fed to
+    /// negentropy as the reconciliation baseline. An empty set degrades to
+    /// full id enumeration from the relay (correct, just more id traffic).
+    fn local_items(
+        &self,
+        since: u64,
+        until: u64,
+    ) -> impl std::future::Future<Output = Vec<(nostr_sdk::EventId, nostr_sdk::Timestamp)>> + Send
+    {
+        let _ = (since, until);
+        async { Vec::new() }
+    }
     /// Store a batch of fetched events; returns how many were genuinely new.
     fn process(
         &self,
@@ -468,10 +480,20 @@ async fn scrape_day<S: Sink>(
             .since(Timestamp::from(start))
             .until(Timestamp::from(end - 1));
         let opts = SyncOptions::new().dry_run();
-        match client.sync_with([url], filter, &opts).await {
+        // Reconcile against our real local set for the day, so steady-state
+        // traffic is the difference rather than the relay's full id list.
+        let items = sink.local_items(start, end - 1).await;
+        let sync = async {
+            let relay = client.relay(url).await?;
+            relay
+                .sync_with_items(filter.clone(), items, &opts)
+                .await
+                .map_err(anyhow::Error::from)
+        };
+        match sync.await {
             Ok(out) => {
                 info.negentropy = Some(true);
-                let remote = &out.val.remote;
+                let remote = &out.remote;
                 seen = remote.len() as u64;
                 let ids: Vec<[u8; 32]> = remote.iter().map(|id| id.to_bytes()).collect();
                 let missing = sink.missing(ids).await;
