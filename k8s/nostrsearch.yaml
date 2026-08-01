@@ -118,6 +118,16 @@ spec:
             #   value: "0,1,3,7,30023"
 
             # ── Stats / web-of-trust ────────────────────────────────────────
+            # Continuous full-network gap scraper (on by default when this
+            # node is the writer and has an archive). Discovers relays from
+            # kind-10002, negentropy-syncs day-by-day backwards, records each
+            # relay's data horizon after 14 empty days. SCRAPE=0 disables;
+            # tune with SCRAPE_MIN_DATE, SCRAPE_MAX_RELAYS (200),
+            # SCRAPE_CONCURRENCY (8), SCRAPE_FLOOR_MINS (10),
+            # SCRAPE_BIRTHDAY_DAYS (14), SCRAPE_PASS_INTERVAL_SECS (1800),
+            # SCRAPE_REDISCOVER_SECS (86400).
+            # - name: SCRAPE
+            #   value: "0"
             # Shard writers held open at once; total writer heap is roughly
             # this x the per-shard heap (~4GB at 64 x 64MB). Keep it at or
             # above the number of months the corpus spans — dumps are often

@@ -8,6 +8,7 @@ pub mod http;
 pub mod node;
 pub mod registry;
 pub mod relay;
+pub mod scraper;
 
 pub use archive::ArchiveState;
 pub use node::{EventSink, NodeDb, spawn_firehose, spawn_writer};

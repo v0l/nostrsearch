@@ -128,6 +128,36 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // ── Scraper: continuous full-network gap-filler ─────────────────────────
+    // Walks day-by-day backwards across relays discovered from kind-10002,
+    // negentropy where supported, feeding the same archive + writer funnel as
+    // the firehose. On by default whenever this node is the writer and has an
+    // archive; SCRAPE=0 disables.
+    let want_scrape = std::env::var("SCRAPE").map(|v| v != "0").unwrap_or(true);
+    if want_scrape {
+        match (&archive, &sink) {
+            (Some(a), Some(sink)) => match &a.db {
+                Some(db) => {
+                    let opts = nostrsearch_server::scraper::ScraperOptions::from_env();
+                    tracing::info!(
+                        max_relays = opts.max_relays,
+                        concurrency = opts.concurrency,
+                        "starting network scraper"
+                    );
+                    if let Err(e) = nostrsearch_server::scraper::spawn_scraper(
+                        opts,
+                        (**db).clone(),
+                        sink.clone(),
+                    ) {
+                        tracing::warn!(error = %e, "scraper failed to start");
+                    }
+                }
+                None => tracing::info!("scraper disabled: archive has no event index"),
+            },
+            _ => tracing::info!("scraper disabled: needs writer role + archive"),
+        }
+    }
+
     let app = nostrsearch_server::http::router_full(state, archive, relay);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(bind = %bind, "nostrsearch node listening");

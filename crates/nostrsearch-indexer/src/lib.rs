@@ -25,6 +25,7 @@ pub mod env;
 pub mod mem;
 pub mod firehose;
 pub mod id_store;
+pub mod scrape;
 pub mod pipeline;
 pub mod shard_writer;
 

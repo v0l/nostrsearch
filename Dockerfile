@@ -26,6 +26,7 @@ RUN mkdir -p crates/nostrsearch-core/src \
     echo "fn main() {}" > crates/nostrsearch-indexer/src/bin/ingest.rs && \
     echo "fn main() {}" > crates/nostrsearch-indexer/src/bin/stats.rs && \
     echo "fn main() {}" > crates/nostrsearch-indexer/src/bin/archive.rs && \
+    echo "fn main() {}" > crates/nostrsearch-indexer/src/bin/scrape.rs && \
     echo "" > crates/nostrsearch-server/src/lib.rs && \
     echo "fn main() {}" > crates/nostrsearch-server/src/main.rs && \
     echo "" > crates/nostrsearch-stats/src/lib.rs && \
@@ -33,6 +34,7 @@ RUN mkdir -p crates/nostrsearch-core/src \
     rm -f target/release/ingest \
           target/release/stats \
           target/release/archive \
+          target/release/scrape \
           target/release/nostrsearch-server \
           target/release/deps/nostrsearch_core-* \
           target/release/deps/nostrsearch_indexer-* \
@@ -53,6 +55,7 @@ RUN touch crates/nostrsearch-core/src/lib.rs \
     cp target/release/ingest /app/bin/ingest && \
     cp target/release/stats /app/bin/stats && \
     cp target/release/archive /app/bin/archive && \
+    cp target/release/scrape /app/bin/scrape && \
     cp target/release/nostrsearch-server /app/bin/nostrsearch-server
 
 # ── Runtime image ─────────────────────────────────────────────────────────────
