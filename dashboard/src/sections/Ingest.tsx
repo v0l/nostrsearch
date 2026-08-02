@@ -148,6 +148,9 @@ function Progress({ st }: { st: ReplayStatus }) {
         <Chip tone="mute">
           {num(st.files_done)}/{num(st.files_total)} files
         </Chip>
+        {/* Rebuilds walk the archive once per dependency stage, so the file
+            counter restarting is a pass boundary, not a restart. */}
+        {st.pass > 1 ? <Chip tone="mute">pass {st.pass}</Chip> : null}
         <Chip tone="mute">{num(events)} read</Chip>
         <Chip tone="mute">{num(fresh)} new</Chip>
         {malformed > 0 ? <Chip tone="bad">{num(malformed)} malformed</Chip> : null}

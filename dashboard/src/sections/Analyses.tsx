@@ -19,6 +19,16 @@ export function Analyses({ authed, gate }: { authed: boolean; gate: string }) {
   const rows = poll.data ?? [];
   const pending = rows.filter((r) => !r.backfilled).length;
 
+  const resetAll = async () => {
+    try {
+      const r = await api.resetAllAnalyses();
+      notify(r.rebuild ? "ok" : "err", r.detail);
+      poll.refresh();
+    } catch (e) {
+      notify("err", e instanceof Error ? e.message : String(e));
+    }
+  };
+
   /**
    * Everything that would be cleared along with `name`, transitively.
    *
@@ -55,6 +65,20 @@ export function Analyses({ authed, gate }: { authed: boolean; gate: string }) {
       ) : rows.length === 0 ? (
         <p class="empty">{poll.loading ? "Loading analyses…" : "No analyses registered."}</p>
       ) : (
+        <div class="stack">
+        {/* The one-click rebuild. Everything goes, including the follow
+            graph's on-disk store, then the archive is folded back in staged
+            passes -- graph first, then the reports that label events with it.
+            This is the honest fix when numbers are suspect: per-analysis
+            resets leave the others holding totals folded from state that no
+            longer exists. */}
+        <div class="row tight">
+          <ConfirmButton
+            label="Rebuild all reports from archive"
+            confirmLabel="Clears everything, then hours of rebuild — confirm"
+            onConfirm={resetAll}
+          />
+        </div>
         <div class="table-wrap">
           <table>
             <thead>
@@ -103,6 +127,7 @@ export function Analyses({ authed, gate }: { authed: boolean; gate: string }) {
               ))}
             </tbody>
           </table>
+        </div>
         </div>
       )}
     </Panel>

@@ -165,6 +165,18 @@ export const api = {
    * no longer exists. `rebuild` is false when nothing could be started --
    * no archive, or a rebuild already running.
    */
+  /**
+   * Clears every analysis -- the follow graph's on-disk store included -- and
+   * rebuilds the lot from the archive in dependency-staged passes. The one
+   * honest answer to "these numbers are wrong": per-analysis resets leave the
+   * others holding totals folded from state that no longer exists.
+   */
+  resetAllAnalyses: () =>
+    signed<{ reset: string[]; rebuild: boolean; detail: string }>(
+      "/admin/analyses/reset-all",
+      "POST",
+    ),
+
   resetAnalysis: (name: string) =>
     signed<{ reset: string[]; rebuild: boolean; detail: string }>(
       `/admin/analyses/${encodeURIComponent(name)}/reset`,

@@ -57,6 +57,10 @@ pub struct ReplayStatus {
     pub finished_at: u64,
     pub files_total: usize,
     pub files_done: usize,
+    /// Which pass over the archive this is. A rebuild reads the file list once
+    /// per dependency stage, so the per-pass file counters restart -- without
+    /// this, "3/319" right after "319/319" reads as a rebuild starting over.
+    pub pass: u32,
     /// Totals across *completed* files.
     pub events: u64,
     pub new: u64,
@@ -274,6 +278,7 @@ pub fn spawn(
             state.update(|s| {
                 s.files_done = 0;
                 s.files_total = names.len();
+                s.pass += 1;
             });
             let mut finished = !rebuild; // ingest is single-pass by construction
             for name in &names {

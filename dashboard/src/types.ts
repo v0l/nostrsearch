@@ -97,6 +97,12 @@ export interface ReplayStatus {
   finished_at: number;
   files_total: number;
   files_done: number;
+  /**
+   * Which pass over the archive this is. A rebuild reads the file list once
+   * per dependency stage -- graph first, then the reports that label events
+   * with it -- so the file counters restart between passes.
+   */
+  pass: number;
   /** Totals across *completed* files only. */
   events: number;
   new: number;
