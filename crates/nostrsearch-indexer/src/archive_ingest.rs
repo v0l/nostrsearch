@@ -334,6 +334,13 @@ pub fn to_core(ev: &nostr_archive_cursor::NostrEventBorrowed) -> NostrEvent {
             .map(|t| t.iter().map(|s| s.to_string()).collect())
             .collect(),
         content: ev.content.to_string(),
-        sig: ev.sig.to_string(),
+        // Not copied: the signature is 128 hex chars, and nothing downstream of
+        // ingest reads it -- not the schema, not any analysis. Allocating it
+        // per event was pure cost.
+        //
+        // If signature verification is ever added it belongs here, at the
+        // point of ingest, verifying against the borrowed bytes rather than
+        // carrying a copy through the pipeline.
+        sig: String::new(),
     }
 }
