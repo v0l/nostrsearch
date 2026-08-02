@@ -51,6 +51,15 @@ pub struct IngestOptions {
     /// Skip events the id store already claims. Off re-indexes everything,
     /// which is what a corrupt or divergent store needs.
     pub dedupe: bool,
+    /// How often to commit and record the ids indexed since the last one.
+    ///
+    /// This is a durability interval, not an optimisation. Ids are only
+    /// recorded after the commit that makes their documents searchable, so
+    /// between checkpoints the store is behind the index by one window. Losing
+    /// the process costs re-reading that window; having no checkpoints at all
+    /// costs re-indexing the entire run into an index that already contains
+    /// it, which Tantivy will happily do twice.
+    pub checkpoint_every: std::time::Duration,
 }
 
 impl Default for IngestOptions {
@@ -61,6 +70,7 @@ impl Default for IngestOptions {
             chunk_size: 1000,
             sort_batches: true,
             dedupe: true,
+            checkpoint_every: std::time::Duration::from_secs(60),
         }
     }
 }
@@ -101,6 +111,52 @@ pub async fn ingest(
     // pipeline lock across commit, so an id is only recorded once its document
     // is durable.
     let pending_ids: Arc<Mutex<Vec<[u8; 32]>>> = Arc::new(Mutex::new(Vec::new()));
+
+    // Periodic checkpoint: commit, then record what that commit made durable.
+    //
+    // Without it a 24-hour run records nothing until the very end, so a kill at
+    // hour 23 leaves an index full of events the store has never heard of --
+    // and the next run indexes every one of them again, because Tantivy has no
+    // unique key to stop it. It also bounds the pending buffer, which would
+    // otherwise hold every id in the corpus.
+    let checkpoint = {
+        let pipe = pipeline.clone();
+        let pending = pending_ids.clone();
+        let store = id_store.clone();
+        let every = opts.checkpoint_every;
+        let done = cancel.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.tick().await; // consume the immediate first tick
+            loop {
+                tick.tick().await;
+                if done.load(Ordering::Relaxed) {
+                    return;
+                }
+                let (pipe, pending, store) = (pipe.clone(), pending.clone(), store.clone());
+                let res = tokio::task::spawn_blocking(move || {
+                    let mut p = pipe.lock().unwrap();
+                    p.commit()?;
+                    // Only now: the documents these ids name are durable.
+                    let n = match &store {
+                        Some(s) => {
+                            let ids = std::mem::take(&mut *pending.lock().unwrap());
+                            s.flush(ids.iter())?;
+                            ids.len()
+                        }
+                        None => 0,
+                    };
+                    anyhow::Ok(n)
+                })
+                .await;
+                match res {
+                    Ok(Ok(n)) if n > 0 => tracing::debug!(ids = n, "ingest checkpoint"),
+                    Ok(Ok(_)) => {}
+                    other => tracing::warn!(?other, "ingest checkpoint failed"),
+                }
+            }
+        })
+    };
 
     let passes = pipeline.lock().unwrap().backfill_passes();
     progress.passes.store(passes as u64, Ordering::Relaxed);
@@ -216,6 +272,7 @@ pub async fn ingest(
         p.commit()?;
     }
 
+    checkpoint.abort();
     progress.running.store(false, Ordering::Relaxed);
     progress.finished_at.store(unix_now(), Ordering::Relaxed);
     tracing::info!(

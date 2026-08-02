@@ -454,6 +454,7 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
                 chunk_size,
                 sort_batches,
                 dedupe: args.dedupe,
+                ..Default::default()
             },
             id_store.clone(),
             progress.clone(),

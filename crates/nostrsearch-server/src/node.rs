@@ -256,6 +256,16 @@ pub fn spawn_writer_with_reports(
     let pipeline = Arc::new(Mutex::new(Pipeline::new(cfg)?));
     // Live tail semantics: everything from here on is realtime.
     pipeline.lock().unwrap().go_live();
+
+    // Publish once from the state just loaded, before any event arrives.
+    //
+    // Reports otherwise only reach the store on a commit tick that found work
+    // to do, so a node restarting with a fully populated analysis state served
+    // an empty /reports until the next live event happened to land -- and on a
+    // node with no firehose attached, indefinitely. The data was on disk the
+    // whole time.
+    publish_reports(&pipeline.lock().unwrap(), reports.as_ref());
+
     let pipeline_for_task = pipeline.clone();
 
     let (tx, mut rx) = mpsc::channel::<NostrEvent>(queue_size);
