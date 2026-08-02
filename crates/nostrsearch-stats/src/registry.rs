@@ -184,8 +184,26 @@ impl Registry {
             let cur_epoch = e.analysis.epoch();
             match store.load(name)? {
                 Some((state, progress)) if progress.epoch == cur_epoch => {
-                    e.analysis.restore_bin(&state)?;
-                    e.progress = progress;
+                    // A checkpoint that will not deserialize must not stop the
+                    // node from starting. It happens whenever an analysis's
+                    // serialized shape changes without an epoch bump, and
+                    // propagating it here takes down the whole process at
+                    // startup — in Kubernetes, a CrashLoopBackOff that is
+                    // indistinguishable from a slow boot. Re-derive that one
+                    // analysis from the corpus instead.
+                    match e.analysis.restore_bin(&state) {
+                        Ok(()) => e.progress = progress,
+                        Err(err) => {
+                            tracing::warn!(
+                                analysis = name,
+                                epoch = cur_epoch,
+                                error = %err,
+                                "unreadable analysis checkpoint; discarding it and re-running \
+                                 this analysis's backfill"
+                            );
+                            e.progress = Progress::fresh(cur_epoch);
+                        }
+                    }
                 }
                 _ => e.progress = Progress::fresh(cur_epoch),
             }

@@ -117,6 +117,13 @@ impl Analysis for ActiveUsers {
         "active_users"
     }
 
+    /// 1: switched from exact `HashSet<Pubkey>` buckets to HyperLogLog
+    /// sketches. The layouts are not compatible, so pre-sketch checkpoints must
+    /// be discarded rather than mis-parsed.
+    fn epoch(&self) -> u32 {
+        1
+    }
+
     fn deps(&self) -> &'static [&'static str] {
         &["follow_graph"]
     }
