@@ -40,10 +40,10 @@ pub use metrics::{
     AnalysisMetrics, BufferObserver, MetricsEvent, MetricsObserver, NullObserver, Phase,
     PipelineMetrics,
 };
-pub use progress::Progress;
-pub use registry::{AnalysisStatus, DynAnalysis, Registry};
+pub use progress::{Progress, Rebuild};
+pub use registry::{AnalysisStatus, DynAnalysis, RebuildPlan, Registry};
 pub use run::backfill_in_memory;
-pub use store::{RebuildCheckpoint, StatStore};
+pub use store::StatStore;
 pub use types::{EventId, Hash32, Pubkey};
 pub use wot::{SharedWot, WotIndex};
 

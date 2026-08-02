@@ -122,9 +122,26 @@ pub struct AnalysisStatus {
 
 /// One registered analysis plus its resumable progress (which carries the
 /// persisted observability counters).
+/// What a rebuild reader may do with a dump, given where the analyses are.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RebuildPlan {
+    /// Every analysis has already folded this file.
+    SkipFile,
+    /// All of them are at the same point, so the reader can fast-forward past
+    /// this id without parsing.
+    ResumeAfter(String),
+    /// They disagree (or all start fresh), so every event must be handed over
+    /// and each analysis skips on its own.
+    FoldAll,
+}
+
 pub struct Entry {
     pub analysis: Box<dyn DynAnalysis>,
     pub progress: Progress,
+    /// Fast-forwarding to this analysis's own resume point in the current
+    /// rebuild. Transient: derived from `progress.rebuild` when a rebuild
+    /// starts, never persisted.
+    pub resuming: bool,
 }
 
 impl Entry {
@@ -164,6 +181,7 @@ impl Registry {
         self.entries.push(Entry {
             analysis: Box::new(analysis),
             progress: Progress::fresh(epoch),
+            resuming: false,
         });
         self
     }
@@ -204,6 +222,9 @@ impl Registry {
     // --- persistence (binary) ---
 
     pub fn load(&mut self, store: &StatStore) -> Result<()> {
+        // Rebuild position moved into each analysis's own progress; drop the
+        // single shared file an older build may have left behind.
+        store.remove_legacy_rebuild_checkpoint();
         for e in &mut self.entries {
             let name = e.analysis.name();
             let cur_epoch = e.analysis.epoch();
@@ -411,6 +432,118 @@ impl Registry {
     /// records every author as untrusted.
     ///
     /// [`backfill_in_memory`]: crate::run::backfill_in_memory
+    /// Begin a rebuild pass over `files`, arming each analysis's own resume
+    /// point.
+    ///
+    /// Returns the position the *reader* may safely fast-forward to: `Some`
+    /// only when every analysis still rebuilding agrees on it, since skipping
+    /// in the reader skips for all of them at once. When they disagree the
+    /// reader must hand over every event and each analysis skips on its own,
+    /// which costs a parse per line but is the only correct answer.
+    pub fn begin_rebuild(&mut self, file: &str) -> RebuildPlan {
+        let mut positions: Vec<Option<String>> = Vec::new();
+
+        for e in self.entries.iter_mut() {
+            if !e.needs_backfill() || !e.progress.rebuild.needs(file) {
+                e.resuming = false;
+                continue;
+            }
+            let at = (e.progress.rebuild.file == file && !e.progress.rebuild.last_id.is_empty())
+                .then(|| e.progress.rebuild.last_id.clone());
+            e.resuming = at.is_some();
+            positions.push(at);
+        }
+
+        let Some(first) = positions.first() else {
+            return RebuildPlan::SkipFile;
+        };
+        match first {
+            Some(id) if positions.iter().all(|p| p == first) => {
+                RebuildPlan::ResumeAfter(id.clone())
+            }
+            _ => RebuildPlan::FoldAll,
+        }
+    }
+
+    /// Mark `file` fully folded for every analysis that was rebuilding it.
+    pub fn finish_rebuild_file(&mut self, file: &str) {
+        for e in self.entries.iter_mut() {
+            if e.needs_backfill() {
+                e.progress.rebuild.finish(file);
+            }
+            e.resuming = false;
+        }
+    }
+
+    /// Analyses with an archive rebuild still in progress.
+    pub fn rebuilding(&self) -> Vec<&'static str> {
+        self.entries
+            .iter()
+            .filter(|e| {
+                e.needs_backfill()
+                    && (!e.progress.rebuild.file.is_empty()
+                        || !e.progress.rebuild.completed.is_empty())
+            })
+            .map(|e| e.analysis.name())
+            .collect()
+    }
+
+    /// Fold a replayed event during a rebuild, honouring each analysis's own
+    /// resume point.
+    ///
+    /// An analysis still fast-forwarding folds nothing until it sees the last
+    /// event it recorded; everything after that is folded and its position
+    /// advanced. Positions are per-analysis because resets are: one analysis
+    /// may be a third of the way through the archive while another has never
+    /// started.
+    pub fn observe_rebuild(&mut self, ev: &NostrEvent, now: u64, world: &World, file: &str) {
+        let (author, id) = match (Hash32::from_hex(&ev.pubkey), Hash32::from_hex(&ev.id)) {
+            (Some(a), Some(i)) => (a, i),
+            _ => return,
+        };
+        let mut touched = false;
+        for e in self.entries.iter_mut() {
+            if e.resuming {
+                // Still behind this analysis's resume point. The event that
+                // matches is the last one it folded, so it is consumed here
+                // and folding restarts with the next.
+                if e.progress.rebuild.last_id == ev.id {
+                    e.resuming = false;
+                }
+                continue;
+            }
+            if !e.needs_backfill() && !e.progress.should_consume(ev.created_at, &id) {
+                continue;
+            }
+            if !e.progress.rebuild.needs(file) {
+                continue;
+            }
+            if e.analysis.wants(ev) {
+                e.progress.counters.observed += 1;
+                let ctx = AnalysisCtx::new(now, author, id, world);
+                if e.analysis.observe(ev, &ctx) {
+                    e.progress.counters.consumed += 1;
+                } else {
+                    e.progress.counters.filtered += 1;
+                }
+            }
+            if e.needs_backfill() {
+                if ev.created_at > e.progress.watermark {
+                    e.progress.watermark = ev.created_at;
+                }
+                e.progress.events += 1;
+                e.progress.rebuild.advance(file, &ev.id);
+            } else {
+                e.progress
+                    .advance_bounded(ev.created_at, id, now.saturating_add(FUTURE_SKEW_SECS));
+            }
+            touched = true;
+        }
+        if touched {
+            self.total_events += 1;
+        }
+    }
+
     pub fn observe_backfill_stage(
         &mut self,
         stage: &[usize],

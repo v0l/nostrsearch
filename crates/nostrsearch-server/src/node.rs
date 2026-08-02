@@ -93,11 +93,11 @@ pub enum Fold {
 pub struct Replayed {
     pub ev: NostrEvent,
     pub fold: Fold,
-    /// Rebuild position: the file this came from, and decompressed bytes read
-    /// through it. Carried per-event so the checkpoint records what the writer
-    /// *folded*, not what the reader produced -- the reader runs a full queue
-    /// ahead, so its own position describes events that may never be folded.
-    pub mark: Option<(std::sync::Arc<str>, u64)>,
+    /// Dump this came from, when rebuilding. Carried per-event so each
+    /// analysis's position records what the writer *folded*, not what the
+    /// reader produced -- the reader runs a full queue ahead, so its own
+    /// position describes events that may never be folded at all.
+    pub file: Option<std::sync::Arc<str>>,
 }
 
 /// Submits replayed archive events to the writer at lower priority than live
@@ -110,13 +110,8 @@ impl ReplaySink {
     ///
     /// Blocking on a full queue is the point: it is what stops a replay of a
     /// 200 GB dump outrunning the writer and pushing live events out.
-    pub fn blocking_submit(
-        &self,
-        ev: NostrEvent,
-        fold: Fold,
-        mark: Option<(std::sync::Arc<str>, u64)>,
-    ) {
-        let _ = self.0.blocking_send(Replayed { ev, fold, mark });
+    pub fn blocking_submit(&self, ev: NostrEvent, fold: Fold, file: Option<std::sync::Arc<str>>) {
+        let _ = self.0.blocking_send(Replayed { ev, fold, file });
     }
 }
 
@@ -128,13 +123,20 @@ pub enum WriterCmd {
         name: String,
         reply: tokio::sync::oneshot::Sender<Option<Vec<&'static str>>>,
     },
-    /// The rebuild checkpoint to resume from, if one was interrupted.
-    RebuildCheckpoint {
-        reply: tokio::sync::oneshot::Sender<Option<nostrsearch_stats::RebuildCheckpoint>>,
+    /// Arm each analysis's resume point for a dump and report what the reader
+    /// may skip.
+    BeginRebuild {
+        file: String,
+        reply: tokio::sync::oneshot::Sender<nostrsearch_stats::RebuildPlan>,
     },
-    /// Drop the rebuild checkpoint, so the next rebuild starts from the top.
-    ClearRebuildCheckpoint {
+    /// Mark a dump fully folded for every analysis rebuilding it.
+    FinishRebuildFile {
+        file: String,
         reply: tokio::sync::oneshot::Sender<()>,
+    },
+    /// Analyses with a rebuild still in progress.
+    Rebuilding {
+        reply: tokio::sync::oneshot::Sender<Vec<&'static str>>,
     },
     /// Per-analysis progress.
     Status {
@@ -147,27 +149,55 @@ pub enum WriterCmd {
 pub struct WriterCtl(mpsc::Sender<WriterCmd>);
 
 impl WriterCtl {
-    /// The rebuild checkpoint to resume from, if one was interrupted.
-    pub async fn rebuild_checkpoint(&self) -> Option<nostrsearch_stats::RebuildCheckpoint> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.0
-            .send(WriterCmd::RebuildCheckpoint { reply: tx })
-            .await
-            .ok()?;
-        rx.await.ok().flatten()
-    }
-
-    /// Drop the rebuild checkpoint so the next rebuild starts from the top.
-    pub async fn clear_rebuild_checkpoint(&self) {
+    /// Arm resume points for `file` and report what the reader may skip.
+    ///
+    /// Blocking, for the replay reader thread: it must know the plan before it
+    /// starts reading, and it is not on the async runtime.
+    pub fn begin_rebuild_blocking(&self, file: &str) -> nostrsearch_stats::RebuildPlan {
         let (tx, rx) = tokio::sync::oneshot::channel();
         if self
             .0
-            .send(WriterCmd::ClearRebuildCheckpoint { reply: tx })
-            .await
+            .blocking_send(WriterCmd::BeginRebuild {
+                file: file.to_string(),
+                reply: tx,
+            })
+            .is_err()
+        {
+            return nostrsearch_stats::RebuildPlan::FoldAll;
+        }
+        // Folding everything is the safe fallback: it re-reads, where guessing
+        // a skip would drop events silently.
+        rx.blocking_recv()
+            .unwrap_or(nostrsearch_stats::RebuildPlan::FoldAll)
+    }
+
+    /// Mark `file` fully folded for every analysis rebuilding it.
+    pub fn finish_rebuild_file_blocking(&self, file: &str) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .0
+            .blocking_send(WriterCmd::FinishRebuildFile {
+                file: file.to_string(),
+                reply: tx,
+            })
             .is_ok()
         {
-            let _ = rx.await;
+            let _ = rx.blocking_recv();
         }
+    }
+
+    /// Analyses with a rebuild still in progress.
+    pub async fn rebuilding(&self) -> Vec<&'static str> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .0
+            .send(WriterCmd::Rebuilding { reply: tx })
+            .await
+            .is_err()
+        {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
     }
 
     /// Reset an analysis and everything that depends on it.
@@ -302,12 +332,15 @@ pub fn spawn_writer_with_reports(
                     }
                 }
                 Some(cmd) = cmd_rx.recv() => match cmd {
-                    WriterCmd::RebuildCheckpoint { reply } => {
-                        let _ = reply.send(pipeline.rebuild_checkpoint());
+                    WriterCmd::BeginRebuild { file, reply } => {
+                        let _ = reply.send(pipeline.begin_rebuild(&file));
                     }
-                    WriterCmd::ClearRebuildCheckpoint { reply } => {
-                        pipeline.clear_rebuild_checkpoint();
+                    WriterCmd::FinishRebuildFile { file, reply } => {
+                        pipeline.finish_rebuild_file(&file);
                         let _ = reply.send(());
+                    }
+                    WriterCmd::Rebuilding { reply } => {
+                        let _ = reply.send(pipeline.rebuilding());
                     }
                     WriterCmd::ResetAnalysis { name, reply } => {
                         let ok = pipeline.reset_analysis(&name);
@@ -321,10 +354,11 @@ pub fn spawn_writer_with_reports(
                     }
                 },
                 Some(r) = replay_rx.recv() => {
-                    pipeline.process_replayed(&r.ev, r.fold == Fold::AndIndex);
-                    if let Some((file, offset)) = r.mark {
-                        pipeline.note_rebuild(&file, &r.ev.id, offset, false);
-                    }
+                    pipeline.process_replayed(
+                        &r.ev,
+                        r.fold == Fold::AndIndex,
+                        r.file.as_deref(),
+                    );
                     dirty = true;
                 }
                 _ = sd_rx.changed() => {

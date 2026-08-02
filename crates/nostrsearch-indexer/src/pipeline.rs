@@ -73,8 +73,7 @@ pub struct Pipeline {
     since_refresh: u64,
     last_refresh: Instant,
     last_persist: Instant,
-    /// How far the running rebuild has been *folded* -- see `note_rebuild`.
-    rebuild_mark: Option<nostrsearch_stats::RebuildCheckpoint>,
+
     refreshed_once: bool,
     /// Cumulative time spent folding events into analyses, in nanoseconds.
     stats_ns: u64,
@@ -130,7 +129,7 @@ impl Pipeline {
             // Allow the first refresh immediately.
             last_refresh: Instant::now() - Duration::from_secs(86_400),
             last_persist: Instant::now(),
-            rebuild_mark: None,
+
             refreshed_once: false,
             stats_ns: 0,
             index_ns: 0,
@@ -178,44 +177,28 @@ impl Pipeline {
     /// that produces them. The reader runs up to a full queue ahead, so its
     /// position describes events that may never have been folded; checkpointing
     /// it would silently drop everything still in flight when a process dies.
-    pub fn note_rebuild(&mut self, file: &str, last_id: &str, offset: u64, finished: bool) {
-        let cp = self.rebuild_mark.get_or_insert_with(Default::default);
-        if cp.file != file && !cp.file.is_empty() {
-            let done = std::mem::take(&mut cp.file);
-            if !cp.completed.contains(&done) {
-                cp.completed.push(done);
-            }
-        }
-        if finished {
-            if !cp.completed.iter().any(|f| f == file) {
-                cp.completed.push(file.to_string());
-            }
-            cp.file.clear();
-            cp.last_id.clear();
-            cp.offset = 0;
-        } else {
-            cp.file = file.to_string();
-            cp.last_id.clear();
-            cp.last_id.push_str(last_id);
-            cp.offset = offset;
-        }
+    /// Arm each analysis's own resume point for `file`, and report what the
+    /// reader may skip.
+    pub fn begin_rebuild(&mut self, file: &str) -> nostrsearch_stats::RebuildPlan {
+        self.registry.begin_rebuild(file)
     }
 
-    /// The rebuild checkpoint to resume from, if one was interrupted.
-    pub fn rebuild_checkpoint(&self) -> Option<nostrsearch_stats::RebuildCheckpoint> {
-        self.store
-            .as_ref()
-            .and_then(|s| s.load_rebuild().ok().flatten())
-    }
-
-    /// Clear the checkpoint once a rebuild completes.
-    pub fn clear_rebuild_checkpoint(&mut self) {
-        self.rebuild_mark = None;
+    /// Mark `file` fully folded for every analysis rebuilding it, and persist
+    /// straight away: a file boundary is the cheapest point at which a restart
+    /// can avoid re-reading it.
+    pub fn finish_rebuild_file(&mut self, file: &str) {
+        self.registry.finish_rebuild_file(file);
         if let Some(store) = &self.store
-            && let Err(e) = store.clear_rebuild()
+            && let Err(e) = self.registry.persist(store)
         {
-            tracing::warn!(error = %e, "clearing rebuild checkpoint failed");
+            tracing::warn!(error = %e, file, "persisting rebuild progress failed");
         }
+    }
+
+    /// Analyses with a rebuild still in progress, so one can be resumed at
+    /// startup.
+    pub fn rebuilding(&self) -> Vec<&'static str> {
+        self.registry.rebuilding()
     }
 
     /// Discard one analysis's state, and every analysis that depends on it, so
@@ -252,19 +235,23 @@ impl Pipeline {
             .unwrap_or(0)
     }
 
-    /// Process one event: fold into stats, then index it with the current WoT
-    /// tier. Triggers a WoT refresh every `wot_refresh_every` events.
     /// Process a replayed archive event.
     ///
-    /// `index` is false when the replay already found the event in the index.
+    /// `index` is false when the replay already found the event in the corpus.
     /// The analyses still see it: index state and analysis state are
-    /// independent, and a replay run after resetting reports exists precisely
-    /// to rebuild analysis state from events that are already indexed. Folding
-    /// only the missing ones would make that replay a no-op.
-    pub fn process_replayed(&mut self, ev: &NostrEvent, index: bool) {
+    /// independent, and a rebuild exists precisely to re-derive analysis state
+    /// from events that are already indexed.
+    ///
+    /// `file` names the dump it came from. When present the event is folded
+    /// through the rebuild path, which honours each analysis's own resume
+    /// point and advances its position.
+    pub fn process_replayed(&mut self, ev: &NostrEvent, index: bool, file: Option<&str>) {
         let now = Self::now();
         let t0 = Instant::now();
-        self.registry.observe_backfill(ev, now, &self.world);
+        match file {
+            Some(f) => self.registry.observe_rebuild(ev, now, &self.world, f),
+            None => self.registry.observe_backfill(ev, now, &self.world),
+        }
         let t1 = Instant::now();
         if index && let Err(e) = self.manager.index_event(ev) {
             tracing::warn!(error = %e, "index_event failed");
@@ -383,16 +370,12 @@ impl Pipeline {
         {
             {
                 let t1 = Instant::now();
+                // Rebuild position lives inside each analysis's Progress, so
+                // it is written by exactly this call. It cannot drift from the
+                // state it describes: ahead of it a resume skips events,
+                // behind it they are folded twice and every counter inflates.
                 if let Err(e) = self.registry.persist(store) {
                     tracing::warn!(error = %e, "stats persist failed");
-                }
-                // Written with the state it describes, never separately: a
-                // checkpoint ahead of the state skips events on resume, behind
-                // it folds them twice and inflates every counter.
-                if let Some(cp) = &self.rebuild_mark
-                    && let Err(e) = store.save_rebuild(cp)
-                {
-                    tracing::warn!(error = %e, "rebuild checkpoint persist failed");
                 }
                 persist_ms = t1.elapsed().as_millis();
                 self.last_persist = Instant::now();

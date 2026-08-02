@@ -21,6 +21,57 @@ pub const LIVE_LAG_SECS: u64 = 6 * 3600;
 /// a single second.
 const MAX_BOUNDARY: usize = 200_000;
 
+/// Where one analysis has reached in a rebuild over the archive.
+///
+/// Per-analysis, because analyses are reset independently and a newly
+/// registered one needs a full pass while everything else needs none. A single
+/// shared position cannot express that, and worse, clearing it on one analysis
+/// destroys the resume point of a rebuild running for another.
+///
+/// The position is the id of the last event folded, not a byte offset. An id is
+/// self-validating: if a dump is rewritten, re-sorted or appended to, a stale
+/// offset still points somewhere plausible and silently skips or repeats a span
+/// of events, corrupting every counter with nothing to show for it. A missing
+/// id is detectable. Resuming costs a linear re-read either way, since a plain
+/// zstd frame cannot be opened part-way through.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Rebuild {
+    /// Dumps this analysis has folded in full.
+    pub completed: Vec<String>,
+    /// Dump in progress, if any.
+    pub file: String,
+    /// Id of the last event folded from `file`.
+    pub last_id: String,
+}
+
+impl Rebuild {
+    /// Whether `file` still needs folding into this analysis.
+    pub fn needs(&self, file: &str) -> bool {
+        !self.completed.iter().any(|f| f == file)
+    }
+
+    /// Record a folded event.
+    pub fn advance(&mut self, file: &str, id: &str) {
+        if self.file != file {
+            self.file.clear();
+            self.file.push_str(file);
+        }
+        self.last_id.clear();
+        self.last_id.push_str(id);
+    }
+
+    /// Mark `file` fully folded.
+    pub fn finish(&mut self, file: &str) {
+        if !self.completed.iter().any(|f| f == file) {
+            self.completed.push(file.to_string());
+        }
+        if self.file == file {
+            self.file.clear();
+            self.last_id.clear();
+        }
+    }
+}
+
 /// How far a single analysis has consumed the corpus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Progress {
@@ -43,6 +94,10 @@ pub struct Progress {
     /// Cumulative observability counters, persisted so totals survive restarts.
     #[serde(default)]
     pub counters: Counters,
+    /// Position in an archive rebuild. Defaulted so state written before this
+    /// existed still loads.
+    #[serde(default)]
+    pub rebuild: Rebuild,
 }
 
 impl Progress {
@@ -55,6 +110,7 @@ impl Progress {
             backfilled: false,
             last_refresh_wall: 0,
             counters: Counters::default(),
+            rebuild: Rebuild::default(),
         }
     }
 

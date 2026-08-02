@@ -217,7 +217,9 @@ pub fn spawn(
     selection: ReplaySelection,
     dedupe: Option<Arc<IdStore>>,
     submit: crate::node::ReplaySink,
-    resume: Option<nostrsearch_stats::RebuildCheckpoint>,
+    // Writer handle, needed for a rebuild: resume points live in each
+    // analysis's own progress, which only the writer owns.
+    ctl: Option<crate::node::WriterCtl>,
 ) -> Result<(), String> {
     if state.is_running() {
         return Err("a replay is already running".into());
@@ -240,7 +242,6 @@ pub fn spawn(
         return Err("no dump files matched".into());
     }
     let rebuild = selection.rebuild;
-    let checkpoint = resume;
 
     state.cancel.store(false, Ordering::Relaxed);
     state.update(|s| {
@@ -257,18 +258,21 @@ pub fn spawn(
             if state.cancel.load(Ordering::Relaxed) {
                 break;
             }
-            // Resume an interrupted rebuild: files already folded are skipped
-            // outright, and the one in progress is fast-forwarded to the last
-            // event that was folded from it.
+            // Ask the analyses where they are in this dump. Files every one of
+            // them has folded are skipped outright; when they all sit at the
+            // same point the reader fast-forwards past it without parsing, and
+            // when they disagree it hands over every event and each analysis
+            // skips on its own.
             let mut resume_after: Option<String> = None;
-            if let Some(cp) = &checkpoint {
-                if cp.completed.iter().any(|f| *f == name) {
-                    tracing::info!(file = %name, "already folded by an earlier rebuild; skipping");
-                    state.update(|s| s.files_done += 1);
-                    continue;
-                }
-                if cp.file == name && !cp.last_id.is_empty() {
-                    resume_after = Some(cp.last_id.clone());
+            if rebuild && let Some(ctl) = &ctl {
+                match ctl.begin_rebuild_blocking(&name) {
+                    nostrsearch_stats::RebuildPlan::SkipFile => {
+                        tracing::info!(file = %name, "every analysis has folded this dump; skipping");
+                        state.update(|s| s.files_done += 1);
+                        continue;
+                    }
+                    nostrsearch_stats::RebuildPlan::ResumeAfter(id) => resume_after = Some(id),
+                    nostrsearch_stats::RebuildPlan::FoldAll => {}
                 }
             }
             let path = dir.join(&name);
@@ -294,6 +298,16 @@ pub fn spawn(
                     resume_after.as_deref(),
                 ),
                 Err(e) => fp.error = Some(format!("open failed: {e}")),
+            }
+
+            // Only a clean read to EOF counts as folded. Recording a file that
+            // errored part-way would strand the remainder: nothing revisits a
+            // completed dump.
+            if fp.complete
+                && rebuild
+                && let Some(ctl) = &ctl
+            {
+                ctl.finish_rebuild_file_blocking(&name);
             }
 
             if !fp.complete && fp.error.is_none() && !state.cancel.load(Ordering::Relaxed) {
@@ -411,8 +425,7 @@ fn replay_file(
                         }
                         // Rebuild: fold everything, index only what is missing.
                         let fold = if known { Fold::Only } else { Fold::AndIndex };
-                        let mark = rebuild.then(|| (name.clone(), decompressed));
-                        submit.blocking_submit(ev, fold, mark);
+                        submit.blocking_submit(ev, fold, rebuild.then(|| name.clone()));
                         batch += 1;
                         if batch >= BATCH {
                             batch = 0;

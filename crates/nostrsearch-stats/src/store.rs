@@ -67,75 +67,18 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// How far a rebuild has folded the archive.
-///
-/// A rebuild needs a resume point, and the per-analysis watermark cannot be it.
-/// The watermark is a `created_at`, which orders a live stream but says nothing
-/// about position in an archive: dump files are not sorted by time, so "highest
-/// created_at folded" identifies no point to carry on from. Two events sharing
-/// a timestamp can sit gigabytes apart.
-///
-/// The resume point is the id of the last event folded. An id is
-/// self-validating in a way a byte offset is not: if the archive file is ever
-/// rewritten, re-sorted or appended to, a stale offset still points *somewhere*
-/// and resuming from it silently skips or repeats a span of events, corrupting
-/// every counter with nothing to indicate it happened. A missing id is
-/// detectable, and the rebuild can restart that file instead.
-///
-/// Resuming costs a linear re-read either way, so the id costs nothing: a plain
-/// zstd frame cannot be opened part-way through, so the file has to be
-/// decompressed from the start regardless. Scanning for the id needs only a
-/// substring match against each raw line -- no JSON parsing, which is the
-/// expensive part -- and `offset` is kept purely as a hint, to report progress
-/// while skipping and to bound how far the scan looks before giving up.
-#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
-pub struct RebuildCheckpoint {
-    /// Files fully folded, skipped entirely on resume.
-    pub completed: Vec<String>,
-    /// File in progress, if any.
-    pub file: String,
-    /// Id of the last event folded from `file`. Empty means start of file.
-    pub last_id: String,
-    /// Decompressed bytes folded, a hint only -- see the type docs.
-    pub offset: u64,
-}
-
 impl StatStore {
     fn rebuild_path(&self) -> PathBuf {
         self.dir.join("rebuild.checkpoint.bin")
     }
 
-    /// Load the rebuild checkpoint, if a rebuild was interrupted.
-    pub fn load_rebuild(&self) -> Result<Option<RebuildCheckpoint>> {
-        let p = self.rebuild_path();
-        if !p.exists() {
-            return Ok(None);
-        }
-        // A truncated or stale checkpoint must not wedge startup: losing it
-        // costs a restart of the rebuild, while failing to start costs the node.
-        match bincode::deserialize(&std::fs::read(&p)?) {
-            Ok(cp) => Ok(Some(cp)),
-            Err(e) => {
-                tracing::warn!(error = %e, "discarding unreadable rebuild checkpoint");
-                Ok(None)
-            }
-        }
-    }
-
-    /// Record how far the rebuild has folded.
+    /// Delete the old global checkpoint left by earlier versions.
     ///
-    /// Must be written in the same persist as the analysis state it describes.
-    /// A checkpoint ahead of the state re-reads nothing and silently loses
-    /// events; behind it, events are folded twice and every counter inflates.
-    pub fn save_rebuild(&self, cp: &RebuildCheckpoint) -> Result<()> {
-        write_atomic(&self.rebuild_path(), &bincode::serialize(cp)?)
-    }
-
-    /// Drop the checkpoint once the rebuild finishes.
-    pub fn clear_rebuild(&self) -> Result<()> {
-        match std::fs::remove_file(self.rebuild_path()) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
-            _ => Ok(()),
-        }
+    /// Rebuild position is per-analysis now, in [`crate::Progress`]. The old
+    /// file described a single shared position that could not represent
+    /// analyses at different points, and clearing it on one analysis destroyed
+    /// the resume point of a rebuild running for another.
+    pub fn remove_legacy_rebuild_checkpoint(&self) {
+        let _ = std::fs::remove_file(self.rebuild_path());
     }
 }

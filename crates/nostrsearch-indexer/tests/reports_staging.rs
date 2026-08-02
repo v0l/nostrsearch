@@ -289,7 +289,7 @@ fn replaying_already_indexed_events_still_folds_reports() {
     run_all_passes(&mut q, &contacts);
 
     for e in events.iter().filter(|e| e.kind != 3) {
-        q.process_replayed(e, false);
+        q.process_replayed(e, false, None);
     }
 
     let got = report(&q, "activity");

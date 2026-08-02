@@ -254,12 +254,12 @@ async fn main() -> anyhow::Result<()> {
             // the middle of one would otherwise discard all of it and leave the
             // analyses part-filled with no indication anything was lost. The
             // checkpoint records what was folded, so pick up from there.
+            let rebuilding = st.ctl.rebuilding().await;
             if let Some(rp) = st.replay.clone()
-                && let Some(cp) = st.ctl.rebuild_checkpoint().await
+                && !rebuilding.is_empty()
             {
                 tracing::info!(
-                    file = %cp.file,
-                    completed = cp.completed.len(),
+                    analyses = ?rebuilding,
                     "resuming interrupted rebuild"
                 );
                 if let Err(e) = nostrsearch_server::replay::spawn(
@@ -271,7 +271,7 @@ async fn main() -> anyhow::Result<()> {
                     },
                     rp.dedupe,
                     rp.sink,
-                    Some(cp),
+                    Some(st.ctl.clone()),
                 ) {
                     tracing::warn!(error = %e, "could not resume rebuild");
                 }
