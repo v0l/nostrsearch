@@ -14,8 +14,6 @@
 //!   ingest --index-root ./data/index --relays wss://relay.damus.io --relays wss://nos.lol
 //!   ingest --index-root ./data/index --input-dir ./dumps --relays wss://relay.damus.io
 
-use nostr_archive_cursor::NostrCursor;
-use nostrsearch_core::event::NostrEvent;
 use nostrsearch_indexer::{Pipeline, PipelineConfig, ShardWriterConfig};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -263,17 +261,6 @@ fn main() -> anyhow::Result<()> {
     rt.block_on(run(args, pipeline))
 }
 
-fn hex32(hex: &str) -> Option<[u8; 32]> {
-    if hex.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
-    }
-    Some(out)
-}
-
 async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
     let total = Arc::new(AtomicU64::new(0));
     let started = Instant::now();
@@ -453,105 +440,27 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
             });
         }
 
-        // Analyses that depend on another analysis's results (the activity and
-        // active-user reports read follower/WoT data from `follow_graph`)
-        // cannot be folded in the same pass that produces those results: on a
-        // cold corpus the world is still empty, so every author would look
-        // untrusted. Replay the archive once per dependency stage instead —
-        // the streaming equivalent of the staged in-memory runner. Only pass 0
-        // indexes; later passes exist purely to feed the dependent analyses.
-        let passes = pipeline.lock().unwrap().backfill_passes();
-        if passes > 1 {
-            tracing::info!(
-                passes,
-                "archive will be replayed once per dependency stage; only pass 0 indexes"
-            );
-        }
-
-        loop {
-            let pass = pipeline.lock().unwrap().current_pass();
-            let indexing_pass = pass == 0;
-            tracing::info!(
-                pass,
-                passes,
-                indexing = indexing_pass,
-                "archive pass starting"
-            );
-
-            let pipe = pipeline.clone();
-            let total_cb = total.clone();
-            let input_dir = input_dir.clone();
-            // The id store records what has been *indexed*. Later passes must see
-            // those same events again, so the dedupe gate applies to pass 0 only.
-            let ck_store = if indexing_pass {
-                id_store.clone()
-            } else {
-                None
-            };
-            let ck_pending = pending_ids.clone();
-            tokio::task::spawn_blocking(move || {
-                let cursor = NostrCursor::new(input_dir).with_parallelism(parallelism);
-                cursor.walk_with_chunked_sync(
-                    move |events: Vec<nostr_archive_cursor::NostrEventBorrowed>| {
-                        let mut batch: Vec<NostrEvent> = events.iter().map(to_core).collect();
-                        // Group each chunk by time so events land shard-by-shard.
-                        // Archives are not necessarily date-ordered, and writing in
-                        // arbitrary month order thrashes the open-shard set: each
-                        // switch can evict a writer that is needed again a moment
-                        // later, paying a commit + fsync every time.
-                        if sort_batches {
-                            batch.sort_unstable_by_key(|e| e.created_at);
-                        }
-                        let mut p = pipe.lock().unwrap();
-                        match &ck_store {
-                            Some(store) => {
-                                let mut pending = ck_pending.lock().unwrap();
-                                let mut n = 0u64;
-                                for ev in &batch {
-                                    let Some(id) = hex32(&ev.id) else { continue };
-                                    if store.contains(&id) {
-                                        continue;
-                                    }
-                                    p.process(ev);
-                                    pending.push(id);
-                                    n += 1;
-                                }
-                                total_cb.fetch_add(n, Ordering::Relaxed);
-                            }
-                            None => {
-                                for ev in &batch {
-                                    p.process(ev);
-                                }
-                                // Later passes replay already-counted events.
-                                if indexing_pass {
-                                    total_cb.fetch_add(batch.len() as u64, Ordering::Relaxed);
-                                }
-                            }
-                        }
-                    },
-                    chunk_size,
-                );
-            })
-            .await?;
-
-            // Materialize this stage into the world so the next pass's
-            // consumers can read it; stop when every stage has folded.
-            if !pipeline.lock().unwrap().advance_pass() {
-                break;
-            }
-        }
-
-        // finalize backfill and (if no firehose) commit + exit
-        pipeline.lock().unwrap().go_live();
-        // Final checkpoint: go_live committed everything, so all pending ids
-        // are durable in the index and may now be recorded as seen.
-        if let Some(store) = &id_store {
-            let ids = std::mem::take(&mut *pending_ids.lock().unwrap());
-            if let Err(e) = store.flush(ids.iter()) {
-                tracing::warn!(error = %e, "final dedupe flush failed");
-            }
-        }
-        pipeline.lock().unwrap().commit()?;
+        // The engine is shared with the server's admin ingest: one reader,
+        // one staging scheme, one set of id-store rules. They used to be two
+        // implementations with two sets of bugs.
+        let progress =
+            std::sync::Arc::new(nostrsearch_indexer::archive_ingest::IngestProgress::default());
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        nostrsearch_indexer::archive_ingest::ingest(
+            pipeline.clone(),
+            nostrsearch_indexer::archive_ingest::IngestOptions {
+                input_dir: input_dir.clone(),
+                parallelism,
+                chunk_size,
+                sort_batches,
+                dedupe: args.dedupe,
+            },
+            id_store.clone(),
+            progress.clone(),
+            cancel,
+        )
+        .await?;
+        total.store(progress.indexed.load(Ordering::Relaxed), Ordering::Relaxed);
         tracing::info!("archive backfill complete");
     }
 
@@ -606,20 +515,4 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
         done as f64 / secs
     );
     Ok(())
-}
-
-fn to_core(ev: &nostr_archive_cursor::NostrEventBorrowed) -> NostrEvent {
-    NostrEvent {
-        id: ev.id.to_string(),
-        pubkey: ev.pubkey.to_string(),
-        created_at: ev.created_at,
-        kind: ev.kind as u16,
-        tags: ev
-            .tags
-            .iter()
-            .map(|t| t.iter().map(|s| s.to_string()).collect())
-            .collect(),
-        content: ev.content.to_string(),
-        sig: ev.sig.to_string(),
-    }
 }

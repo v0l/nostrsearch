@@ -73,9 +73,6 @@ pub struct Pipeline {
     since_refresh: u64,
     last_refresh: Instant,
     last_persist: Instant,
-    /// Stage of the rebuild pass most recently begun, to materialize the world
-    /// exactly once per stage change.
-    rebuild_stage_seen: Option<usize>,
 
     refreshed_once: bool,
     /// Cumulative time spent folding events into analyses, in nanoseconds.
@@ -135,7 +132,6 @@ impl Pipeline {
             // Allow the first refresh immediately.
             last_refresh: Instant::now() - Duration::from_secs(86_400),
             last_persist: Instant::now(),
-            rebuild_stage_seen: None,
 
             refreshed_once: false,
             stats_ns: 0,
@@ -177,96 +173,20 @@ impl Pipeline {
     pub fn analyses_status(&self) -> Vec<nostrsearch_stats::AnalysisStatus> {
         self.registry.status()
     }
-
-    /// Record how far the rebuild has been folded.
-    ///
-    /// Called by the writer as it consumes replayed events, not by the reader
-    /// that produces them. The reader runs up to a full queue ahead, so its
-    /// position describes events that may never have been folded; checkpointing
-    /// it would silently drop everything still in flight when a process dies.
-    /// Arm each analysis's own resume point for `file`, and report what the
-    /// reader may skip.
-    /// Start (or resume) a rebuild run over `files`.
-    pub fn set_rebuild_files(&mut self, files: Vec<String>) {
-        if let Err(e) = self.registry.set_rebuild_files(files) {
-            tracing::error!(error = %e, "rebuild run could not be staged");
-        }
-        self.rebuild_stage_seen = None;
-    }
-
-    pub fn begin_rebuild(&mut self, file: &str) -> nostrsearch_stats::RebuildPlan {
-        // Materialize the world when the pass changes. The next stage's
-        // analyses label events with what the previous stage built -- fold
-        // activity against a world that predates the follow graph and every
-        // event is recorded untrusted, permanently. This is the same reason
-        // the staged ingest materializes between passes.
-        let stage = self.registry.rebuild_stage();
-        if stage.is_some() && stage != self.rebuild_stage_seen {
-            tracing::info!(?stage, "rebuild pass starting; materializing world");
-            self.refresh_inner(true);
-            self.rebuild_stage_seen = stage;
-        }
-        self.registry.begin_rebuild(file)
-    }
-
-    /// End the rebuild run: clear positions, materialize, persist.
-    pub fn finish_rebuild_run(&mut self) {
-        self.registry.finish_rebuild_run();
-        self.rebuild_stage_seen = None;
-        self.refresh_inner(true);
-        tracing::info!("rebuild complete");
-    }
-
-    /// Abandon the rebuild run: clear positions and persist them cleared.
-    ///
-    /// For an operator cancel, which must stay stopped. The positions exist so
-    /// an *involuntary* end -- deploy, crash -- resumes on the next start;
-    /// after a deliberate stop that same mechanism would quietly restart the
-    /// run the operator just killed. The analyses keep whatever they folded so
-    /// far and remain on the fold-everything path.
-    pub fn abort_rebuild_run(&mut self) {
-        self.registry.finish_rebuild_run();
-        self.rebuild_stage_seen = None;
-        if let Some(store) = &self.store
-            && let Err(e) = self.registry.persist(store)
-        {
-            tracing::warn!(error = %e, "persisting the aborted rebuild failed");
-        }
-        tracing::info!("rebuild cancelled; positions cleared, it will not resume");
-    }
-
-    /// Mark `file` fully folded for every analysis rebuilding it, and persist
-    /// straight away: a file boundary is the cheapest point at which a restart
-    /// can avoid re-reading it.
-    pub fn finish_rebuild_file(&mut self, file: &str) {
-        self.registry.finish_rebuild_file(file);
-        if let Some(store) = &self.store
-            && let Err(e) = self.registry.persist(store)
-        {
-            tracing::warn!(error = %e, file, "persisting rebuild progress failed");
-        }
-    }
-
-    /// Analyses with a rebuild still in progress, so one can be resumed at
-    /// startup.
-    pub fn rebuilding(&self) -> Vec<&'static str> {
-        self.registry.rebuilding()
-    }
-
-    /// Reset every analysis and persist immediately, so a restart cannot
-    /// resurrect the old state.
+    /// Analyses with a rebuild still in progress, so one can be resumed at    /// Reset every analysis, external storage included, and persist
+    /// immediately so a restart cannot resurrect the old state.
     pub fn reset_all_analyses(&mut self) -> Vec<&'static str> {
         let names = self.registry.reset_all();
-        // The world is derived from analyses that no longer hold anything, so
-        // leaving it in place would keep labelling events with a web of trust
-        // that has been discarded.
+        // The world is derived from analyses that now hold nothing, so leaving
+        // it in place would keep labelling events with a web of trust that has
+        // been discarded.
         self.world = Default::default();
         if let Some(store) = &self.store
             && let Err(e) = self.registry.persist(store)
         {
             tracing::warn!(error = %e, "persisting reset failed");
         }
-        tracing::info!(reset = ?names, "all analyses reset; rebuilding from the archive");
+        tracing::info!(reset = ?names, "all analyses reset");
         names
     }
 
@@ -327,36 +247,6 @@ impl Pipeline {
             .map(|d| d.as_secs())
             .unwrap_or(0)
     }
-
-    /// Process a replayed archive event.
-    ///
-    /// `index` is false when the replay already found the event in the corpus.
-    /// The analyses still see it: index state and analysis state are
-    /// independent, and a rebuild exists precisely to re-derive analysis state
-    /// from events that are already indexed.
-    ///
-    /// `file` names the dump it came from. When present the event is folded
-    /// through the rebuild path, which honours each analysis's own resume
-    /// point and advances its position.
-    pub fn process_replayed(&mut self, ev: &NostrEvent, index: bool, file: Option<&str>) {
-        let now = Self::now();
-        let t0 = Instant::now();
-        match file {
-            Some(f) => self.registry.observe_rebuild(ev, now, &self.world, f),
-            None => self.registry.observe_backfill(ev, now, &self.world),
-        }
-        let t1 = Instant::now();
-        if index && let Err(e) = self.manager.index_event(ev) {
-            tracing::warn!(error = %e, "index_event failed");
-        }
-        self.stats_ns += (t1 - t0).as_nanos() as u64;
-        self.index_ns += t1.elapsed().as_nanos() as u64;
-        self.since_refresh += 1;
-        if self.live && self.since_refresh >= self.cfg.wot_refresh_every {
-            self.maybe_refresh_wot();
-        }
-    }
-
     pub fn process(&mut self, ev: &NostrEvent) {
         let now = Self::now();
         let t0 = Instant::now();

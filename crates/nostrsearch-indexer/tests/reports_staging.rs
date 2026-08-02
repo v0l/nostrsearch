@@ -257,16 +257,16 @@ fn later_passes_do_not_reindex() {
     );
 }
 
-/// A replay of already-indexed events must still feed the analyses.
+/// Events fed to a node whose graph is already built must fold with the right
+/// trust split.
 ///
-/// The archive replay skips indexing for events it finds in the id-store, which
-/// is correct -- they are already searchable. But an operator replays a dump
-/// *after* resetting reports precisely to rebuild analysis state, and at that
-/// point every event in the dump is already indexed. Treating "already indexed"
-/// as "nothing to do" made the replay a no-op for reports: on the live node it
-/// read 122 GiB and folded nothing.
+/// This is what an archive pass does after the graph exists: the dedupe gate
+/// stops events being *indexed* twice, but they must still reach the analyses,
+/// or a re-read of the corpus folds nothing and the reports stay empty. The
+/// engine expresses that by applying the dedupe gate to pass 0 only; this pins
+/// the fold behaviour that rule depends on.
 #[test]
-fn replaying_already_indexed_events_still_folds_reports() {
+fn events_fold_against_an_already_materialized_world() {
     let dir = tempfile::tempdir().unwrap();
     let day0 = 1_700_000_000 - (1_700_000_000 % DAY);
     let events = corpus(day0);
@@ -289,7 +289,7 @@ fn replaying_already_indexed_events_still_folds_reports() {
     run_all_passes(&mut q, &contacts);
 
     for e in events.iter().filter(|e| e.kind != 3) {
-        q.process_replayed(e, false, None);
+        q.process(e);
     }
 
     let got = report(&q, "activity");

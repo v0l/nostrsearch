@@ -1,0 +1,262 @@
+//! Ingesting an archive of JSONL dumps into a [`Pipeline`].
+//!
+//! This is *the* archive ingest. It was previously implemented twice -- once in
+//! `bin/ingest.rs` and once, differently, in the server's admin replay -- which
+//! meant two readers, two staging schemes, two resume schemes, and two sets of
+//! bugs. The server's copy silently never recorded indexed ids, so its dedupe
+//! store drifted ahead of the index and every later ingest skipped the events
+//! it was supposed to add. One engine, called by both, is the fix.
+//!
+//! Three properties matter and are easy to get wrong:
+//!
+//! **A bad line costs one event.** An earlier reader abandoned the rest of a
+//! file on the first parse failure, which is how a large span of the corpus
+//! went missing from an index that reported success.
+//!
+//! **Dependent analyses need their own pass.** `activity` and `active_users`
+//! label events using the world `follow_graph` builds, so folding them in the
+//! same pass over a cold corpus records everything as untrusted. The archive is
+//! read once per dependency stage; only pass 0 indexes.
+//!
+//! **Ids are recorded only once their documents are durable.** The id store
+//! answers "is this already indexed?", and ingest skips whatever it claims. A
+//! store ahead of the index is therefore unfillable data loss -- every retry
+//! skips the hole. Recording happens under the same pipeline lock as the
+//! commit, so a kill leaves the store *behind* at worst, which costs redundant
+//! work and self-corrects.
+
+use crate::id_store::IdStore;
+use crate::pipeline::Pipeline;
+use nostr_archive_cursor::NostrCursor;
+use nostrsearch_core::event::NostrEvent;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
+/// How the archive should be read.
+#[derive(Clone, Debug)]
+pub struct IngestOptions {
+    /// Directory of JSONL dumps.
+    pub input_dir: PathBuf,
+    /// Reader threads. The cursor walks whole files in parallel.
+    pub parallelism: usize,
+    /// Events handed to the pipeline per callback.
+    pub chunk_size: usize,
+    /// Sort each chunk by `created_at` so events land shard-by-shard.
+    ///
+    /// Archives are not date-ordered, and writing in arbitrary month order
+    /// thrashes the open-shard set: each switch can evict a writer needed again
+    /// a moment later, paying a commit and fsync every time.
+    pub sort_batches: bool,
+    /// Skip events the id store already claims. Off re-indexes everything,
+    /// which is what a corrupt or divergent store needs.
+    pub dedupe: bool,
+}
+
+impl Default for IngestOptions {
+    fn default() -> Self {
+        Self {
+            input_dir: PathBuf::new(),
+            parallelism: 4,
+            chunk_size: 1000,
+            sort_batches: true,
+            dedupe: true,
+        }
+    }
+}
+
+/// Live counters, shared with whoever is watching.
+#[derive(Debug, Default)]
+pub struct IngestProgress {
+    /// Dependency-stage pass currently running, 0-based.
+    pub pass: AtomicU64,
+    /// Total passes this run will make.
+    pub passes: AtomicU64,
+    /// Events handed to the pipeline in the indexing pass.
+    pub indexed: AtomicU64,
+    /// Events seen, including those skipped as already known.
+    pub seen: AtomicU64,
+    /// Events skipped because the id store already had them.
+    pub skipped: AtomicU64,
+    /// Lines that would not parse. One bad line costs one event, never a file.
+    pub malformed: AtomicU64,
+    pub running: AtomicBool,
+    pub finished_at: AtomicU64,
+}
+
+/// Run an archive ingest to completion.
+///
+/// Blocking work happens on the blocking pool; the caller may cancel by
+/// setting `cancel`, which is honoured between chunks.
+pub async fn ingest(
+    pipeline: Arc<Mutex<Pipeline>>,
+    opts: IngestOptions,
+    id_store: Option<Arc<IdStore>>,
+    progress: Arc<IngestProgress>,
+    cancel: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
+    progress.running.store(true, Ordering::Relaxed);
+
+    // Ids indexed since the last checkpoint. Flushed while holding the
+    // pipeline lock across commit, so an id is only recorded once its document
+    // is durable.
+    let pending_ids: Arc<Mutex<Vec<[u8; 32]>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let passes = pipeline.lock().unwrap().backfill_passes();
+    progress.passes.store(passes as u64, Ordering::Relaxed);
+    if passes > 1 {
+        tracing::info!(
+            passes,
+            "archive will be read once per dependency stage; only pass 0 indexes"
+        );
+    }
+
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            tracing::info!("archive ingest cancelled");
+            break;
+        }
+
+        let pass = pipeline.lock().unwrap().current_pass();
+        let indexing_pass = pass == 0;
+        progress.pass.store(pass as u64, Ordering::Relaxed);
+        tracing::info!(
+            pass,
+            passes,
+            indexing = indexing_pass,
+            "archive pass starting"
+        );
+
+        let pipe = pipeline.clone();
+        let input_dir = opts.input_dir.clone();
+        let parallelism = opts.parallelism;
+        let chunk_size = opts.chunk_size;
+        let sort_batches = opts.sort_batches;
+        // The id store records what has been *indexed*, so its gate applies to
+        // pass 0 only: later passes must see the same events again to feed the
+        // dependent analyses.
+        let ck_store = if indexing_pass && opts.dedupe {
+            id_store.clone()
+        } else {
+            None
+        };
+        let ck_pending = pending_ids.clone();
+        let prog = progress.clone();
+        let cancel_cb = cancel.clone();
+
+        tokio::task::spawn_blocking(move || {
+            let cursor = NostrCursor::new(input_dir).with_parallelism(parallelism);
+            cursor.walk_with_chunked_sync(
+                move |events: Vec<nostr_archive_cursor::NostrEventBorrowed>| {
+                    if cancel_cb.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    let mut batch: Vec<NostrEvent> = events.iter().map(to_core).collect();
+                    if sort_batches {
+                        batch.sort_unstable_by_key(|e| e.created_at);
+                    }
+                    prog.seen.fetch_add(batch.len() as u64, Ordering::Relaxed);
+
+                    let mut p = pipe.lock().unwrap();
+                    match &ck_store {
+                        Some(store) => {
+                            let mut pending = ck_pending.lock().unwrap();
+                            let mut n = 0u64;
+                            let mut skipped = 0u64;
+                            for ev in &batch {
+                                let Some(id) = hex32(&ev.id) else { continue };
+                                if store.contains(&id) {
+                                    skipped += 1;
+                                    continue;
+                                }
+                                p.process(ev);
+                                pending.push(id);
+                                n += 1;
+                            }
+                            prog.indexed.fetch_add(n, Ordering::Relaxed);
+                            prog.skipped.fetch_add(skipped, Ordering::Relaxed);
+                        }
+                        None => {
+                            for ev in &batch {
+                                p.process(ev);
+                            }
+                            if indexing_pass {
+                                prog.indexed
+                                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                },
+                chunk_size,
+            );
+        })
+        .await?;
+
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+
+        // Materialize this stage into the world so the next pass's consumers
+        // can read it; stop when every stage has folded.
+        if !pipeline.lock().unwrap().advance_pass() {
+            break;
+        }
+    }
+
+    // Finalize: commit first, then claim the ids, never the other way round.
+    {
+        let mut p = pipeline.lock().unwrap();
+        p.go_live();
+        if let Some(store) = &id_store {
+            let ids = std::mem::take(&mut *pending_ids.lock().unwrap());
+            if let Err(e) = store.flush(ids.iter()) {
+                tracing::warn!(error = %e, "final dedupe flush failed");
+            }
+        }
+        p.commit()?;
+    }
+
+    progress.running.store(false, Ordering::Relaxed);
+    progress.finished_at.store(unix_now(), Ordering::Relaxed);
+    tracing::info!(
+        indexed = progress.indexed.load(Ordering::Relaxed),
+        skipped = progress.skipped.load(Ordering::Relaxed),
+        "archive ingest complete"
+    );
+    Ok(())
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+pub fn hex32(hex: &str) -> Option<[u8; 32]> {
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, b) in out.iter_mut().enumerate() {
+        *b = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+/// Borrowed cursor event to owned core event.
+pub fn to_core(ev: &nostr_archive_cursor::NostrEventBorrowed) -> NostrEvent {
+    NostrEvent {
+        id: ev.id.to_string(),
+        pubkey: ev.pubkey.to_string(),
+        created_at: ev.created_at,
+        kind: ev.kind as u16,
+        tags: ev
+            .tags
+            .iter()
+            .map(|t| t.iter().map(|s| s.to_string()).collect())
+            .collect(),
+        content: ev.content.to_string(),
+        sig: ev.sig.to_string(),
+    }
+}

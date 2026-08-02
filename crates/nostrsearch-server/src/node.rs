@@ -27,7 +27,7 @@ use nostr_archive_cursor::DefaultJsonFilesDatabase;
 use nostr_sdk::prelude::*;
 use nostrsearch_core::event::NostrEvent;
 use nostrsearch_indexer::{Pipeline, PipelineConfig};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 /// Convert an sdk event into the canonical corpus event.
@@ -78,47 +78,41 @@ impl EventSink {
     }
 }
 
-/// What the writer should do with a replayed event.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Fold {
-    /// Ingest: the event is missing from the corpus, so index it as well as
-    /// folding it into the analyses.
-    AndIndex,
-    /// Rebuild: the event is already in the corpus and only the analyses need
-    /// it, so skip the index write entirely.
-    Only,
-}
-
-/// A replayed event and what to do with it.
-pub struct Replayed {
-    pub ev: NostrEvent,
-    pub fold: Fold,
-    /// Dump this came from, when rebuilding. Carried per-event so each
-    /// analysis's position records what the writer *folded*, not what the
-    /// reader produced -- the reader runs a full queue ahead, so its own
-    /// position describes events that may never be folded at all.
-    pub file: Option<std::sync::Arc<str>>,
-}
-
-/// Submits replayed archive events to the writer at lower priority than live
-/// traffic. Cloneable and cheap.
+/// Ids indexed since the last commit, awaiting durable record.
 ///
-/// The channel carries *batches*: at parse-bound rates a per-event send is
-/// measurable overhead, and the writer folding a batch per wakeup amortizes
-/// the channel to noise. Producers should not call this directly -- a
-/// [`crate::replay::Submitter`] wraps it so a partially filled batch cannot
-/// be forgotten on an early return.
-#[derive(Clone)]
-pub struct ReplaySink(mpsc::Sender<Vec<Replayed>>);
+/// The id-store answers "is this already in the index?", and ingest skips
+/// anything it says yes to. So the store being *ahead* of the index is silent,
+/// permanent data loss: every attempt to fill the gap is skipped as
+/// already-done, and no amount of re-running helps.
+///
+/// The ordering rule that prevents it: **record only after the commit that
+/// made the document searchable**. Crashing in that window leaves the store
+/// *behind*, which costs a re-index of a few seconds of events and is
+/// self-correcting.
+#[derive(Default)]
+struct IndexedIds(Vec<[u8; 32]>);
 
-impl ReplaySink {
-    /// Submit a batch from a blocking thread, waiting for capacity.
-    ///
-    /// Blocking on a full queue is the point: it is what stops a replay of a
-    /// 200 GB dump outrunning the writer and pushing live events out.
-    pub fn blocking_submit_batch(&self, batch: Vec<Replayed>) {
-        if !batch.is_empty() {
-            let _ = self.0.blocking_send(batch);
+impl IndexedIds {
+    fn note(&mut self, ev: &NostrEvent) {
+        if let Some(id) = nostrsearch_indexer::archive_ingest::hex32(&ev.id) {
+            self.0.push(id);
+        }
+    }
+
+    /// Record everything indexed since the last commit. Call *after* it.
+    fn flush(&mut self, store: Option<&Arc<nostrsearch_indexer::id_store::IdStore>>) {
+        if self.0.is_empty() {
+            return;
+        }
+        match store {
+            Some(s) => {
+                if let Err(e) = s.flush(self.0.iter()) {
+                    tracing::warn!(error = %e, pending = self.0.len(), "recording indexed ids failed");
+                    return;
+                }
+                self.0.clear();
+            }
+            None => self.0.clear(),
         }
     }
 }
@@ -130,36 +124,6 @@ pub enum WriterCmd {
     ResetAnalysis {
         name: String,
         reply: tokio::sync::oneshot::Sender<Option<Vec<&'static str>>>,
-    },
-    /// Declare the dump list for a rebuild run.
-    SetRebuildFiles {
-        files: Vec<String>,
-        reply: tokio::sync::oneshot::Sender<()>,
-    },
-    /// Arm each analysis's resume point for a dump and report what the reader
-    /// may skip.
-    BeginRebuild {
-        file: String,
-        reply: tokio::sync::oneshot::Sender<nostrsearch_stats::RebuildPlan>,
-    },
-    /// End the rebuild run: clear positions, materialize, persist.
-    FinishRebuildRun {
-        reply: tokio::sync::oneshot::Sender<()>,
-    },
-    /// Abandon the rebuild run after an operator cancel: clear positions and
-    /// persist, so a restart does not resume a run that was stopped on
-    /// purpose.
-    AbortRebuildRun {
-        reply: tokio::sync::oneshot::Sender<()>,
-    },
-    /// Mark a dump fully folded for every analysis rebuilding it.
-    FinishRebuildFile {
-        file: String,
-        reply: tokio::sync::oneshot::Sender<()>,
-    },
-    /// Analyses with a rebuild still in progress.
-    Rebuilding {
-        reply: tokio::sync::oneshot::Sender<Vec<&'static str>>,
     },
     /// Per-analysis progress.
     Status {
@@ -180,79 +144,6 @@ pub enum WriterCmd {
 pub struct WriterCtl(mpsc::Sender<WriterCmd>);
 
 impl WriterCtl {
-    /// Declare the dump list for a rebuild run. Blocking, for the reader.
-    pub fn set_rebuild_files_blocking(&self, files: Vec<String>) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        if self
-            .0
-            .blocking_send(WriterCmd::SetRebuildFiles { files, reply: tx })
-            .is_ok()
-        {
-            let _ = rx.blocking_recv();
-        }
-    }
-
-    /// Abandon the rebuild run after a cancel. Blocking, for the reader.
-    pub fn abort_rebuild_run_blocking(&self) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        if self
-            .0
-            .blocking_send(WriterCmd::AbortRebuildRun { reply: tx })
-            .is_ok()
-        {
-            let _ = rx.blocking_recv();
-        }
-    }
-
-    /// End the rebuild run. Blocking, for the reader.
-    pub fn finish_rebuild_run_blocking(&self) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        if self
-            .0
-            .blocking_send(WriterCmd::FinishRebuildRun { reply: tx })
-            .is_ok()
-        {
-            let _ = rx.blocking_recv();
-        }
-    }
-
-    /// Arm resume points for `file` and report what the reader may skip.
-    ///
-    /// Blocking, for the replay reader thread: it must know the plan before it
-    /// starts reading, and it is not on the async runtime.
-    pub fn begin_rebuild_blocking(&self, file: &str) -> nostrsearch_stats::RebuildPlan {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        if self
-            .0
-            .blocking_send(WriterCmd::BeginRebuild {
-                file: file.to_string(),
-                reply: tx,
-            })
-            .is_err()
-        {
-            return nostrsearch_stats::RebuildPlan::FoldAll;
-        }
-        // Folding everything is the safe fallback: it re-reads, where guessing
-        // a skip would drop events silently.
-        rx.blocking_recv()
-            .unwrap_or(nostrsearch_stats::RebuildPlan::FoldAll)
-    }
-
-    /// Mark `file` fully folded for every analysis rebuilding it.
-    pub fn finish_rebuild_file_blocking(&self, file: &str) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        if self
-            .0
-            .blocking_send(WriterCmd::FinishRebuildFile {
-                file: file.to_string(),
-                reply: tx,
-            })
-            .is_ok()
-        {
-            let _ = rx.blocking_recv();
-        }
-    }
-
     /// Discard every analysis so they rebuild from the archive.
     pub async fn reset_all(&self) -> Result<Vec<&'static str>, &'static str> {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -279,21 +170,6 @@ impl WriterCtl {
         }
         rx.await.unwrap_or_default()
     }
-
-    /// Analyses with a rebuild still in progress.
-    pub async fn rebuilding(&self) -> Vec<&'static str> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        if self
-            .0
-            .send(WriterCmd::Rebuilding { reply: tx })
-            .await
-            .is_err()
-        {
-            return Vec::new();
-        }
-        rx.await.unwrap_or_default()
-    }
-
     /// Reset an analysis and everything that depends on it.
     ///
     /// `Ok(None)` = no analysis by that name.
@@ -354,41 +230,40 @@ pub fn spawn_writer(
     commit_every: std::time::Duration,
 ) -> anyhow::Result<(EventSink, WriterHandle)> {
     let (sink, handle, _ctl, _replay) =
-        spawn_writer_with_reports(cfg, queue_size, commit_every, None)?;
+        spawn_writer_with_reports(cfg, queue_size, commit_every, None, None)?;
     Ok((sink, handle))
 }
 
 /// As [`spawn_writer`], but also publishes analysis snapshots into `reports`
 /// on each commit tick so the HTTP layer can serve them without touching the
 /// pipeline (which this task owns exclusively).
+///
+/// `dedupe` is the id-store this node indexes against. The writer records the
+/// id of everything it indexes, *after* the commit that made it searchable --
+/// see [`IndexedIds`] for why the ordering is the whole point.
 pub fn spawn_writer_with_reports(
     cfg: PipelineConfig,
     queue_size: usize,
     commit_every: std::time::Duration,
     reports: Option<crate::reports::ReportStore>,
-) -> anyhow::Result<(EventSink, WriterHandle, WriterCtl, ReplaySink)> {
-    let mut pipeline = Pipeline::new(cfg)?;
+    dedupe: Option<std::sync::Arc<nostrsearch_indexer::id_store::IdStore>>,
+) -> anyhow::Result<(EventSink, WriterHandle, WriterCtl, Arc<Mutex<Pipeline>>)> {
+    // Behind a mutex, not moved into the task: the archive ingest engine --
+    // the same one the CLI runs -- needs access to this pipeline, and a
+    // channel-only writer is exactly what forced a second, divergent ingest
+    // implementation to exist. Contention is negligible: live traffic is a
+    // handful of events a second, and ingest holds the lock per chunk.
+    let pipeline = Arc::new(Mutex::new(Pipeline::new(cfg)?));
     // Live tail semantics: everything from here on is realtime.
-    pipeline.go_live();
+    pipeline.lock().unwrap().go_live();
+    let pipeline_for_task = pipeline.clone();
 
     let (tx, mut rx) = mpsc::channel::<NostrEvent>(queue_size);
     let (sd_tx, mut sd_rx) = tokio::sync::watch::channel(false);
     // Small: these are rare operator actions, not a data path.
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriterCmd>(16);
-    // Replay queue, deliberately shallow: a deep buffer would let a replay
-    // build a long backlog that delays live events behind it.
-    // 8 batches of up to 512: the same ~4k-event ceiling the per-event queue
-    // had, in far fewer channel operations.
-    let (replay_tx, mut replay_rx) = mpsc::channel::<Vec<Replayed>>(8);
-
-    /// Fold one replayed batch into the pipeline.
-    fn fold_batch(pipeline: &mut Pipeline, batch: Vec<Replayed>) {
-        for r in batch {
-            pipeline.process_replayed(&r.ev, r.fold == Fold::AndIndex, r.file.as_deref());
-        }
-    }
-
     let join = tokio::spawn(async move {
+        let pipeline = pipeline_for_task;
         let mut tick = tokio::time::interval(commit_every);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await; // consume the immediate first tick
@@ -401,6 +276,8 @@ pub fn spawn_writer_with_reports(
         delta_tick.tick().await;
 
         let mut dirty = false;
+        // Ids indexed since the last commit, recorded only once it succeeds.
+        let mut indexed = IndexedIds::default();
 
         loop {
             // The commit timer must be independent of event arrival: a purely
@@ -414,106 +291,60 @@ pub fn spawn_writer_with_reports(
 
                 maybe = rx.recv() => match maybe {
                     Some(ev) => {
-                        pipeline.process(&ev);
+                        pipeline.lock().unwrap().process(&ev);
+                        indexed.note(&ev);
                         dirty = true;
                     }
                     None => break, // all senders dropped
                 },
                 _ = tick.tick() => {
                     if dirty {
-                        if let Err(e) = pipeline.commit() {
-                            tracing::warn!(error = %e, "commit failed");
+                        match pipeline.lock().unwrap().commit() {
+                            // Committed, so the documents are searchable and
+                            // their ids may now be claimed. Never before: a
+                            // store ahead of the index makes those events
+                            // unreachable to every future ingest.
+                            Ok(()) => indexed.flush(dedupe.as_ref()),
+                            Err(e) => tracing::warn!(error = %e, "commit failed"),
                         }
-                        publish_reports(&pipeline, reports.as_ref());
+                        publish_reports(&pipeline.lock().unwrap(), reports.as_ref());
                         dirty = false;
                     }
                 }
                 _ = delta_tick.tick() => {
                     if let Some(store) = reports.as_ref() {
-                        let deltas = pipeline.drain_report_deltas();
+                        let deltas = pipeline.lock().unwrap().drain_report_deltas();
                         store.apply_deltas(unix_now(), deltas);
                     }
                 }
                 Some(cmd) = cmd_rx.recv() => match cmd {
-                    WriterCmd::SetRebuildFiles { files, reply } => {
-                        pipeline.set_rebuild_files(files);
-                        let _ = reply.send(());
-                    }
-                    WriterCmd::BeginRebuild { file, reply } => {
-                        let _ = reply.send(pipeline.begin_rebuild(&file));
-                    }
-                    WriterCmd::FinishRebuildRun { reply } => {
-                        // Same drain as FinishRebuildFile: clearing positions
-                        // with events still queued would fold that tail into
-                        // analyses that already counted it.
-                        while let Ok(batch) = replay_rx.try_recv() {
-                            fold_batch(&mut pipeline, batch);
-                        }
-                        pipeline.finish_rebuild_run();
-                        publish_reports(&pipeline, reports.as_ref());
-                        let _ = reply.send(());
-                    }
-                    WriterCmd::AbortRebuildRun { reply } => {
-                        // Discarded, not folded: the operator cancelled, and
-                        // folding the queued tail would re-advance the very
-                        // positions this exists to clear.
-                        let mut dropped = 0u64;
-                        while let Ok(batch) = replay_rx.try_recv() {
-                            dropped += batch.len() as u64;
-                        }
-                        if dropped > 0 {
-                            tracing::info!(dropped, "discarded queued replay events on cancel");
-                        }
-                        pipeline.abort_rebuild_run();
-                        let _ = reply.send(());
-                    }
-                    WriterCmd::FinishRebuildFile { file, reply } => {
-                        // Fold whatever of this file is still queued before
-                        // marking it complete. The reader is blocked on the
-                        // reply, so the drain sees everything it submitted --
-                        // and without it, up to a full queue of the file's
-                        // tail is skipped as "already folded" the moment the
-                        // completion lands.
-                        while let Ok(batch) = replay_rx.try_recv() {
-                            fold_batch(&mut pipeline, batch);
-                        }
-                        pipeline.finish_rebuild_file(&file);
-                        dirty = true;
-                        let _ = reply.send(());
-                    }
-                    WriterCmd::Rebuilding { reply } => {
-                        let _ = reply.send(pipeline.rebuilding());
-                    }
                     WriterCmd::ResetAll { reply } => {
-                        let names = pipeline.reset_all_analyses();
-                        publish_reports(&pipeline, reports.as_ref());
+                        let names = pipeline.lock().unwrap().reset_all_analyses();
+                        publish_reports(&pipeline.lock().unwrap(), reports.as_ref());
                         let _ = reply.send(names);
                     }
                     WriterCmd::RelayTargets { reply } => {
-                        let _ = reply.send(pipeline.relay_targets());
+                        let _ = reply.send(pipeline.lock().unwrap().relay_targets());
                     }
                     WriterCmd::ResetAnalysis { name, reply } => {
-                        let ok = pipeline.reset_analysis(&name);
+                        let ok = pipeline.lock().unwrap().reset_analysis(&name);
                         // Republish immediately so the dashboard reflects the
                         // now-empty report rather than the stale one.
-                        publish_reports(&pipeline, reports.as_ref());
+                        publish_reports(&pipeline.lock().unwrap(), reports.as_ref());
                         let _ = reply.send(ok);
                     }
                     WriterCmd::Status { reply } => {
-                        let _ = reply.send(pipeline.analyses_status());
+                        let _ = reply.send(pipeline.lock().unwrap().analyses_status());
                     }
                 },
-                Some(batch) = replay_rx.recv() => {
-                    fold_batch(&mut pipeline, batch);
-                    dirty = true;
-                }
                 _ = sd_rx.changed() => {
                     if *sd_rx.borrow() {
                         tracing::info!("writer shutting down; draining queue");
                         // Drain anything already queued so a deploy doesn't
                         // drop in-flight events.
                         while let Ok(ev) = rx.try_recv() {
-                            pipeline.process(&ev);
+                            pipeline.lock().unwrap().process(&ev);
+                            indexed.note(&ev);
                         }
                         break;
                     }
@@ -521,10 +352,13 @@ pub fn spawn_writer_with_reports(
             }
         }
 
-        if let Err(e) = pipeline.finish() {
-            tracing::warn!(error = %e, "final flush failed");
+        match pipeline.lock().unwrap().finish() {
+            // Same rule on the way out: claim the ids only once the final
+            // commit has made them searchable.
+            Ok(()) => indexed.flush(dedupe.as_ref()),
+            Err(e) => tracing::warn!(error = %e, "final flush failed"),
         }
-        publish_reports(&pipeline, reports.as_ref());
+        publish_reports(&pipeline.lock().unwrap(), reports.as_ref());
         tracing::info!("writer task stopped (flushed)");
     });
 
@@ -535,7 +369,7 @@ pub fn spawn_writer_with_reports(
             join,
         },
         WriterCtl(cmd_tx),
-        ReplaySink(replay_tx),
+        pipeline,
     ))
 }
 

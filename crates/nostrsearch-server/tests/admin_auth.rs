@@ -47,6 +47,7 @@ async fn serve(admin: &Keys) -> anyhow::Result<String> {
         128,
         std::time::Duration::from_secs(30),
         None,
+        None,
     )?;
     // Leak the handles: the server must outlive this helper.
     std::mem::forget(_sink);

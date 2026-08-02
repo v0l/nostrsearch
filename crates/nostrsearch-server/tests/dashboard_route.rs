@@ -45,6 +45,7 @@ async fn serve(with_admin: bool) -> anyhow::Result<String> {
         128,
         std::time::Duration::from_secs(30),
         None,
+        None,
     )?;
     std::mem::forget(sink);
     std::mem::forget(handle);

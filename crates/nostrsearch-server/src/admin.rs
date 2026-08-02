@@ -44,7 +44,7 @@ pub struct AdminState {
     pub ctl: WriterCtl,
     pub scrape: Option<Arc<ScrapeState>>,
     /// Set when this node has an archive directory it can replay from.
-    pub replay: Option<ReplayCtx>,
+    pub replay: Option<IngestCtx>,
     /// Recently accepted auth event ids, to stop a captured header being
     /// replayed within its freshness window.
     seen: Arc<Mutex<HashMap<String, u64>>>,
@@ -92,13 +92,7 @@ impl AdminConfig {
 }
 
 /// Everything the replay endpoints need to start a background re-ingest.
-#[derive(Clone)]
-pub struct ReplayCtx {
-    pub state: crate::replay::ReplayState,
-    pub dir: std::path::PathBuf,
-    pub dedupe: Option<Arc<nostrsearch_indexer::id_store::IdStore>>,
-    pub sink: crate::node::ReplaySink,
-}
+pub use crate::ingest_job::IngestCtx;
 
 impl AdminState {
     pub fn new(cfg: AdminConfig, ctl: WriterCtl, scrape: Option<Arc<ScrapeState>>) -> Self {
@@ -111,7 +105,7 @@ impl AdminState {
         }
     }
 
-    pub fn with_replay(mut self, replay: ReplayCtx) -> Self {
+    pub fn with_replay(mut self, replay: IngestCtx) -> Self {
         self.replay = Some(replay);
         self
     }
@@ -351,17 +345,10 @@ async fn reset_all(State(st): State<AdminState>) -> Response {
         }
     };
 
-    let started = crate::replay::spawn(
-        rp.state.clone(),
-        rp.dir,
-        crate::replay::ReplaySelection {
-            files: Vec::new(), // every dump
-            rebuild: true,
-        },
-        rp.dedupe,
-        rp.sink,
-        Some(st.ctl.clone()),
-    );
+    // Re-index everything: the analyses are empty, and after a reset the
+    // dedupe store is not a safe gate -- if it has drifted ahead of the index,
+    // every attempt to refill the gap is skipped as already-done.
+    let started = crate::ingest_job::start(&rp, false, default_parallelism());
 
     match started {
         Ok(()) => Json(ResetResult {
@@ -420,19 +407,10 @@ async fn reset_analysis(State(st): State<AdminState>, Path(name): Path<String>) 
     // rest of its progress, so it starts from the top while analyses that were
     // not reset keep theirs -- a reset can no longer disturb a rebuild already
     // running for something else.
-    let rebuild = match st.replay.clone() {
-        Some(rp) => crate::replay::spawn(
-            rp.state.clone(),
-            rp.dir,
-            crate::replay::ReplaySelection {
-                files: Vec::new(), // every dump
-                rebuild: true,
-            },
-            rp.dedupe,
-            rp.sink,
-            Some(st.ctl.clone()),
-        )
-        .is_ok(),
+    let rebuild = match st.replay.as_ref() {
+        // Dedupe on: this analysis's state is gone, but the index is intact,
+        // so events already indexed only need folding, not re-indexing.
+        Some(rp) => crate::ingest_job::start(rp, true, default_parallelism()).is_ok(),
         None => false,
     };
 
@@ -471,64 +449,33 @@ pub struct ScrapeResetQuery {
 /// `POST /admin/ingest[?file=combined.jsonl&file=...]`
 ///
 /// Re-reads archive dumps through the live writer, so gaps are filled without
-/// stopping the relay. Already-indexed events are skipped via the dedupe set,
-/// and the replay is fed to the writer at lower priority than live traffic.
-/// Parsed by hand from the raw query rather than through [`Query`].
+/// `POST /admin/ingest[?dedupe=false]`
 ///
-/// axum's `Query` uses `serde_urlencoded`, which has no notion of repeated
-/// keys: `?file=a&file=b` fails to deserialize into a `Vec` with "invalid
-/// type: string, expected a sequence". Repeating the parameter is the natural
-/// spelling here, so parse the pairs directly.
-fn ingest_files(raw: Option<&str>) -> Vec<String> {
-    let Some(raw) = raw else { return Vec::new() };
-    url::form_urlencoded::parse(raw.as_bytes())
-        .filter(|(k, _)| k == "file")
-        .map(|(_, v)| v.into_owned())
-        .filter(|v| !v.is_empty())
-        .collect()
-}
-
+/// Reads the whole archive directory into this node, using the same engine as
+/// the `nostrsearch-ingest` binary. Runs alongside live traffic, so the relay
+/// keeps serving.
+///
+/// There is no per-file selection: the cursor walks the directory in parallel,
+/// and a whole-archive pass is what both callers actually need. Selecting one
+/// dump was a property of the sequential reader this replaced.
 async fn start_ingest(
     State(st): State<AdminState>,
     axum::extract::RawQuery(raw): axum::extract::RawQuery,
 ) -> Response {
-    let files = ingest_files(raw.as_deref());
+    let dedupe = wants_dedupe(raw.as_deref());
     let Some(rp) = st.replay.clone() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": "this node has no archive directory to replay" })),
+            Json(serde_json::json!({ "error": "this node has no archive directory" })),
         )
             .into_response();
     };
 
-    // Reject traversal outright rather than sanitising: these names come from
-    // the archive listing, so anything else is a mistake or an attack.
-    if files.iter().any(|f| f.contains('/') || f.contains("..")) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "error": "file must be a bare name from /archive/files" })),
-        )
-            .into_response();
-    }
-
-    let selection = crate::replay::ReplaySelection {
-        files: files.clone(),
-        rebuild: false,
-    };
-    // Ingest passes no writer handle: rebuild positions describe rebuild
-    // progress only, and an ingest must neither consult nor advance them.
-    match crate::replay::spawn(
-        rp.state.clone(),
-        rp.dir,
-        selection,
-        rp.dedupe,
-        rp.sink,
-        None,
-    ) {
+    match crate::ingest_job::start(&rp, dedupe, default_parallelism()) {
         Ok(()) => Json(serde_json::json!({
             "started": true,
-            "files": files,
-            "detail": "replaying at lower priority than live traffic; poll GET /admin/ingest",
+            "dedupe": dedupe,
+            "detail": "reading the archive; poll GET /admin/ingest",
         }))
         .into_response(),
         Err(e) => (
@@ -537,6 +484,24 @@ async fn start_ingest(
         )
             .into_response(),
     }
+}
+
+/// Whether an archive pass may skip events the id store already claims.
+///
+/// On by default. The gate is only trustworthy while the id store agrees with
+/// the index; when it has drifted ahead -- which is what silently lost a large
+/// span of this corpus -- every run skips the missing events as already-done
+/// and no amount of retrying fills the gap. `?dedupe=false` is the repair.
+fn wants_dedupe(raw: Option<&str>) -> bool {
+    let Some(raw) = raw else { return true };
+    !url::form_urlencoded::parse(raw.as_bytes()).any(|(k, v)| k == "dedupe" && v == "false")
+}
+
+/// Reader threads for an archive pass.
+fn default_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
 }
 
 async fn ingest_status(State(st): State<AdminState>) -> Response {
@@ -692,35 +657,25 @@ async fn reset_relay(State(st): State<AdminState>, Query(q): Query<RelayResetQue
 
 #[cfg(test)]
 mod query_tests {
-    use super::ingest_files;
+    use super::wants_dedupe;
 
+    /// The dedupe gate defaults on and takes exactly one spelling to turn off.
+    ///
+    /// It decides whether an archive pass may skip events the id store claims.
+    /// That store drifting ahead of the index is what made a large span of
+    /// this corpus unreachable -- every run skipped the gap as already-done --
+    /// so turning the gate off is the repair, and turning it off by accident
+    /// is a full re-index of hundreds of millions of events.
     #[test]
-    fn repeated_file_params_parse() {
-        // The spelling the CLI produces. axum's Query rejects this outright.
-        assert_eq!(
-            ingest_files(Some("file=combined.jsonl&file=events_20260802.jsonl.zst")),
-            vec!["combined.jsonl", "events_20260802.jsonl.zst"]
-        );
-        assert_eq!(
-            ingest_files(Some("file=combined.jsonl")),
-            vec!["combined.jsonl"]
-        );
-    }
+    fn dedupe_is_on_unless_explicitly_disabled() {
+        assert!(wants_dedupe(None));
+        assert!(wants_dedupe(Some("")));
+        assert!(wants_dedupe(Some("other=1")));
+        // Neither of these asks for it to be off.
+        assert!(wants_dedupe(Some("dedupe=true")));
+        assert!(wants_dedupe(Some("dedupe=0")));
 
-    #[test]
-    fn no_files_means_every_dump() {
-        assert!(ingest_files(None).is_empty());
-        assert!(ingest_files(Some("")).is_empty());
-        assert!(ingest_files(Some("file=")).is_empty());
-        // Unrelated params are ignored rather than mistaken for a filename.
-        assert!(ingest_files(Some("other=1")).is_empty());
-    }
-
-    #[test]
-    fn percent_encoding_is_decoded() {
-        assert_eq!(
-            ingest_files(Some("file=my%20dump.jsonl")),
-            vec!["my dump.jsonl"]
-        );
+        assert!(!wants_dedupe(Some("dedupe=false")));
+        assert!(!wants_dedupe(Some("foo=1&dedupe=false")));
     }
 }

@@ -41,7 +41,7 @@ pub use metrics::{
     PipelineMetrics,
 };
 pub use progress::{Progress, Rebuild};
-pub use registry::{AnalysisStatus, DynAnalysis, RebuildPlan, Registry};
+pub use registry::{AnalysisStatus, DynAnalysis, Registry};
 pub use run::backfill_in_memory;
 pub use store::StatStore;
 pub use types::{EventId, Hash32, Pubkey};

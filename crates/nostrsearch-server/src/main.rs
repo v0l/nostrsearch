@@ -111,7 +111,28 @@ async fn main() -> anyhow::Result<()> {
     let reports = nostrsearch_server::reports::ReportStore::new();
     let mut writer_handle = None;
     let mut writer_ctl = None;
-    let mut replay_tx = None;
+    // One handle for the dedupe set, shared by the writer, the scraper and the
+    // admin ingest. RocksDB takes an exclusive per-process lock, so this
+    // cannot be opened twice.
+    //
+    // The writer needs it to *record* what it indexes: an id store that drifts
+    // ahead of the index makes every later ingest skip the events it should
+    // add, which is how a large span of this corpus went missing.
+    let dedupe_path = index_root.join(".dedupe");
+    let shared_dedupe: Option<std::sync::Arc<nostrsearch_indexer::id_store::IdStore>> = if is_writer
+    {
+        match nostrsearch_indexer::id_store::IdStore::open(&dedupe_path) {
+            Ok(s) => Some(std::sync::Arc::new(s)),
+            Err(e) => {
+                tracing::warn!(error = %e, "dedupe store unavailable");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let mut writer_pipeline = None;
     let sink = if is_writer {
         let cfg = PipelineConfig {
             index_root: index_root.clone(),
@@ -125,15 +146,16 @@ async fn main() -> anyhow::Result<()> {
             persist_interval: env::persist_interval(),
             wot_out: Some(env::wot_out()),
         };
-        let (sink, handle, ctl, replay_sink) = nostrsearch_server::node::spawn_writer_with_reports(
+        let (sink, handle, ctl, pipeline) = nostrsearch_server::node::spawn_writer_with_reports(
             cfg,
             10_000,
             std::time::Duration::from_secs(30),
             Some(reports.clone()),
+            shared_dedupe.clone(),
         )?;
         writer_handle = Some(handle);
         writer_ctl = Some(ctl);
-        replay_tx = Some(replay_sink);
+        writer_pipeline = Some(pipeline);
         Some(sink)
     } else {
         None
@@ -182,23 +204,6 @@ async fn main() -> anyhow::Result<()> {
     // negentropy where supported, feeding the same archive + writer funnel as
     // the firehose. On by default whenever this node is the writer and has an
     // archive; SCRAPE=0 disables.
-    // One handle for the dedupe set, shared by the scraper and any admin-run
-    // replay. RocksDB takes an exclusive per-process lock, so this cannot be
-    // opened twice.
-    let dedupe_path = index_root.join(".dedupe");
-    let shared_dedupe: Option<std::sync::Arc<nostrsearch_indexer::id_store::IdStore>> =
-        if is_writer && dedupe_path.exists() {
-            match nostrsearch_indexer::id_store::IdStore::open(&dedupe_path) {
-                Ok(s) => Some(std::sync::Arc::new(s)),
-                Err(e) => {
-                    tracing::warn!(error = %e, "dedupe store unavailable");
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
     let want_scrape = std::env::var("SCRAPE").map(|v| v != "0").unwrap_or(true);
     // Shared with the HTTP layer so /sync can report progress from the same
     // RocksDB handle (it takes an exclusive per-process lock).
@@ -238,44 +243,17 @@ async fn main() -> anyhow::Result<()> {
     ) {
         (Some(ctl), Some(cfg)) => {
             let mut st = nostrsearch_server::admin::AdminState::new(cfg, ctl, scrape_state.clone());
-            // Replay needs somewhere to read from and the *shared* dedupe
-            // handle: RocksDB takes an exclusive lock, so it cannot be
-            // reopened alongside the scraper's.
-            if let (Some(dir), Some(sink)) = (archive_dir.clone(), replay_tx.clone()) {
-                st = st.with_replay(nostrsearch_server::admin::ReplayCtx {
-                    state: nostrsearch_server::replay::ReplayState::new(),
+            // The archive ingest runs the same engine as the CLI, against
+            // this node's pipeline. It needs the shared dedupe handle:
+            // RocksDB takes an exclusive lock, so it cannot be reopened
+            // alongside the scraper's.
+            if let (Some(dir), Some(pipeline)) = (archive_dir.clone(), writer_pipeline.clone()) {
+                st = st.with_replay(nostrsearch_server::admin::IngestCtx {
+                    pipeline,
                     dir,
                     dedupe: shared_dedupe.clone(),
-                    sink,
+                    state: Default::default(),
                 });
-            }
-            // Resume an interrupted rebuild.
-            //
-            // A rebuild folds the whole archive and takes hours; a deploy in
-            // the middle of one would otherwise discard all of it and leave the
-            // analyses part-filled with no indication anything was lost. The
-            // checkpoint records what was folded, so pick up from there.
-            let rebuilding = st.ctl.rebuilding().await;
-            if let Some(rp) = st.replay.clone()
-                && !rebuilding.is_empty()
-            {
-                tracing::info!(
-                    analyses = ?rebuilding,
-                    "resuming interrupted rebuild"
-                );
-                if let Err(e) = nostrsearch_server::replay::spawn(
-                    rp.state.clone(),
-                    rp.dir,
-                    nostrsearch_server::replay::ReplaySelection {
-                        files: Vec::new(),
-                        rebuild: true,
-                    },
-                    rp.dedupe,
-                    rp.sink,
-                    Some(st.ctl.clone()),
-                ) {
-                    tracing::warn!(error = %e, "could not resume rebuild");
-                }
             }
             Some(st)
         }

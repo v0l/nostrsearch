@@ -39,6 +39,22 @@ impl IdStore {
     }
 
     /// Has this event id already been committed to the index?
+    /// Membership for many ids at once.
+    ///
+    /// A rebuild asks this per event across hundreds of millions of them, and
+    /// one-at-a-time point reads cap at roughly 13k/s: every lookup is a hit
+    /// (the corpus already holds these events), and a hit is exactly what a
+    /// bloom filter cannot make cheap. `multi_get` hands RocksDB the whole
+    /// batch, so the block reads are issued together and sorted keys share
+    /// index blocks.
+    pub fn contains_batch(&self, ids: &[[u8; 32]]) -> Vec<bool> {
+        self.db
+            .multi_get(ids.iter().map(|i| i.as_slice()))
+            .into_iter()
+            .map(|r| matches!(r, Ok(Some(_))))
+            .collect()
+    }
+
     pub fn contains(&self, id: &[u8; 32]) -> bool {
         self.db
             .get_pinned(id.as_slice())

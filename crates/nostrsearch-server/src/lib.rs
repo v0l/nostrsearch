@@ -7,10 +7,10 @@ pub mod admin;
 pub mod archive;
 pub mod dashboard;
 pub mod http;
+pub mod ingest_job;
 pub mod node;
 pub mod registry;
 pub mod relay;
-pub mod replay;
 pub mod reports;
 pub mod scraper;
 
