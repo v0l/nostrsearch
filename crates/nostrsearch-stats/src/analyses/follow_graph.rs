@@ -54,6 +54,38 @@ impl Analysis for FollowGraph {
 
     fn attach(&mut self, ctx: &AttachCtx) -> anyhow::Result<()> {
         self.store = Some(ctx.graph.clone());
+
+        // Rebuild the follower tally from the adjacency already on disk.
+        //
+        // The graph is a shared RocksDB store, deliberately kept out of this
+        // analysis's serialized state, so it survives a reset while `counts`
+        // does not. Without this, resetting follow_graph drops every follower
+        // count to zero -- and with them the whole web of trust, since
+        // `contribute` publishes the tiers that drive search ranking and every
+        // trusted/untrusted split. Recovering by re-observing contact lists is
+        // not viable: kind 3 is a small fraction of the firehose, so it would
+        // take longer than the corpus took to collect.
+        //
+        // The counts are a pure function of the adjacency, so derive them
+        // instead. Only when empty: a normal restore already has them.
+        if self.counts.is_empty() {
+            let mut counts: HashMap<Pubkey, u32> = HashMap::new();
+            let mut authors = 0usize;
+            ctx.graph.for_each(|_author, follows| {
+                authors += 1;
+                for followed in &follows.follows {
+                    *counts.entry(*followed).or_default() += 1;
+                }
+            });
+            if authors > 0 {
+                tracing::info!(
+                    authors,
+                    followed = counts.len(),
+                    "rebuilt follower counts from the on-disk follow graph"
+                );
+                self.counts = counts;
+            }
+        }
         Ok(())
     }
 
