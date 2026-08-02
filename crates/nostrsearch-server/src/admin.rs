@@ -43,6 +43,8 @@ pub struct AdminState {
     pub cfg: Arc<AdminConfig>,
     pub ctl: WriterCtl,
     pub scrape: Option<Arc<ScrapeState>>,
+    /// Set when this node has an archive directory it can replay from.
+    pub replay: Option<ReplayCtx>,
     /// Recently accepted auth event ids, to stop a captured header being
     /// replayed within its freshness window.
     seen: Arc<Mutex<HashMap<String, u64>>>,
@@ -89,14 +91,29 @@ impl AdminConfig {
     }
 }
 
+/// Everything the replay endpoints need to start a background re-ingest.
+#[derive(Clone)]
+pub struct ReplayCtx {
+    pub state: crate::replay::ReplayState,
+    pub dir: std::path::PathBuf,
+    pub dedupe: Option<Arc<nostrsearch_indexer::id_store::IdStore>>,
+    pub sink: crate::node::ReplaySink,
+}
+
 impl AdminState {
     pub fn new(cfg: AdminConfig, ctl: WriterCtl, scrape: Option<Arc<ScrapeState>>) -> Self {
         Self {
             cfg: Arc::new(cfg),
             ctl,
             scrape,
+            replay: None,
             seen: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    pub fn with_replay(mut self, replay: ReplayCtx) -> Self {
+        self.replay = Some(replay);
+        self
     }
 
     /// Record an auth event id, rejecting it if already used. Also prunes ids
@@ -240,6 +257,8 @@ pub fn router(state: AdminState) -> Router {
     Router::new()
         .route("/analyses", get(analyses))
         .route("/analyses/{name}/reset", post(reset_analysis))
+        .route("/ingest", get(ingest_status).post(start_ingest))
+        .route("/ingest/cancel", post(cancel_ingest))
         .route("/scrape", get(scrape_state))
         .route("/scrape/reset", post(reset_scrape))
         .route("/scrape/relay/reset", post(reset_relay))
@@ -293,6 +312,84 @@ pub struct ScrapeResetQuery {
     pub relay: Option<String>,
     pub from: Option<String>,
     pub to: Option<String>,
+}
+
+/// `POST /admin/ingest[?file=combined.jsonl&file=...]`
+///
+/// Re-reads archive dumps through the live writer, so gaps are filled without
+/// stopping the relay. Already-indexed events are skipped via the dedupe set,
+/// and the replay is fed to the writer at lower priority than live traffic.
+#[derive(Debug, Deserialize)]
+pub struct IngestQuery {
+    /// Repeatable. Omitted = every dump in the archive directory.
+    #[serde(default)]
+    pub file: Vec<String>,
+}
+
+async fn start_ingest(State(st): State<AdminState>, Query(q): Query<IngestQuery>) -> Response {
+    let Some(rp) = st.replay.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "this node has no archive directory to replay" })),
+        )
+            .into_response();
+    };
+
+    // Reject traversal outright rather than sanitising: these names come from
+    // the archive listing, so anything else is a mistake or an attack.
+    if q.file.iter().any(|f| f.contains('/') || f.contains("..")) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "file must be a bare name from /archive/files" })),
+        )
+            .into_response();
+    }
+
+    let selection = crate::replay::ReplaySelection {
+        files: q.file.clone(),
+    };
+    match crate::replay::spawn(rp.state.clone(), rp.dir, selection, rp.dedupe, rp.sink) {
+        Ok(()) => Json(serde_json::json!({
+            "started": true,
+            "files": q.file,
+            "detail": "replaying at lower priority than live traffic; poll GET /admin/ingest",
+        }))
+        .into_response(),
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+async fn ingest_status(State(st): State<AdminState>) -> Response {
+    match st.replay.as_ref() {
+        Some(rp) => Json(rp.state.status()).into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "this node has no archive directory to replay" })),
+        )
+            .into_response(),
+    }
+}
+
+async fn cancel_ingest(State(st): State<AdminState>) -> Response {
+    match st.replay.as_ref() {
+        Some(rp) if rp.state.cancel() => {
+            Json(serde_json::json!({ "cancelled": true })).into_response()
+        }
+        Some(_) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({ "error": "no replay is running" })),
+        )
+            .into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "this node has no archive directory to replay" })),
+        )
+            .into_response(),
+    }
 }
 
 /// `GET /admin/scrape[?relay=&from=&to=]`

@@ -111,6 +111,7 @@ async fn main() -> anyhow::Result<()> {
     let reports = nostrsearch_server::reports::ReportStore::new();
     let mut writer_handle = None;
     let mut writer_ctl = None;
+    let mut replay_tx = None;
     let sink = if is_writer {
         let cfg = PipelineConfig {
             index_root: index_root.clone(),
@@ -124,7 +125,7 @@ async fn main() -> anyhow::Result<()> {
             persist_interval: env::persist_interval(),
             wot_out: Some(env::wot_out()),
         };
-        let (sink, handle, ctl) = nostrsearch_server::node::spawn_writer_with_reports(
+        let (sink, handle, ctl, replay_sink) = nostrsearch_server::node::spawn_writer_with_reports(
             cfg,
             10_000,
             std::time::Duration::from_secs(30),
@@ -132,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
         )?;
         writer_handle = Some(handle);
         writer_ctl = Some(ctl);
+        replay_tx = Some(replay_sink);
         Some(sink)
     } else {
         None
@@ -180,6 +182,23 @@ async fn main() -> anyhow::Result<()> {
     // negentropy where supported, feeding the same archive + writer funnel as
     // the firehose. On by default whenever this node is the writer and has an
     // archive; SCRAPE=0 disables.
+    // One handle for the dedupe set, shared by the scraper and any admin-run
+    // replay. RocksDB takes an exclusive per-process lock, so this cannot be
+    // opened twice.
+    let dedupe_path = index_root.join(".dedupe");
+    let shared_dedupe: Option<std::sync::Arc<nostrsearch_indexer::id_store::IdStore>> =
+        if is_writer && dedupe_path.exists() {
+            match nostrsearch_indexer::id_store::IdStore::open(&dedupe_path) {
+                Ok(s) => Some(std::sync::Arc::new(s)),
+                Err(e) => {
+                    tracing::warn!(error = %e, "dedupe store unavailable");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     let want_scrape = std::env::var("SCRAPE").map(|v| v != "0").unwrap_or(true);
     // Shared with the HTTP layer so /sync can report progress from the same
     // RocksDB handle (it takes an exclusive per-process lock).
@@ -198,6 +217,7 @@ async fn main() -> anyhow::Result<()> {
                         opts,
                         (**db).clone(),
                         sink.clone(),
+                        shared_dedupe.clone(),
                     ) {
                         Ok(st) => scrape_state = Some(st),
                         Err(e) => tracing::warn!(error = %e, "scraper failed to start"),
@@ -215,11 +235,21 @@ async fn main() -> anyhow::Result<()> {
         writer_ctl,
         nostrsearch_server::admin::AdminConfig::from_env(),
     ) {
-        (Some(ctl), Some(cfg)) => Some(nostrsearch_server::admin::AdminState::new(
-            cfg,
-            ctl,
-            scrape_state.clone(),
-        )),
+        (Some(ctl), Some(cfg)) => {
+            let mut st = nostrsearch_server::admin::AdminState::new(cfg, ctl, scrape_state.clone());
+            // Replay needs somewhere to read from and the *shared* dedupe
+            // handle: RocksDB takes an exclusive lock, so it cannot be
+            // reopened alongside the scraper's.
+            if let (Some(dir), Some(sink)) = (archive_dir.clone(), replay_tx.clone()) {
+                st = st.with_replay(nostrsearch_server::admin::ReplayCtx {
+                    state: nostrsearch_server::replay::ReplayState::new(),
+                    dir,
+                    dedupe: shared_dedupe.clone(),
+                    sink,
+                });
+            }
+            Some(st)
+        }
         (None, Some(_)) => {
             tracing::warn!("ADMIN_PUBKEYS set but this node is not the writer; admin disabled");
             None

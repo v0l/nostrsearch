@@ -78,6 +78,21 @@ impl EventSink {
     }
 }
 
+/// Submits replayed archive events to the writer at lower priority than live
+/// traffic. Cloneable and cheap.
+#[derive(Clone)]
+pub struct ReplaySink(mpsc::Sender<NostrEvent>);
+
+impl ReplaySink {
+    /// Submit from a blocking thread, waiting for capacity.
+    ///
+    /// Blocking on a full queue is the point: it is what stops a replay of a
+    /// 200 GB dump outrunning the writer and pushing live events out.
+    pub fn blocking_submit(&self, ev: NostrEvent) {
+        let _ = self.0.blocking_send(ev);
+    }
+}
+
 /// A request that must run on the writer task, because that task is the sole
 /// owner of the [`Pipeline`].
 pub enum WriterCmd {
@@ -151,7 +166,8 @@ pub fn spawn_writer(
     queue_size: usize,
     commit_every: std::time::Duration,
 ) -> anyhow::Result<(EventSink, WriterHandle)> {
-    let (sink, handle, _ctl) = spawn_writer_with_reports(cfg, queue_size, commit_every, None)?;
+    let (sink, handle, _ctl, _replay) =
+        spawn_writer_with_reports(cfg, queue_size, commit_every, None)?;
     Ok((sink, handle))
 }
 
@@ -163,7 +179,7 @@ pub fn spawn_writer_with_reports(
     queue_size: usize,
     commit_every: std::time::Duration,
     reports: Option<crate::reports::ReportStore>,
-) -> anyhow::Result<(EventSink, WriterHandle, WriterCtl)> {
+) -> anyhow::Result<(EventSink, WriterHandle, WriterCtl, ReplaySink)> {
     let mut pipeline = Pipeline::new(cfg)?;
     // Live tail semantics: everything from here on is realtime.
     pipeline.go_live();
@@ -172,6 +188,9 @@ pub fn spawn_writer_with_reports(
     let (sd_tx, mut sd_rx) = tokio::sync::watch::channel(false);
     // Small: these are rare operator actions, not a data path.
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriterCmd>(16);
+    // Replay queue, deliberately shallow: a deep buffer would let a replay
+    // build a long backlog that delays live events behind it.
+    let (replay_tx, mut replay_rx) = mpsc::channel::<NostrEvent>(2_048);
 
     let join = tokio::spawn(async move {
         let mut tick = tokio::time::interval(commit_every);
@@ -192,6 +211,11 @@ pub fn spawn_writer_with_reports(
             // event-driven commit would leave the last events uncommitted (and
             // therefore unsearchable) for the whole of a quiet period.
             tokio::select! {
+                // Biased: every arm above the replay one is checked first, so
+                // live events, commits and operator commands always win. A
+                // replay only advances when the node is otherwise idle.
+                biased;
+
                 maybe = rx.recv() => match maybe {
                     Some(ev) => {
                         pipeline.process(&ev);
@@ -226,6 +250,12 @@ pub fn spawn_writer_with_reports(
                         let _ = reply.send(pipeline.analyses_status());
                     }
                 },
+                Some(ev) = replay_rx.recv() => {
+                    // Same path as a live event: indexed, folded into stats,
+                    // and deduped upstream by the replay's id-store check.
+                    pipeline.process(&ev);
+                    dirty = true;
+                }
                 _ = sd_rx.changed() => {
                     if *sd_rx.borrow() {
                         tracing::info!("writer shutting down; draining queue");
@@ -254,6 +284,7 @@ pub fn spawn_writer_with_reports(
             join,
         },
         WriterCtl(cmd_tx),
+        ReplaySink(replay_tx),
     ))
 }
 

@@ -34,7 +34,7 @@ async fn serve(admin: &Keys) -> anyhow::Result<String> {
         registry: Mutex::new(registry),
     });
 
-    let (_sink, _handle, ctl) = nostrsearch_server::node::spawn_writer_with_reports(
+    let (_sink, _handle, ctl, _replay) = nostrsearch_server::node::spawn_writer_with_reports(
         PipelineConfig {
             index_root: root.join("index"),
             shard: ShardWriterConfig::default(),

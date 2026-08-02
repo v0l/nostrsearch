@@ -28,7 +28,7 @@ struct NodeSink {
     db: DefaultJsonFilesDatabase,
     sink: EventSink,
     /// Ids indexed by dump ingest (read-only; may be absent on fresh deploys).
-    dedupe: Option<IdStore>,
+    dedupe: Option<Arc<IdStore>>,
     seen: AtomicU64,
     new: AtomicU64,
 }
@@ -147,15 +147,10 @@ pub fn spawn_scraper(
     opts: ScraperOptions,
     db: DefaultJsonFilesDatabase,
     sink: EventSink,
+    dedupe: Option<Arc<IdStore>>,
 ) -> anyhow::Result<Arc<ScrapeState>> {
     let state = Arc::new(ScrapeState::open(&opts.state_dir.join("scrape"))?);
     let state_out = state.clone();
-    let dedupe_path = opts.index_root.join(".dedupe");
-    let dedupe = if dedupe_path.exists() {
-        Some(IdStore::open(&dedupe_path)?)
-    } else {
-        None
-    };
     let node_sink = Arc::new(NodeSink {
         db,
         sink,

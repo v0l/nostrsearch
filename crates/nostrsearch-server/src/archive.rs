@@ -88,6 +88,26 @@ async fn files_json(
 }
 
 /// List archive files straight from the filesystem (no index lock needed).
+/// Extensions the archive cursor can read; anything else in the directory is
+/// internal (RocksDB id index, lock files) and must not be published.
+const DUMP_EXTS: &[&str] = &[
+    ".jsonl",
+    ".jsonl.gz",
+    ".jsonl.zst",
+    ".jsonl.zstd",
+    ".jsonl.bz2",
+    ".json",
+    ".json.gz",
+    ".json.zst",
+    ".json.zstd",
+    ".json.bz2",
+];
+
+fn is_archive_dump(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    DUMP_EXTS.iter().any(|e| lower.ends_with(e))
+}
+
 async fn list(st: &ArchiveState) -> Result<Vec<ArchiveFileInfo>, Response> {
     let dir = st.dir.clone();
     let entries = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<ArchiveFileInfo>> {
@@ -102,8 +122,19 @@ async fn list(st: &ArchiveState) -> Result<Vec<ArchiveFileInfo>, Response> {
                 Some(n) => n.to_string(),
                 None => continue,
             };
-            // Only publish archive dumps, never index/internal files.
-            if !name.starts_with("events_") {
+            // Publish archive dumps, never index/internal files.
+            //
+            // This used to require an `events_` prefix, which silently hid any
+            // dump not following the daily naming convention -- including a
+            // ~200 GB `combined.jsonl` holding most of the historical corpus.
+            // The ingest cursor has no such filter and reads every top-level
+            // file, so the listing was claiming an archive far smaller than the
+            // one actually being indexed.
+            //
+            // Match on readable extensions instead (the set the cursor
+            // supports), which keeps RocksDB's internals out without making
+            // assumptions about how a dump is named.
+            if !is_archive_dump(&name) {
                 continue;
             }
             let timestamp = meta
@@ -216,4 +247,40 @@ a{{color:#7aa2f7;text-decoration:none}} a:hover{{text-decoration:underline}}
         total_gib = total_size as f64 / 1024.0 / 1024.0 / 1024.0,
         links = links,
     )))
+}
+
+#[cfg(test)]
+mod listing_tests {
+    use super::is_archive_dump;
+
+    #[test]
+    fn publishes_dumps_whatever_they_are_named() {
+        // The daily convention...
+        assert!(is_archive_dump("events_20260802.jsonl.zst"));
+        assert!(is_archive_dump("events_20250820.jsonl.zstd"));
+        // ...and the merged historical archive, which an `events_` prefix
+        // filter hid entirely despite being the largest file present.
+        assert!(is_archive_dump("combined.jsonl"));
+        assert!(is_archive_dump("combined.jsonl.zst"));
+        assert!(is_archive_dump("2023-backup.json.gz"));
+        assert!(is_archive_dump("OLD_DUMP.JSONL"));
+    }
+
+    #[test]
+    fn never_publishes_index_internals() {
+        // RocksDB id index and lock files must stay private.
+        for name in [
+            "LOCK",
+            "CURRENT",
+            "IDENTITY",
+            "MANIFEST-000004",
+            "OPTIONS-000026",
+            "000018.sst",
+            "000017.log",
+            "LOG.old.1699999999",
+            "wot.bin",
+        ] {
+            assert!(!is_archive_dump(name), "would have published {name}");
+        }
+    }
 }
