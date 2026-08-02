@@ -127,14 +127,36 @@ pub struct CompositeSegmentCollector {
     hits: Vec<ScoredDoc>,
 }
 
+/// How far ahead of `now` a timestamp may be and still count as "fresh".
+/// Covers ordinary clock skew between publishers and this node; anything
+/// beyond it is treated as not recent at all.
+pub const FUTURE_SKEW_SECS: u64 = 300;
+
+/// Recency multiplier in `0.0..=1.0` for an event created at `created`,
+/// relative to `now`, decaying linearly to zero over `half_life_days`.
+///
+/// Future-dated events get **no** boost. This is the interesting case: the
+/// obvious `now.saturating_sub(created)` reports an age of 0 for anything in
+/// the future, which handed those events the *maximum* recency multiplier
+/// forever — pinning yourself to the top of every result set costs one bogus
+/// timestamp. The corpus already contains events dated past the year 55000.
+#[inline]
+pub fn recency_boost(created: u64, now: u64, half_life_days: f32) -> f32 {
+    if created > now.saturating_add(FUTURE_SKEW_SECS) {
+        return 0.0;
+    }
+    // Inside the skew window an event counts as brand new, so a publisher whose
+    // clock runs slightly fast is not penalised.
+    let age_days = now.saturating_sub(created) as f32 / 86_400.0;
+    (1.0 - age_days / half_life_days).max(0.0)
+}
+
 impl CompositeSegmentCollector {
     #[inline]
     fn composite(&self, bm25: Score, doc: DocId) -> Score {
         let created = self.created_at.get_val(doc);
         let wot = self.wot_tier.get_val(doc);
-
-        let age_days = self.now_ts.saturating_sub(created) as f32 / 86_400.0;
-        let recency = (1.0 - age_days / self.weights.half_life_days).max(0.0);
+        let recency = recency_boost(created, self.now_ts, self.weights.half_life_days);
 
         bm25 * (1.0 + self.weights.wot_weight * wot as f32 + self.weights.recency_weight * recency)
     }
@@ -161,13 +183,54 @@ impl SegmentCollector for CompositeSegmentCollector {
 mod tests {
     use super::*;
 
+    const NOW: u64 = 1_700_000_000;
+    const DAY: u64 = 86_400;
+
     #[test]
     fn recency_decays_linearly_to_zero() {
         let w = ScoreWeights::default();
-        // fresh
-        let fresh = (1.0 - 0.0 / w.half_life_days).max(0.0);
-        let old = (1.0 - 400.0 / w.half_life_days).max(0.0);
-        assert_eq!(fresh, 1.0);
-        assert_eq!(old, 0.0);
+        assert_eq!(recency_boost(NOW, NOW, w.half_life_days), 1.0);
+        // half way through the window -> half the boost
+        let half = (w.half_life_days / 2.0) as u64 * DAY;
+        let mid = recency_boost(NOW - half, NOW, w.half_life_days);
+        assert!((mid - 0.5).abs() < 0.01, "expected ~0.5, got {mid}");
+        // past the window -> nothing, and it never goes negative
+        assert_eq!(recency_boost(NOW - 400 * DAY, NOW, w.half_life_days), 0.0);
+        assert_eq!(recency_boost(0, NOW, w.half_life_days), 0.0);
+    }
+
+    #[test]
+    fn future_dated_events_get_no_recency_boost() {
+        let w = ScoreWeights::default();
+        // The real thing seen in the corpus: events dated centuries or
+        // millennia ahead. These must not outrank genuinely fresh content.
+        for ahead in [DAY, 365 * DAY, 100_000 * DAY] {
+            assert_eq!(
+                recency_boost(NOW + ahead, NOW, w.half_life_days),
+                0.0,
+                "future-dated event got a recency boost"
+            );
+        }
+        // A far-future event must score strictly below a genuinely fresh one.
+        assert!(
+            recency_boost(NOW + 100_000 * DAY, NOW, w.half_life_days)
+                < recency_boost(NOW, NOW, w.half_life_days)
+        );
+    }
+
+    #[test]
+    fn small_clock_skew_still_counts_as_fresh() {
+        let w = ScoreWeights::default();
+        // A publisher a minute fast is fresh, not suspicious.
+        assert_eq!(recency_boost(NOW + 60, NOW, w.half_life_days), 1.0);
+        assert_eq!(
+            recency_boost(NOW + FUTURE_SKEW_SECS, NOW, w.half_life_days),
+            1.0
+        );
+        // One second past the window is where the boost stops.
+        assert_eq!(
+            recency_boost(NOW + FUTURE_SKEW_SECS + 1, NOW, w.half_life_days),
+            0.0
+        );
     }
 }
