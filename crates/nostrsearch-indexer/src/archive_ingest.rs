@@ -90,6 +90,9 @@ pub struct IngestProgress {
     pub skipped: AtomicU64,
     /// Lines that would not parse. One bad line costs one event, never a file.
     pub malformed: AtomicU64,
+    /// Events the indexer rejected. These keep their ids unclaimed, so a
+    /// later run over the same archive will retry them.
+    pub failed: AtomicU64,
     pub running: AtomicBool,
     pub finished_at: AtomicU64,
 }
@@ -218,6 +221,9 @@ pub async fn ingest(
                     // Drop anything the store already has, before taking any
                     // lock: membership is a read-only lookup.
                     let mut skipped = 0u64;
+                    // Ids of the events kept, positionally aligned with
+                    // `batch`. Claimed only once their documents exist.
+                    let mut new_ids: Vec<[u8; 32]> = Vec::new();
                     if let Some(store) = &ck_store {
                         let ids: Vec<[u8; 32]> = batch
                             .iter()
@@ -225,7 +231,7 @@ pub async fn ingest(
                             .collect();
                         let known = store.contains_batch(&ids);
                         let mut keep = Vec::with_capacity(batch.len());
-                        let mut new_ids = Vec::with_capacity(batch.len());
+                        new_ids.reserve(batch.len());
                         for ((ev, id), known) in batch.into_iter().zip(ids).zip(known) {
                             if known {
                                 skipped += 1;
@@ -235,7 +241,6 @@ pub async fn ingest(
                             }
                         }
                         batch = keep;
-                        ck_pending.lock().unwrap().extend(new_ids);
                         prog.skipped.fetch_add(skipped, Ordering::Relaxed);
                     }
 
@@ -254,13 +259,32 @@ pub async fn ingest(
                     // Doing it under the pipeline lock held the whole corpus
                     // to one core while the readers idled.
                     if indexing_pass {
-                        for ev in &batch {
-                            if let Err(e) = indexer.index_event(ev) {
-                                tracing::warn!(error = %e, "index_event failed");
+                        // An id is claimed only if its event reached a writer.
+                        // Claiming first and indexing after means anything that
+                        // fails here is recorded as done and skipped by every
+                        // later run: the archive still has the event, but
+                        // nothing will ever look at it again.
+                        let mut ok_ids = Vec::with_capacity(new_ids.len());
+                        let mut failed = 0u64;
+                        for (i, ev) in batch.iter().enumerate() {
+                            match indexer.index_event(ev) {
+                                Ok(_) => {
+                                    if let Some(id) = new_ids.get(i) {
+                                        ok_ids.push(*id);
+                                    }
+                                }
+                                Err(e) => {
+                                    failed += 1;
+                                    tracing::warn!(error = %e, id = %ev.id, "index_event failed");
+                                }
                             }
                         }
-                        prog.indexed
-                            .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                        if !ok_ids.is_empty() {
+                            ck_pending.lock().unwrap().extend(ok_ids);
+                        }
+                        let ok = batch.len() as u64 - failed;
+                        prog.indexed.fetch_add(ok, Ordering::Relaxed);
+                        prog.failed.fetch_add(failed, Ordering::Relaxed);
                     }
                 },
                 chunk_size,
@@ -295,7 +319,16 @@ pub async fn ingest(
     checkpoint.abort();
     progress.running.store(false, Ordering::Relaxed);
     progress.finished_at.store(unix_now(), Ordering::Relaxed);
+    let failed = progress.failed.load(Ordering::Relaxed);
+    if failed > 0 {
+        tracing::warn!(
+            failed,
+            "events the indexer rejected; their ids were left unclaimed, so \
+             running the same archive again will retry them"
+        );
+    }
     tracing::info!(
+        failed,
         indexed = progress.indexed.load(Ordering::Relaxed),
         skipped = progress.skipped.load(Ordering::Relaxed),
         "archive ingest complete"

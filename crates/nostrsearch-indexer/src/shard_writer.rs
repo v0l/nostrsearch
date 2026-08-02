@@ -263,7 +263,10 @@ impl ShardManager {
     /// Commit and close the least-recently-written shard while over the cap.
     fn evict_if_needed(&self) -> Result<(), ShardError> {
         let cap = self.cfg.max_open_shards.max(1);
-        loop {
+        // An eviction can decline to close -- the shard may have been taken
+        // between choosing it and closing it -- so this cannot loop until the
+        // map is under the cap or it would spin whenever every shard is busy.
+        for _ in 0..cap.saturating_add(1) {
             // Pick a victim under the map lock, then release it: closing a
             // shard commits and fsyncs, which must not block every other
             // thread's shard lookup.
@@ -272,10 +275,18 @@ impl ShardManager {
                 if map.len() < cap {
                     return Ok(());
                 }
+                // Only shards nobody is writing to. A handle held by another
+                // thread keeps the writer -- and so tantivy's directory
+                // lockfile -- alive after the map drops it, and the next
+                // thread to want that month then fails to open it with
+                // LockBusy and loses its events. Being briefly over the cap is
+                // the harmless side of that trade.
                 map.iter()
+                    .filter(|(_, s)| Arc::strong_count(s) == 1)
                     .min_by_key(|(_, s)| s.last_used.load(Ordering::Relaxed))
                     .map(|(id, _)| *id)
             };
+            // Every open shard is in use: nothing can be evicted safely.
             let Some(id) = victim else { return Ok(()) };
 
             let n = self.evictions.fetch_add(1, Ordering::Relaxed) + 1;
@@ -293,6 +304,7 @@ impl ShardManager {
             tracing::debug!(shard = %id, "evicting shard writer");
             self.close_shard(id)?;
         }
+        Ok(())
     }
 
     /// Index one event. `deleted`/`superseded` are computed by the caller's
@@ -377,12 +389,30 @@ impl ShardManager {
     /// Close and drop the writer for a shard, freeing its heap. The on-disk
     /// index remains searchable. Use to bound memory when many shards are open.
     pub fn close_shard(&self, id: ShardId) -> Result<(), ShardError> {
-        let shard = self.shards.lock().unwrap().remove(&id);
-        if let Some(shard) = shard {
-            // Committed after removal from the map, so the fsync does not hold
-            // up lookups for other shards.
-            shard.commit()?;
-            tracing::info!(shard = %id, "closed shard writer");
+        // Commit before removing, holding only a handle: the fsync is the slow
+        // part and must not block lookups of other shards.
+        let shard = match self.shards.lock().unwrap().get(&id) {
+            Some(s) => s.clone(),
+            None => return Ok(()),
+        };
+        shard.commit()?;
+
+        // Remove and drop under one lock. Dropping outside it leaves a window
+        // where the shard is gone from the map but its writer still holds
+        // tantivy's lockfile, and a thread that looks up that month in the
+        // window will miss, try to open the directory, and fail with LockBusy.
+        //
+        // `shard` is a second handle, so release it first and re-check the
+        // count: another thread may have taken one since the commit, and
+        // dropping the map's handle then would not close the writer at all.
+        drop(shard);
+        let mut map = self.shards.lock().unwrap();
+        match map.get(&id) {
+            Some(s) if Arc::strong_count(s) == 1 => {
+                drop(map.remove(&id));
+                tracing::debug!(shard = %id, "closed shard writer");
+            }
+            _ => return Ok(()),
         }
         Ok(())
     }
