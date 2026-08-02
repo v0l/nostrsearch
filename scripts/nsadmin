@@ -72,7 +72,16 @@ call() {
   # such flag and does not wrap by default, so try both.
   auth=$(printf '%s' "$event" | base64 -w0 2>/dev/null || printf '%s' "$event" | base64)
 
-  body=$(curl -sS -m 120 -X "$method" \
+  # The DDoS scrubbing layer in front of this drops SYNs during connection
+  # bursts, so a connect can hang for the full timeout and look like a dead
+  # node. Fail the connect fast and retry it instead of waiting.
+  #
+  # Only the connect phase is retried (--retry-connrefused covers refusals;
+  # a connect that times out never delivered the request). Read timeouts are
+  # deliberately not retried: replaying a POST that did reach the server would
+  # either run a reset twice or trip the single-use auth guard.
+  body=$(curl -sS -m 120 --connect-timeout 3 --retry 5 --retry-delay 1 \
+           --retry-connrefused -X "$method" \
            -H "Authorization: Nostr ${auth}" \
            -w '\n%{http_code}' "$url") || die "request failed: $method $url"
 
