@@ -6,3 +6,5 @@ data
 Dockerfile
 docker-compose.yml
 compose.yml
+dashboard/node_modules
+dashboard/dist

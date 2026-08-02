@@ -10,9 +10,8 @@ export interface MemoryStats {
 }
 
 export interface ShardStat {
-  name: string;
+  shard: string;
   docs: number;
-  [k: string]: unknown;
 }
 
 export interface RegistryStats {

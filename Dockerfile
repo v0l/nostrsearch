@@ -1,5 +1,17 @@
 # syntax=docker/dockerfile:1
 
+# ── Operator console ──────────────────────────────────────────────────────────
+# Built here rather than trusted from the repo, so an image can never ship a
+# console that is older than the API it talks to. The committed asset at
+# crates/nostrsearch-server/assets/dashboard.html only exists so a plain
+# `cargo build` works without bun; this stage always overwrites it.
+FROM oven/bun:1 AS dashboard
+WORKDIR /dash
+COPY dashboard/package.json dashboard/bun.lock ./
+RUN bun install --frozen-lockfile
+COPY dashboard ./
+RUN bun run build
+
 # ── Rust dependency cache ─────────────────────────────────────────────────────
 # Pre-compile dependencies in isolation; this layer is only invalidated when
 # Cargo.toml / Cargo.lock change, not on every source edit.
@@ -45,6 +57,8 @@ RUN mkdir -p crates/nostrsearch-core/src \
 # ── Application build ─────────────────────────────────────────────────────────
 FROM rust-deps AS rust-build
 COPY crates ./crates
+COPY --from=dashboard /dash/dist/index.html \
+     crates/nostrsearch-server/assets/dashboard.html
 # Touch entry points so Cargo rebuilds the app crates, not the world.
 RUN touch crates/nostrsearch-core/src/lib.rs \
           crates/nostrsearch-indexer/src/lib.rs \

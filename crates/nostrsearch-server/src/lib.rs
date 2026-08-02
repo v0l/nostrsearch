@@ -5,6 +5,7 @@
 
 pub mod admin;
 pub mod archive;
+pub mod dashboard;
 pub mod http;
 pub mod node;
 pub mod registry;

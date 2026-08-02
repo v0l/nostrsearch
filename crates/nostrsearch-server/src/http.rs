@@ -97,11 +97,17 @@ pub fn router_full_node(
         app = app.nest("/admin", crate::admin::router(a));
     }
 
+    // The console is always served: most of what it shows comes from the open
+    // endpoints above, and the admin panels gate themselves on a signed key.
+    app = app.merge(crate::dashboard::routes());
+
     if let Some(r) = relay {
-        // Nostr relays live at the root path; a websocket upgrade here is
-        // handed to LocalRelay, anything else falls through to the archive
-        // index page (or 400 if archive serving is off).
+        // Nostr relays live at the root path, and so does the console. A
+        // websocket upgrade is handed to LocalRelay; a plain GET is a browser,
+        // and gets the page.
         app = app.route("/", get(crate::relay::ws_handler).with_state(r));
+    } else {
+        app = app.route("/", get(crate::dashboard::page));
     }
 
     app.layer(tower_http::cors::CorsLayer::permissive())

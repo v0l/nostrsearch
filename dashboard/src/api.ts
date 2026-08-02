@@ -5,6 +5,7 @@ import type {
   RegistryStats,
   ReplayStatus,
   ReportDelta,
+  ReportIndex,
   SyncStatus,
 } from "./types";
 
@@ -34,19 +35,45 @@ declare global {
   }
 }
 
+export const NO_SIGNER =
+  "No signer in this browser. Install a NIP-07 extension (Alby, nos2x, Nostore) and reload.";
+
 export function hasSigner(): boolean {
   return typeof window.nostr?.signEvent === "function";
 }
 
+/**
+ * Extensions inject `window.nostr` on document idle, which can land after the
+ * app has already rendered. Wait briefly before concluding there is no signer,
+ * otherwise a fast page load looks like a missing extension.
+ */
+export function waitForSigner(timeoutMs = 2500): Promise<boolean> {
+  if (hasSigner()) return Promise.resolve(true);
+  return new Promise((resolve) => {
+    const started = Date.now();
+    const h = setInterval(() => {
+      if (hasSigner()) {
+        clearInterval(h);
+        resolve(true);
+      } else if (Date.now() - started > timeoutMs) {
+        clearInterval(h);
+        resolve(false);
+      }
+    }, 120);
+  });
+}
+
 export async function connect(): Promise<string> {
-  if (!window.nostr) throw new Error("No signer found. Install a nostr browser extension.");
-  return window.nostr.getPublicKey();
+  if (!(await waitForSigner())) throw new Error(NO_SIGNER);
+  const pk = await window.nostr!.getPublicKey();
+  if (!/^[0-9a-f]{64}$/i.test(pk)) throw new Error("Signer returned an unusable public key.");
+  return pk.toLowerCase();
 }
 
 /** NIP-98 header: a fresh kind-27235 event naming this exact URL and method. */
 async function nip98(url: string, method: string): Promise<string> {
-  if (!window.nostr) throw new Error("No signer found. Install a nostr browser extension.");
-  const event = await window.nostr.signEvent({
+  if (!hasSigner()) throw new Error(NO_SIGNER);
+  const event = await window.nostr!.signEvent({
     kind: 27235,
     created_at: Math.floor(Date.now() / 1000),
     tags: [
@@ -66,6 +93,11 @@ export class ApiError extends Error {
     message: string,
   ) {
     super(message);
+  }
+
+  /** 401 from the NIP-98 gate: wrong key, stale clock, or replayed header. */
+  get isAuth(): boolean {
+    return this.status === 401;
   }
 }
 
@@ -97,12 +129,18 @@ async function open<T>(path: string): Promise<T> {
  */
 async function signed<T>(path: string, method: "GET" | "POST" = "GET"): Promise<T> {
   const url = new URL(path, window.location.origin).toString();
+  let authorization: string;
+  try {
+    authorization = await nip98(url, method);
+  } catch (e) {
+    // A rejected signing prompt is a user decision, not a node failure — say so
+    // rather than surfacing the extension's own wording.
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new ApiError(0, msg === NO_SIGNER ? msg : `Signing was refused: ${msg}`);
+  }
   const res = await fetch(url, {
     method,
-    headers: {
-      accept: "application/json",
-      authorization: await nip98(url, method),
-    },
+    headers: { accept: "application/json", authorization },
   });
   return unwrap<T>(res);
 }
@@ -149,20 +187,33 @@ function qstr(q: Record<string, string | undefined>): string {
   return parts.length ? `?${parts.join("&")}` : "";
 }
 
+/** The names the writer has published, and when. */
+export const reportIndex = () => open<ReportIndex>("/reports/");
+
+/** One report's full snapshot, the shape its deltas patch. */
+export const report = (name: string) =>
+  open<unknown>(`/reports/${encodeURIComponent(name)}`);
+
 /** Live report deltas. Returns a teardown function. */
-export function streamReports(
-  onDelta: (d: ReportDelta) => void,
-  onState: (up: boolean) => void,
-): () => void {
+export function streamReports(h: {
+  onDelta: (d: ReportDelta) => void;
+  onLagged: (dropped: number) => void;
+  onState: (up: boolean) => void;
+}): () => void {
   const es = new EventSource("/reports/stream");
-  es.addEventListener("open", () => onState(true));
-  es.addEventListener("error", () => onState(false));
+  es.addEventListener("open", () => h.onState(true));
+  es.addEventListener("error", () => h.onState(false));
   es.addEventListener("delta", (e) => {
     try {
-      onDelta(JSON.parse((e as MessageEvent).data) as ReportDelta);
+      h.onDelta(JSON.parse((e as MessageEvent).data) as ReportDelta);
     } catch {
-      /* ignore malformed frame */
+      /* ignore a malformed frame rather than tearing down the stream */
     }
   });
+  // The node sends this when it drops us as a slow consumer: the stream is
+  // gapped from here, so the only correct move is to re-seed.
+  es.addEventListener("lagged", (e) =>
+    h.onLagged(Number((e as MessageEvent).data) || 0),
+  );
   return () => es.close();
 }

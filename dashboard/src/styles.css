@@ -51,7 +51,7 @@ body {
   background-image: repeating-linear-gradient(
     to bottom,
     transparent 0 27px,
-    color-mix(in srgb, var(--ink) 3%, transparent) 27px 28px
+    color-mix(in srgb, var(--ink) 2%, transparent) 27px 28px
   );
 }
 
@@ -195,7 +195,7 @@ a {
 }
 
 .panel-note {
-  margin: 0 0 18px;
+  margin: 0 0 16px;
   color: var(--slate);
   max-width: 68ch;
 }
@@ -216,6 +216,14 @@ a {
 
 .readout:last-child {
   border-right: 0;
+}
+
+.readout.compact {
+  padding: 14px 16px;
+}
+
+.readout.compact .v {
+  font-size: clamp(20px, 2vw, 26px);
 }
 
 .readout .v {
@@ -536,9 +544,51 @@ label.field {
   background: var(--rust);
 }
 
+/* ---------------------------------------------------------------- ranks -- */
+
+.ranks {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.ranks li {
+  display: grid;
+  grid-template-columns: 26px minmax(90px, 200px) 1fr 72px;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 0;
+  border-bottom: 1px solid var(--rule);
+}
+
+.ranks .rank {
+  font-size: 10px;
+  color: var(--slate);
+  font-variant-numeric: tabular-nums;
+}
+
+.ranks .tag {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ranks .count {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--slate);
+}
+
 /* ---------------------------------------------------------------- files -- */
 
 .filelist {
+  text-transform: none;
+  letter-spacing: 0;
+  color: var(--ink);
+  font-size: 12px;
   max-height: 260px;
   overflow-y: auto;
   border: 1px solid var(--rule);
@@ -622,8 +672,12 @@ label.field {
 /* ----------------------------------------------------------------- misc -- */
 
 .empty {
-  padding: 22px 0;
+  padding: 4px 0 2px;
   color: var(--slate);
+}
+
+td.empty {
+  padding: 18px 0;
 }
 
 .gate {

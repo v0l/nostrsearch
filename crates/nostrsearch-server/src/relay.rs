@@ -105,8 +105,11 @@ fn derive_accept_key(key: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(h.finalize())
 }
 
-/// Websocket upgrade handler: completes the handshake, then hands the raw
-/// upgraded connection to the relay.
+/// Root handler: completes a websocket handshake and hands the raw upgraded
+/// connection to the relay.
+///
+/// A plain `GET /` is a browser rather than a nostr client, so it gets the
+/// operator console instead of an error nobody can act on.
 pub async fn ws_handler(
     State(st): State<RelayState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -125,11 +128,7 @@ pub async fn ws_handler(
             .unwrap_or(false);
 
     if !is_upgrade {
-        return (
-            StatusCode::BAD_REQUEST,
-            "expected a websocket upgrade (nostr relay)",
-        )
-            .into_response();
+        return crate::dashboard::page().await;
     }
 
     let key = match headers.get("sec-websocket-key") {

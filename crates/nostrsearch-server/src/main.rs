@@ -257,6 +257,7 @@ async fn main() -> anyhow::Result<()> {
         _ => None,
     };
 
+    let has_admin = admin.is_some();
     let app = nostrsearch_server::http::router_full_node(
         state,
         archive,
@@ -264,6 +265,10 @@ async fn main() -> anyhow::Result<()> {
         Some(reports),
         scrape_state,
         admin,
+    );
+    tracing::info!(
+        admin = has_admin,
+        "operator console at / (admin panels need a key from ADMIN_PUBKEYS)"
     );
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(bind = %bind, "nostrsearch node listening");

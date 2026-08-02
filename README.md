@@ -68,7 +68,9 @@ scale:
 - **`nostrsearch-indexer`** — JSONL/zstd source, `ShardManager` (per-shard
   writers, scheduled commits), `ingest` CLI.
 - **`nostrsearch-server`** — `ShardRegistry` (fan-out + merge + hydrate), axum
-  REST API.
+  REST API, NIP-98 admin endpoints, embedded operator console.
+- **`dashboard/`** — the console itself (Preact + Vite, built to a single HTML
+  file that the server crate compiles in). See [dashboard/README.md](dashboard/README.md).
 
 ## Usage
 
@@ -93,6 +95,34 @@ cargo run --release --bin ingest -- \
 ```bash
 INDEX_ROOT=./data/index BIND=0.0.0.0:8080 \
   cargo run --release --bin nostrsearch-server
+```
+
+### Operate the node
+
+Every node serves the operator console on `/` (and `/dashboard`), built into the
+binary. It shows backfill coverage, the published analysis reports — activity,
+zap volume, publishers, trending hashtags, kinds, clients — live-patched from
+`/reports/stream`, plus relay health and index memory. All of that comes from
+open endpoints and needs no key.
+
+Set `ADMIN_PUBKEYS` (comma-separated hex or npub) to additionally enable the
+admin API, which unlocks replay control and the resets in the console. Admin
+calls are signed in the browser with a NIP-07 extension (NIP-98 auth) — no
+shared secret, no token to leak.
+
+```bash
+INDEX_ROOT=./data/index BIND=0.0.0.0:8080 \
+  ADMIN_PUBKEYS=npub1... ADMIN_ORIGIN=https://archive.example \
+  cargo run --release --bin nostrsearch-server
+# then open http://localhost:8080/
+```
+
+Docker images build the console from source on every build. For a local cargo
+build the committed asset is used as-is, so rebuild it after changing
+`dashboard/`:
+
+```bash
+./scripts/build-dashboard.sh
 ```
 
 ### Query
