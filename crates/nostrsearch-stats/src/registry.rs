@@ -146,10 +146,39 @@ pub enum RebuildPlan {
 /// Transient -- re-sent by the reader at the start of every run -- because the
 /// registry cannot answer "is this stage finished" without knowing what the
 /// full set of dumps is, and only the reader knows that.
+///
+/// The run is a small state machine, and these are its only transitions:
+///
+/// ```text
+///   set_rebuild_files ──▶ RUNNING ──▶ begin_rebuild(file)      (per file)
+///                            │        finish_rebuild_file(file) (per file)
+///                            │        ... repeated once per dependency stage
+///                            ├──▶ finish_rebuild_run   completed: clear, keep folds
+///                            └──▶ finish_rebuild_run   cancelled: same, via abort
+///   (process death)     ──▶ positions persist ──▶ next start resumes RUNNING
+/// ```
+///
+/// Folding through `FoldMode::Rebuild` outside a run is refused, not
+/// tolerated: without the run there is no stage arithmetic, and unstaged
+/// folding records dependents against a world that does not exist yet.
 struct RebuildRun {
     files: Vec<String>,
     entry_stage: Vec<usize>,
     stage_count: usize,
+}
+
+/// Which policy [`Registry::fold`] applies. The gate *sequence* is fixed;
+/// what each mode changes is which gates arm.
+#[derive(Clone, Copy)]
+enum FoldMode<'a> {
+    /// Ordered realtime tail: the watermark gate applies to every analysis.
+    Live,
+    /// Unordered backfill: analyses still deriving fold everything, finished
+    /// ones stay on the watermark rule.
+    Backfill,
+    /// A rebuild run: backfill rules plus dependency-stage gating and
+    /// per-analysis, per-file resume positions.
+    Rebuild { file: &'a str },
 }
 
 pub struct Entry {
@@ -391,16 +420,101 @@ impl Registry {
     /// consumed it (watermark rule). Events must arrive in ascending
     /// `created_at` order.
     pub fn observe_stage(&mut self, stage: &[usize], ev: &NostrEvent, now: u64, world: &World) {
+        let indices: Vec<usize> = stage.to_vec();
+        self.fold(ev, now, world, FoldMode::Live, &indices);
+    }
+
+    /// The single fold path. Every public observe_* entry point is a thin
+    /// wrapper over this.
+    ///
+    /// It used to be four near-copies -- live, backfill, staged backfill,
+    /// rebuild -- each re-implementing the gate sequence slightly differently,
+    /// and every difference was a bug: the rebuild copy was written without
+    /// the stage gate and recorded every event untrusted; the backfill copy
+    /// pinned watermarks the live copy then honoured. What varies between
+    /// modes is *policy*, expressed in [`FoldMode`]; the sequence itself --
+    /// stage gate, resume gate, watermark gate, fold, advance -- exists once,
+    /// so a change to it changes every mode or none.
+    fn fold(
+        &mut self,
+        ev: &NostrEvent,
+        now: u64,
+        world: &World,
+        mode: FoldMode,
+        indices: &[usize],
+    ) {
         let (author, id) = match (Hash32::from_hex(&ev.pubkey), Hash32::from_hex(&ev.id)) {
             (Some(a), Some(i)) => (a, i),
             _ => return, // malformed key; drop
         };
+
+        // Rebuild pass context, resolved once per event.
+        let (rebuild_file, current_stage, entry_stage) = match mode {
+            FoldMode::Rebuild { file } => {
+                // No declared run means no stage arithmetic, and folding
+                // without it is the single-pass bug: dependents recorded
+                // against a world that does not exist yet, permanently.
+                // Refusing loudly beats corrupting quietly -- this is only
+                // reachable through a caller that skipped set_rebuild_files.
+                let Some(run) = self.rebuild_run.as_ref() else {
+                    static WARNED: std::sync::Once = std::sync::Once::new();
+                    WARNED.call_once(|| {
+                        tracing::error!(
+                            "rebuild event dropped: no run declared \
+                             (set_rebuild_files was not called)"
+                        );
+                    });
+                    return;
+                };
+                (Some(file), self.rebuild_stage(), run.entry_stage.clone())
+            }
+            _ => (None, None, Vec::new()),
+        };
+
         let mut touched = false;
-        for &i in stage {
+        for &i in indices {
             let e = &mut self.entries[i];
-            if !e.progress.should_consume(ev.created_at, &id) {
+
+            // Gate 1 (rebuild only): dependency stage. Dependents wait for
+            // their own pass -- they label events using the world their
+            // dependency builds, and folding them early records everything
+            // against a world that does not exist yet.
+            if let Some(s) = current_stage
+                && entry_stage.get(i).copied().unwrap_or(0) != s
+            {
                 continue;
             }
+
+            // Gate 2 (rebuild only): this analysis's own resume point. The
+            // matching event is the last one it folded, so it is consumed
+            // here and folding restarts with the next.
+            if rebuild_file.is_some() && e.resuming {
+                if e.progress.rebuild.last_id == ev.id {
+                    e.resuming = false;
+                }
+                continue;
+            }
+
+            // Gate 3: the watermark. Live consumption is ordered, so it
+            // always applies. An analysis mid-backfill or mid-rebuild reads
+            // *unordered* history and must fold everything -- the watermark
+            // rule would drop earlier events the moment a later one bumped
+            // the mark. Once backfilled it rejoins the ordered rule, or
+            // replaying newly published dumps would never update it again.
+            let initial = e.needs_backfill();
+            let ordered = matches!(mode, FoldMode::Live) || !initial;
+            if ordered && !e.progress.should_consume(ev.created_at, &id) {
+                continue;
+            }
+
+            // Gate 4 (rebuild only): a dump this analysis already folded.
+            if let Some(f) = rebuild_file
+                && !e.progress.rebuild.needs(f)
+            {
+                continue;
+            }
+
+            // The fold itself: identical in every mode.
             if e.analysis.wants(ev) {
                 e.progress.counters.observed += 1;
                 let ctx = AnalysisCtx::new(now, author, id, world);
@@ -410,8 +524,22 @@ impl Registry {
                     e.progress.counters.filtered += 1;
                 }
             }
-            e.progress
-                .advance_bounded(ev.created_at, id, now.saturating_add(FUTURE_SKEW_SECS));
+
+            // Advance: ordered consumption keeps the count-once boundary set;
+            // unordered tracks the high-water mark without it, plus the
+            // per-file rebuild position when there is one.
+            if ordered {
+                e.progress
+                    .advance_bounded(ev.created_at, id, now.saturating_add(FUTURE_SKEW_SECS));
+            } else {
+                if ev.created_at > e.progress.watermark {
+                    e.progress.watermark = ev.created_at;
+                }
+                e.progress.events += 1;
+                if let Some(f) = rebuild_file {
+                    e.progress.rebuild.advance(f, &ev.id);
+                }
+            }
             touched = true;
         }
         if touched {
@@ -441,24 +569,6 @@ impl Registry {
         self.observe_backfill_stage(&all, ev, now, world);
     }
 
-    /// Unordered-backfill fold restricted to the entries in `stage`.
-    ///
-    /// This is the streaming counterpart of [`backfill_in_memory`]'s staged
-    /// passes: the caller replays the corpus once per stage, so that by the
-    /// time stage *n* folds, every stage below it has finished and
-    /// `contribute`d to `world`. Without this, a consumer like the daily
-    /// activity report reads an empty `World` on a cold backfill and silently
-    /// records every author as untrusted.
-    ///
-    /// [`backfill_in_memory`]: crate::run::backfill_in_memory
-    /// Begin a rebuild pass over `files`, arming each analysis's own resume
-    /// point.
-    ///
-    /// Returns the position the *reader* may safely fast-forward to: `Some`
-    /// only when every analysis still rebuilding agrees on it, since skipping
-    /// in the reader skips for all of them at once. When they disagree the
-    /// reader must hand over every event and each analysis skips on its own,
-    /// which costs a parse per line but is the only correct answer.
     /// Start (or resume) a rebuild run over `files`.
     ///
     /// Must be called before `begin_rebuild`: stage arithmetic needs the full
@@ -498,6 +608,13 @@ impl Registry {
         })
     }
 
+    /// Begin a rebuild pass over `file`, arming each participating analysis's
+    /// resume point.
+    ///
+    /// Returns what the *reader* may safely do: skip the file, fast-forward
+    /// past a shared id, or hand over every event so each analysis skips on
+    /// its own. Fast-forwarding is only offered when every participant agrees
+    /// on the position, since a reader-level skip skips for all of them.
     pub fn begin_rebuild(&mut self, file: &str) -> RebuildPlan {
         let Some(stage) = self.rebuild_stage() else {
             return RebuildPlan::Finished;
@@ -596,67 +713,17 @@ impl Registry {
     /// may be a third of the way through the archive while another has never
     /// started.
     pub fn observe_rebuild(&mut self, ev: &NostrEvent, now: u64, world: &World, file: &str) {
-        let (author, id) = match (Hash32::from_hex(&ev.pubkey), Hash32::from_hex(&ev.id)) {
-            (Some(a), Some(i)) => (a, i),
-            _ => return,
-        };
-        let stage = self.rebuild_stage();
-        let run_stage: Vec<usize> = self
-            .rebuild_run
-            .as_ref()
-            .map(|r| r.entry_stage.clone())
-            .unwrap_or_default();
-        let mut touched = false;
-        for (i, e) in self.entries.iter_mut().enumerate() {
-            // Dependents wait for their own pass. They label events using the
-            // world their dependency builds, so folding them now would record
-            // everything against a world that does not exist yet.
-            if let Some(s) = stage
-                && run_stage.get(i).copied().unwrap_or(0) != s
-            {
-                continue;
-            }
-            if e.resuming {
-                // Still behind this analysis's resume point. The event that
-                // matches is the last one it folded, so it is consumed here
-                // and folding restarts with the next.
-                if e.progress.rebuild.last_id == ev.id {
-                    e.resuming = false;
-                }
-                continue;
-            }
-            if !e.needs_backfill() && !e.progress.should_consume(ev.created_at, &id) {
-                continue;
-            }
-            if !e.progress.rebuild.needs(file) {
-                continue;
-            }
-            if e.analysis.wants(ev) {
-                e.progress.counters.observed += 1;
-                let ctx = AnalysisCtx::new(now, author, id, world);
-                if e.analysis.observe(ev, &ctx) {
-                    e.progress.counters.consumed += 1;
-                } else {
-                    e.progress.counters.filtered += 1;
-                }
-            }
-            if e.needs_backfill() {
-                if ev.created_at > e.progress.watermark {
-                    e.progress.watermark = ev.created_at;
-                }
-                e.progress.events += 1;
-                e.progress.rebuild.advance(file, &ev.id);
-            } else {
-                e.progress
-                    .advance_bounded(ev.created_at, id, now.saturating_add(FUTURE_SKEW_SECS));
-            }
-            touched = true;
-        }
-        if touched {
-            self.total_events += 1;
-        }
+        let all: Vec<usize> = (0..self.entries.len()).collect();
+        self.fold(ev, now, world, FoldMode::Rebuild { file }, &all);
     }
 
+    /// Unordered-backfill fold restricted to the entries in `stage`.
+    ///
+    /// The caller replays the corpus once per stage, so that by the time stage
+    /// *n* folds, every stage below it has finished and `contribute`d to
+    /// `world`. Without this, a consumer like the daily activity report reads
+    /// an empty `World` on a cold backfill and silently records every author
+    /// as untrusted.
     pub fn observe_backfill_stage(
         &mut self,
         stage: &[usize],
@@ -664,49 +731,8 @@ impl Registry {
         now: u64,
         world: &World,
     ) {
-        let (author, id) = match (Hash32::from_hex(&ev.pubkey), Hash32::from_hex(&ev.id)) {
-            (Some(a), Some(i)) => (a, i),
-            _ => return,
-        };
-        let mut touched = false;
-        for &i in stage {
-            let e = &mut self.entries[i];
-            // An analysis still doing its initial scan folds everything: the
-            // archive is unordered, so the watermark rule would drop earlier
-            // events as soon as a later one bumped the mark.
-            //
-            // An analysis that already finished falls back to the watermark
-            // rule rather than being skipped — otherwise re-running a backfill
-            // over newly published dumps would index the events but silently
-            // never update stats/WoT again.
-            let initial = e.needs_backfill();
-            if !initial && !e.progress.should_consume(ev.created_at, &id) {
-                continue;
-            }
-            if e.analysis.wants(ev) {
-                e.progress.counters.observed += 1;
-                let ctx = AnalysisCtx::new(now, author, id, world);
-                if e.analysis.observe(ev, &ctx) {
-                    e.progress.counters.consumed += 1;
-                } else {
-                    e.progress.counters.filtered += 1;
-                }
-            }
-            if initial {
-                // Track the high-water mark without the ordered bookkeeping.
-                if ev.created_at > e.progress.watermark {
-                    e.progress.watermark = ev.created_at;
-                }
-                e.progress.events += 1;
-            } else {
-                e.progress
-                    .advance_bounded(ev.created_at, id, now.saturating_add(FUTURE_SKEW_SECS));
-            }
-            touched = true;
-        }
-        if touched {
-            self.total_events += 1;
-        }
+        let indices: Vec<usize> = stage.to_vec();
+        self.fold(ev, now, world, FoldMode::Backfill, &indices);
     }
 
     /// Refresh + materialize every stage in dependency order into `world`.

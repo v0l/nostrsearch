@@ -299,3 +299,28 @@ fn a_cancelled_run_does_not_resume_after_restart() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Rebuild folding outside a declared run is refused, not tolerated.
+///
+/// Without the run there is no stage arithmetic, and unstaged folding is the
+/// single-pass bug: dependents recorded against a world that does not exist
+/// yet, permanently. A caller that forgets set_rebuild_files must lose events
+/// loudly rather than corrupt every trust split quietly.
+#[test]
+fn rebuild_folding_without_a_declared_run_is_refused() {
+    let dir = tempdir("norun");
+    let store = StatStore::new(&dir).unwrap();
+    let mut reg = registry(&store);
+
+    // No set_rebuild_files.
+    let events: Vec<NostrEvent> = (0..5).map(|n| note(n, &pk(1))).collect();
+    fold(&mut reg, &events, 5);
+
+    let snap = snapshot(&reg, "kind_breakdown");
+    assert!(
+        snap.as_object().map(|o| o.is_empty()).unwrap_or(true),
+        "events must not fold unstaged: {snap}"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
