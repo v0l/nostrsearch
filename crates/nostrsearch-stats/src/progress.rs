@@ -100,17 +100,66 @@ pub struct Progress {
     pub rebuild: Rebuild,
 }
 
-/// [`Progress`] as it was stored before `rebuild` existed.
+/// Progress metadata as persisted, without the boundary set.
 ///
-/// Progress is persisted with bincode, which is positional and carries no
-/// field names, so `#[serde(default)]` does nothing for it: a struct that
-/// gained a trailing field simply runs off the end of the old bytes and fails
-/// with "unexpected end of file". Adding `rebuild` therefore made every
-/// existing `.progress.bin` undecodable, and the node refused to boot.
+/// Stored as JSON, and the reason is worth stating: this is the half that
+/// keeps gaining fields, and the previous bincode encoding could not read
+/// bytes written before a field existed. That is not a theoretical concern --
+/// adding `rebuild` stopped nodes from booting, with
+/// "decoding follow_graph.progress.bin: unexpected end of file". Every field
+/// here is `#[serde(default)]`, so the next addition costs nothing and an
+/// older build ignores what it does not know.
 ///
-/// Decoding falls back to this layout and fills in the new field, so watermarks,
-/// counters and `backfilled` all survive the upgrade. Any future field needs the
-/// same treatment -- or a format that stores names.
+/// It is about 100 bytes. The boundary set, which is the actual bulk and never
+/// changes shape, is stored separately as raw keys.
+#[derive(Default, Serialize, Deserialize)]
+pub(crate) struct ProgressMeta {
+    #[serde(default)]
+    pub epoch: u32,
+    #[serde(default)]
+    pub watermark: u64,
+    #[serde(default)]
+    pub events: u64,
+    #[serde(default)]
+    pub backfilled: bool,
+    #[serde(default)]
+    pub last_refresh_wall: u64,
+    #[serde(default)]
+    pub counters: Counters,
+    #[serde(default)]
+    pub rebuild: Rebuild,
+}
+
+impl From<&Progress> for ProgressMeta {
+    fn from(p: &Progress) -> Self {
+        Self {
+            epoch: p.epoch,
+            watermark: p.watermark,
+            events: p.events,
+            backfilled: p.backfilled,
+            last_refresh_wall: p.last_refresh_wall,
+            counters: p.counters.clone(),
+            rebuild: p.rebuild.clone(),
+        }
+    }
+}
+
+impl From<ProgressMeta> for Progress {
+    fn from(m: ProgressMeta) -> Self {
+        Self {
+            epoch: m.epoch,
+            watermark: m.watermark,
+            boundary: HashSet::new(), // loaded from its own file
+            events: m.events,
+            backfilled: m.backfilled,
+            last_refresh_wall: m.last_refresh_wall,
+            counters: m.counters,
+            rebuild: m.rebuild,
+        }
+    }
+}
+
+/// The bincode layout written before `rebuild` existed.
 #[derive(Deserialize)]
 pub(crate) struct ProgressV0 {
     pub epoch: u32,
@@ -121,6 +170,19 @@ pub(crate) struct ProgressV0 {
     pub last_refresh_wall: u64,
     #[serde(default)]
     pub counters: Counters,
+}
+
+/// The bincode layout written after `rebuild` was added, before the split.
+#[derive(Deserialize)]
+pub(crate) struct ProgressV1 {
+    pub epoch: u32,
+    pub watermark: u64,
+    pub boundary: HashSet<EventId>,
+    pub events: u64,
+    pub backfilled: bool,
+    pub last_refresh_wall: u64,
+    pub counters: Counters,
+    pub rebuild: Rebuild,
 }
 
 impl From<ProgressV0> for Progress {
@@ -134,6 +196,21 @@ impl From<ProgressV0> for Progress {
             last_refresh_wall: v.last_refresh_wall,
             counters: v.counters,
             rebuild: Rebuild::default(),
+        }
+    }
+}
+
+impl From<ProgressV1> for Progress {
+    fn from(v: ProgressV1) -> Self {
+        Self {
+            epoch: v.epoch,
+            watermark: v.watermark,
+            boundary: v.boundary,
+            events: v.events,
+            backfilled: v.backfilled,
+            last_refresh_wall: v.last_refresh_wall,
+            counters: v.counters,
+            rebuild: v.rebuild,
         }
     }
 }

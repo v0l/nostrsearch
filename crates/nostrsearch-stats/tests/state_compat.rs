@@ -134,6 +134,7 @@ fn progress_written_before_rebuild_tracking_still_loads() {
         bincode::serialize(&old).unwrap(),
     )
     .unwrap();
+    // No boundary file: the old format kept the set inside the same blob.
 
     let (state, p): (Vec<u8>, Progress) = store
         .load("activity")
@@ -148,6 +149,82 @@ fn progress_written_before_rebuild_tracking_still_loads() {
         p.rebuild.file.is_empty() && p.rebuild.completed.is_empty(),
         "the new field defaults"
     );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Progress round-trips through the split format, boundary set included.
+///
+/// Metadata is JSON so it can gain fields safely; the boundary set is the bulk
+/// (6.4 MB at its cap versus ~100 bytes of metadata) and never changes shape,
+/// so it stays raw. Encoding it as JSON would more than double every persist,
+/// and persists happen every five minutes per analysis.
+#[test]
+fn progress_round_trips_and_metadata_is_readable() {
+    use nostrsearch_stats::types::Hash32;
+    use nostrsearch_stats::{Progress, StatStore};
+
+    let dir = std::env::temp_dir().join(format!(
+        "nssplit-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = StatStore::new(&dir).unwrap();
+
+    let mut p = Progress::fresh(3);
+    p.watermark = 1_700_000_000;
+    p.events = 12_345;
+    p.backfilled = true;
+    p.rebuild.file = "combined.jsonl.zst".into();
+    p.rebuild.last_id = "abc123".into();
+    p.rebuild.completed.push("older.jsonl".into());
+    for i in 0..1_000u32 {
+        let mut id = [0u8; 32];
+        id[..4].copy_from_slice(&i.to_le_bytes());
+        p.boundary.insert(Hash32(id));
+    }
+
+    store.save("activity", b"state-bytes", &p).unwrap();
+    let (state, back) = store.load("activity").unwrap().expect("saved");
+
+    assert_eq!(state, b"state-bytes");
+    assert_eq!(back.watermark, p.watermark);
+    assert_eq!(back.events, p.events);
+    assert!(back.backfilled);
+    assert_eq!(back.rebuild.last_id, "abc123");
+    assert_eq!(back.rebuild.completed, vec!["older.jsonl".to_string()]);
+    assert_eq!(back.boundary.len(), 1_000, "boundary set must survive");
+    assert_eq!(back.boundary, p.boundary);
+
+    // The metadata is readable without the code that wrote it, which is the
+    // point of not using a positional format for the evolving half.
+    let raw = std::fs::read(dir.join("activity.progress.json")).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(v["watermark"], 1_700_000_000u64);
+    assert_eq!(v["rebuild"]["last_id"], "abc123");
+
+    // A field the reader does not know must be ignored, not fatal -- this is
+    // what the bincode layout could not do.
+    let mut obj = v.as_object().unwrap().clone();
+    obj.insert("some_future_field".into(), serde_json::json!({"a": 1}));
+    std::fs::write(
+        dir.join("activity.progress.json"),
+        serde_json::to_vec(&obj).unwrap(),
+    )
+    .unwrap();
+    let (_, forward) = store
+        .load("activity")
+        .expect("an unknown field must not abort startup")
+        .expect("present");
+    assert_eq!(forward.watermark, 1_700_000_000);
+
+    // The boundary file is raw keys, 32 bytes each and nothing else.
+    let b = std::fs::read(dir.join("activity.boundary.bin")).unwrap();
+    assert_eq!(b.len(), 1_000 * 32);
 
     std::fs::remove_dir_all(&dir).ok();
 }
