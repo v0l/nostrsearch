@@ -37,6 +37,7 @@ pub trait DynAnalysis: Send + Sync {
     fn merge_dyn(&mut self, other: Box<dyn DynAnalysis>) -> Result<(), Box<dyn DynAnalysis>>;
     fn snapshot_json(&self) -> serde_json::Value;
     fn drain_delta_json(&mut self) -> Option<serde_json::Value>;
+    fn reset_to_default(&mut self);
     fn checkpoint_bin(&self) -> Result<Vec<u8>>;
     fn restore_bin(&mut self, bytes: &[u8]) -> Result<()>;
     fn into_any(self: Box<Self>) -> Box<dyn Any>;
@@ -88,6 +89,9 @@ where
     fn drain_delta_json(&mut self) -> Option<serde_json::Value> {
         Analysis::drain_delta(self)
     }
+    fn reset_to_default(&mut self) {
+        *self = A::default();
+    }
     fn checkpoint_bin(&self) -> Result<Vec<u8>> {
         Ok(bincode::serialize(self)?)
     }
@@ -98,6 +102,22 @@ where
     fn into_any(self: Box<Self>) -> Box<dyn Any> {
         self
     }
+}
+
+/// Per-analysis progress as served by the status endpoint.
+#[derive(Debug, Clone, Serialize)]
+pub struct AnalysisStatus {
+    pub name: String,
+    pub epoch: u32,
+    /// False = still deriving from the corpus; its report is incomplete.
+    pub backfilled: bool,
+    /// Highest `created_at` consumed.
+    pub watermark: u64,
+    pub events: u64,
+    pub observed: u64,
+    pub consumed: u64,
+    pub filtered: u64,
+    pub deps: &'static [&'static str],
 }
 
 /// One registered analysis plus its resumable progress (which carries the
@@ -482,6 +502,40 @@ impl Registry {
             }
             self.entries[i].analysis.contribute(world);
         }
+    }
+
+    /// Per-analysis progress, for the status endpoint.
+    pub fn status(&self) -> Vec<AnalysisStatus> {
+        self.entries
+            .iter()
+            .map(|e| AnalysisStatus {
+                name: e.analysis.name().to_string(),
+                epoch: e.analysis.epoch(),
+                backfilled: e.progress.backfilled,
+                watermark: e.progress.watermark,
+                events: e.progress.events,
+                observed: e.progress.counters.observed,
+                consumed: e.progress.counters.consumed,
+                filtered: e.progress.counters.filtered,
+                deps: e.analysis.deps(),
+            })
+            .collect()
+    }
+
+    /// Discard an analysis's accumulated state and progress so it re-derives
+    /// from scratch. Returns false if no analysis has that name.
+    ///
+    /// Clearing `backfilled` is the part that matters: an analysis in that
+    /// state folds every event it is handed regardless of watermark, so
+    /// out-of-order history (from the scraper walking backwards, or an archive
+    /// replay) is picked up instead of being rejected as "already past".
+    pub fn reset(&mut self, name: &str) -> bool {
+        let Some(e) = self.entries.iter_mut().find(|e| e.analysis.name() == name) else {
+            return false;
+        };
+        e.analysis.reset_to_default();
+        e.progress = Progress::fresh(e.analysis.epoch());
+        true
     }
 
     /// Mark backfilled only those analyses that have actually consumed events,

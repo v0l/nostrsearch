@@ -62,6 +62,18 @@ pub fn router_all_sync(
     reports: Option<crate::reports::ReportStore>,
     scrape: Option<std::sync::Arc<nostrsearch_indexer::scrape::ScrapeState>>,
 ) -> Router {
+    router_full_node(state, archive, relay, reports, scrape, None)
+}
+
+/// The complete node router, including authenticated admin routes.
+pub fn router_full_node(
+    state: SharedState,
+    archive: Option<crate::archive::ArchiveState>,
+    relay: Option<crate::relay::RelayState>,
+    reports: Option<crate::reports::ReportStore>,
+    scrape: Option<std::sync::Arc<nostrsearch_indexer::scrape::ScrapeState>>,
+    admin: Option<crate::admin::AdminState>,
+) -> Router {
     let mut app = Router::new()
         .route("/search", get(search_get).post(search_post))
         .route("/event/{id}", get(get_event))
@@ -79,6 +91,10 @@ pub fn router_all_sync(
 
     if let Some(s) = scrape {
         app = app.nest("/sync", crate::reports::sync_router(s));
+    }
+
+    if let Some(a) = admin {
+        app = app.nest("/admin", crate::admin::router(a));
     }
 
     if let Some(r) = relay {

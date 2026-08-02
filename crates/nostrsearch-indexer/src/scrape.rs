@@ -182,6 +182,77 @@ impl ScrapeState {
         p
     }
 
+    /// Forget completion records so those (relay, day) pairs get scraped again.
+    ///
+    /// `relay` / `from` / `to` are all optional filters; `from` and `to` are
+    /// inclusive `YYYY-MM-DD` bounds compared lexically, which is exactly
+    /// chronological for that format. Returns how many records were dropped.
+    ///
+    /// This is the operational escape hatch for "that day was scraped against a
+    /// relay that was broken/empty at the time" — without it the only remedy is
+    /// deleting the whole state database and re-walking the entire network.
+    pub fn reset_days(&self, relay: Option<&str>, from: Option<&str>, to: Option<&str>) -> u64 {
+        let mut keys: Vec<Vec<u8>> = Vec::new();
+        for kv in self.db.prefix_iterator(b"d|") {
+            let Ok((k, _)) = kv else { break };
+            if !k.starts_with(b"d|") {
+                break;
+            }
+            let rest = String::from_utf8_lossy(&k[2..]).into_owned();
+            let Some((date, url)) = rest.split_once('|') else {
+                continue;
+            };
+            if let Some(r) = relay
+                && r != url
+            {
+                continue;
+            }
+            if let Some(f) = from
+                && date < f
+            {
+                continue;
+            }
+            if let Some(t) = to
+                && date > t
+            {
+                continue;
+            }
+            keys.push(k.to_vec());
+        }
+        let n = keys.len() as u64;
+        for k in keys {
+            let _ = self.db.delete(k);
+        }
+        n
+    }
+
+    /// Clear a relay's *learned* state: the detected data horizon, failure
+    /// count, observed result cap and negentropy probe result.
+    ///
+    /// `sources` (how many authors advertise it) is discovery data, not
+    /// learned behaviour, so it is preserved. Mainly for a relay that was down
+    /// or lying when first probed and has since been fixed — otherwise its
+    /// `birthday` permanently stops us walking earlier history.
+    pub fn reset_relay(&self, url: &str) -> bool {
+        let mut k = b"r|".to_vec();
+        k.extend_from_slice(url.as_bytes());
+        let Ok(Some(v)) = self.db.get(&k) else {
+            return false;
+        };
+        let Ok(old) = bincode::deserialize::<RelayInfo>(&v) else {
+            return false;
+        };
+        let fresh = RelayInfo {
+            sources: old.sources,
+            ..Default::default()
+        };
+        if let Ok(v) = bincode::serialize(&fresh) {
+            let _ = self.db.put(k, v);
+            return true;
+        }
+        false
+    }
+
     fn day_key(date: &str, url: &str) -> Vec<u8> {
         let mut k = b"d|".to_vec();
         k.extend_from_slice(date.as_bytes());

@@ -91,6 +91,7 @@ async fn main() -> anyhow::Result<()> {
     // leaves it empty (and `/reports` reports generated_at = 0).
     let reports = nostrsearch_server::reports::ReportStore::new();
     let mut writer_handle = None;
+    let mut writer_ctl = None;
     let sink = if is_writer {
         let cfg = PipelineConfig {
             index_root: index_root.clone(),
@@ -104,13 +105,14 @@ async fn main() -> anyhow::Result<()> {
             persist_interval: env::persist_interval(),
             wot_out: Some(env::wot_out()),
         };
-        let (sink, handle) = nostrsearch_server::node::spawn_writer_with_reports(
+        let (sink, handle, ctl) = nostrsearch_server::node::spawn_writer_with_reports(
             cfg,
             10_000,
             std::time::Duration::from_secs(30),
             Some(reports.clone()),
         )?;
         writer_handle = Some(handle);
+        writer_ctl = Some(ctl);
         Some(sink)
     } else {
         None
@@ -188,12 +190,31 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let app = nostrsearch_server::http::router_all_sync(
+    // Admin routes only exist when ADMIN_PUBKEYS names at least one valid key
+    // and this node owns the pipeline; otherwise they are never mounted.
+    let admin = match (
+        writer_ctl,
+        nostrsearch_server::admin::AdminConfig::from_env(),
+    ) {
+        (Some(ctl), Some(cfg)) => Some(nostrsearch_server::admin::AdminState::new(
+            cfg,
+            ctl,
+            scrape_state.clone(),
+        )),
+        (None, Some(_)) => {
+            tracing::warn!("ADMIN_PUBKEYS set but this node is not the writer; admin disabled");
+            None
+        }
+        _ => None,
+    };
+
+    let app = nostrsearch_server::http::router_full_node(
         state,
         archive,
         relay,
         Some(reports),
         scrape_state,
+        admin,
     );
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(bind = %bind, "nostrsearch node listening");

@@ -157,6 +157,21 @@ spec:
             # bound descriptors and reload-watcher threads, not memory.
             - name: MAX_OPEN_SHARD_READERS
               value: "48"
+            # ── Admin endpoints (NIP-98 authenticated) ─────────────────────
+            # Comma-separated npub/hex allowed to call /admin/*. Unset (the
+            # default) means the routes are never mounted, so a misconfigured
+            # deploy exposes nothing rather than everything. Callers sign a
+            # kind-27235 event naming the exact URL + method, so no secret is
+            # ever transmitted.
+            #   POST /admin/analyses/{name}/reset    re-derive one report
+            #   POST /admin/scrape/reset?relay=&from=&to=   re-scrape days
+            #   POST /admin/scrape/relay/reset?relay=       clear learned state
+            # - name: ADMIN_PUBKEYS
+            #   value: "npub1..."
+            # Public origin, so the signed `u` tag is checked against the real
+            # external URL and not just the path.
+            # - name: ADMIN_ORIGIN
+            #   value: "https://archive.v0l.io"
             - name: STATE_DIR
               value: /data/stats
             - name: WOT_OUT

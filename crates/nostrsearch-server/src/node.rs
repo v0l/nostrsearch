@@ -78,6 +78,48 @@ impl EventSink {
     }
 }
 
+/// A request that must run on the writer task, because that task is the sole
+/// owner of the [`Pipeline`].
+pub enum WriterCmd {
+    /// Discard an analysis's state so it re-derives from incoming events.
+    ResetAnalysis {
+        name: String,
+        reply: tokio::sync::oneshot::Sender<bool>,
+    },
+    /// Per-analysis progress.
+    Status {
+        reply: tokio::sync::oneshot::Sender<Vec<nostrsearch_stats::AnalysisStatus>>,
+    },
+}
+
+/// Control handle for the writer task. Cloneable and cheap.
+#[derive(Clone)]
+pub struct WriterCtl(mpsc::Sender<WriterCmd>);
+
+impl WriterCtl {
+    /// Reset one analysis. `Ok(false)` = no analysis by that name.
+    pub async fn reset_analysis(&self, name: &str) -> Result<bool, &'static str> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.0
+            .send(WriterCmd::ResetAnalysis {
+                name: name.to_string(),
+                reply: tx,
+            })
+            .await
+            .map_err(|_| "writer task gone")?;
+        rx.await.map_err(|_| "writer task dropped the request")
+    }
+
+    pub async fn status(&self) -> Result<Vec<nostrsearch_stats::AnalysisStatus>, &'static str> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.0
+            .send(WriterCmd::Status { reply: tx })
+            .await
+            .map_err(|_| "writer task gone")?;
+        rx.await.map_err(|_| "writer task dropped the request")
+    }
+}
+
 /// Handle for shutting the writer down cleanly.
 ///
 /// Without this, a SIGTERM (what Docker/k8s send on every deploy) kills the
@@ -109,7 +151,8 @@ pub fn spawn_writer(
     queue_size: usize,
     commit_every: std::time::Duration,
 ) -> anyhow::Result<(EventSink, WriterHandle)> {
-    spawn_writer_with_reports(cfg, queue_size, commit_every, None)
+    let (sink, handle, _ctl) = spawn_writer_with_reports(cfg, queue_size, commit_every, None)?;
+    Ok((sink, handle))
 }
 
 /// As [`spawn_writer`], but also publishes analysis snapshots into `reports`
@@ -120,13 +163,15 @@ pub fn spawn_writer_with_reports(
     queue_size: usize,
     commit_every: std::time::Duration,
     reports: Option<crate::reports::ReportStore>,
-) -> anyhow::Result<(EventSink, WriterHandle)> {
+) -> anyhow::Result<(EventSink, WriterHandle, WriterCtl)> {
     let mut pipeline = Pipeline::new(cfg)?;
     // Live tail semantics: everything from here on is realtime.
     pipeline.go_live();
 
     let (tx, mut rx) = mpsc::channel::<NostrEvent>(queue_size);
     let (sd_tx, mut sd_rx) = tokio::sync::watch::channel(false);
+    // Small: these are rare operator actions, not a data path.
+    let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriterCmd>(16);
 
     let join = tokio::spawn(async move {
         let mut tick = tokio::time::interval(commit_every);
@@ -169,6 +214,18 @@ pub fn spawn_writer_with_reports(
                         store.apply_deltas(unix_now(), deltas);
                     }
                 }
+                Some(cmd) = cmd_rx.recv() => match cmd {
+                    WriterCmd::ResetAnalysis { name, reply } => {
+                        let ok = pipeline.reset_analysis(&name);
+                        // Republish immediately so the dashboard reflects the
+                        // now-empty report rather than the stale one.
+                        publish_reports(&pipeline, reports.as_ref());
+                        let _ = reply.send(ok);
+                    }
+                    WriterCmd::Status { reply } => {
+                        let _ = reply.send(pipeline.analyses_status());
+                    }
+                },
                 _ = sd_rx.changed() => {
                     if *sd_rx.borrow() {
                         tracing::info!("writer shutting down; draining queue");
@@ -196,6 +253,7 @@ pub fn spawn_writer_with_reports(
             shutdown: sd_tx,
             join,
         },
+        WriterCtl(cmd_tx),
     ))
 }
 

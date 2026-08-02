@@ -164,6 +164,29 @@ impl Pipeline {
         self.registry.snapshots()
     }
 
+    /// Per-analysis progress (watermark, backfill state, counters).
+    pub fn analyses_status(&self) -> Vec<nostrsearch_stats::AnalysisStatus> {
+        self.registry.status()
+    }
+
+    /// Discard one analysis's state so it re-derives from the corpus, and
+    /// persist that immediately so a restart cannot resurrect the old state.
+    pub fn reset_analysis(&mut self, name: &str) -> bool {
+        if !self.registry.reset(name) {
+            return false;
+        }
+        if let Some(store) = &self.store
+            && let Err(e) = self.registry.persist(store)
+        {
+            tracing::warn!(error = %e, analysis = name, "persisting reset failed");
+        }
+        tracing::info!(
+            analysis = name,
+            "analysis reset; will re-derive from events"
+        );
+        true
+    }
+
     /// Drain each analysis's partial changes since the last call, for streaming
     /// to a live dashboard. Empty when nothing moved. See
     /// [`nostrsearch_stats::delta`] for the merge-patch contract.
@@ -186,7 +209,16 @@ impl Pipeline {
         if self.live {
             // Live tail: the world is already materialized, so one pass feeds
             // every stage.
-            self.registry.observe(ev, now, &self.world);
+            //
+            // `observe_backfill` rather than `observe` because the two differ
+            // only for analyses still marked un-backfilled, which fold every
+            // event regardless of watermark. That is what lets a reset analysis
+            // rebuild from out-of-order history -- the scraper walks the
+            // network backwards day by day, so its events arrive older than
+            // the watermark and `observe` would reject every one of them.
+            // Analyses that are already backfilled behave identically either
+            // way, keeping count-once semantics.
+            self.registry.observe_backfill(ev, now, &self.world);
         } else {
             // Backfill: fold only the stage this pass is responsible for, so
             // consumers never read a half-built world.
