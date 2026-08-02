@@ -195,7 +195,31 @@ async fn stale_replayed_and_mismatched_headers_are_refused() -> anyhow::Result<(
         .header("Authorization", &header)
         .send()
         .await?;
-    assert_eq!(second.status(), 401, "replayed auth event must be refused");
+    // A repeated GET is allowed. Proxies transparently retry idempotent
+    // requests against a slow upstream, and rejecting the retry made the
+    // status endpoints 401 exactly when the node was busy enough to need them.
+    assert_eq!(
+        second.status(),
+        200,
+        "a retried GET must not be rejected as a replay"
+    );
+
+    // State-changing requests keep strict single-use: running a reset twice
+    // because something retried it is the outcome worth preventing.
+    let post_url = format!("{base}/admin/analyses/activity/reset");
+    let post_hdr = nip98(&admin, &post_url, "POST", None).await?;
+    let p1 = http
+        .post(&post_url)
+        .header("Authorization", &post_hdr)
+        .send()
+        .await?;
+    assert_eq!(p1.status(), 200);
+    let p2 = http
+        .post(&post_url)
+        .header("Authorization", &post_hdr)
+        .send()
+        .await?;
+    assert_eq!(p2.status(), 401, "replayed POST must be refused");
 
     // Garbage.
     for bad in ["Nostr not-base64!!", "Bearer hunter2", "Nostr "] {

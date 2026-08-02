@@ -240,7 +240,20 @@ async fn auth(State(st): State<AdminState>, req: Request, next: Next) -> Respons
         return deny("auth event u tag does not match this URL");
     }
 
-    if !st.accept_once(&event.id.to_hex(), now) {
+    // Single-use, but only for requests that change something.
+    //
+    // A proxy in front of this node will transparently retry a request whose
+    // upstream was slow -- which is exactly what happens while a replay has the
+    // writer busy. With the guard applied to every method, the retry arrives
+    // with the same (legitimately fresh) auth event, gets rejected as a replay,
+    // and the client sees a 401 for a request it made once. That made GET
+    // /admin/ingest unusable precisely when it was most needed.
+    //
+    // Replaying a GET achieves nothing an attacker could not get by replaying
+    // the original response, and signature, freshness and url+method binding
+    // still apply. State-changing methods keep strict single-use: rejecting a
+    // duplicate reset is far better than running it twice.
+    if req.method() != axum::http::Method::GET && !st.accept_once(&event.id.to_hex(), now) {
         return deny("auth event already used");
     }
 
