@@ -65,22 +65,72 @@ impl Args {
         let mut it = std::env::args().skip(1);
         while let Some(a) = it.next() {
             match a.as_str() {
-                "--index-root" => index_root = PathBuf::from(it.next().ok_or("--index-root value")?),
-                "--input-dir" => input_dir = Some(PathBuf::from(it.next().ok_or("--input-dir value")?)),
+                "--index-root" => {
+                    index_root = PathBuf::from(it.next().ok_or("--index-root value")?)
+                }
+                "--input-dir" => {
+                    input_dir = Some(PathBuf::from(it.next().ok_or("--input-dir value")?))
+                }
                 "--relays" | "--relay" => relays.push(it.next().ok_or("--relays value")?),
-                "--archive-dir" => archive_dir = Some(PathBuf::from(it.next().ok_or("--archive-dir value")?)),
-                "--state-dir" => state_dir = Some(PathBuf::from(it.next().ok_or("--state-dir value")?)),
+                "--archive-dir" => {
+                    archive_dir = Some(PathBuf::from(it.next().ok_or("--archive-dir value")?))
+                }
+                "--state-dir" => {
+                    state_dir = Some(PathBuf::from(it.next().ok_or("--state-dir value")?))
+                }
                 "--no-state" => state_dir = None,
                 "--wot-out" => wot_out = Some(PathBuf::from(it.next().ok_or("--wot-out value")?)),
                 "--no-wot-out" => wot_out = None,
-                "--wot-refresh-every" => wot_refresh_every = it.next().ok_or("--wot-refresh-every value")?.parse().map_err(|_| "bad wot-refresh-every")?,
-                "--heap-mb" => heap_mb = it.next().ok_or("--heap-mb value")?.parse().map_err(|_| "bad heap")?,
-                "--commit-docs" => commit_docs = it.next().ok_or("--commit-docs value")?.parse().map_err(|_| "bad commit-docs")?,
-                "--parallelism" => parallelism = it.next().ok_or("--parallelism value")?.parse().map_err(|_| "bad parallelism")?,
-                "--chunk-size" => chunk_size = it.next().ok_or("--chunk-size value")?.parse().map_err(|_| "bad chunk-size")?,
+                "--wot-refresh-every" => {
+                    wot_refresh_every = it
+                        .next()
+                        .ok_or("--wot-refresh-every value")?
+                        .parse()
+                        .map_err(|_| "bad wot-refresh-every")?
+                }
+                "--heap-mb" => {
+                    heap_mb = it
+                        .next()
+                        .ok_or("--heap-mb value")?
+                        .parse()
+                        .map_err(|_| "bad heap")?
+                }
+                "--commit-docs" => {
+                    commit_docs = it
+                        .next()
+                        .ok_or("--commit-docs value")?
+                        .parse()
+                        .map_err(|_| "bad commit-docs")?
+                }
+                "--parallelism" => {
+                    parallelism = it
+                        .next()
+                        .ok_or("--parallelism value")?
+                        .parse()
+                        .map_err(|_| "bad parallelism")?
+                }
+                "--chunk-size" => {
+                    chunk_size = it
+                        .next()
+                        .ok_or("--chunk-size value")?
+                        .parse()
+                        .map_err(|_| "bad chunk-size")?
+                }
                 "--no-dedupe" => dedupe = false,
-                "--max-open-shards" => max_open_shards = it.next().ok_or("--max-open-shards value")?.parse().map_err(|_| "bad max-open-shards")?,
-                "--writer-threads" => writer_threads = it.next().ok_or("--writer-threads value")?.parse().map_err(|_| "bad writer-threads")?,
+                "--max-open-shards" => {
+                    max_open_shards = it
+                        .next()
+                        .ok_or("--max-open-shards value")?
+                        .parse()
+                        .map_err(|_| "bad max-open-shards")?
+                }
+                "--writer-threads" => {
+                    writer_threads = it
+                        .next()
+                        .ok_or("--writer-threads value")?
+                        .parse()
+                        .map_err(|_| "bad writer-threads")?
+                }
                 "--no-sort" => sort_batches = false,
                 "-h" | "--help" => {
                     println!("{}", help());
@@ -178,7 +228,9 @@ fn main() -> anyhow::Result<()> {
     };
     let pipeline = Arc::new(Mutex::new(Pipeline::new(cfg)?));
 
-    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
     rt.block_on(run(args, pipeline))
 }
 
@@ -224,15 +276,14 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
         let id_store_sig = id_store.clone();
         let pending_sig = pending_ids.clone();
         tokio::spawn(async move {
-            let mut term = match tokio::signal::unix::signal(
-                tokio::signal::unix::SignalKind::terminate(),
-            ) {
-                Ok(t) => t,
-                Err(e) => {
-                    tracing::warn!(error = %e, "no SIGTERM handler");
-                    return;
-                }
-            };
+            let mut term =
+                match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "no SIGTERM handler");
+                        return;
+                    }
+                };
             term.recv().await;
             tracing::warn!("SIGTERM received; flushing index and stats before exit");
             let store = id_store_sig.clone();
@@ -277,39 +328,43 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
         });
 
         let stage_pipe = pipeline.clone();
-        std::thread::spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(5));
-            let done = total_prog.load(Ordering::Relaxed);
-            let stages = stage_pipe
-                .try_lock()
-                .map(|p| {
-                    let (st, ix) = p.stage_secs();
-                    format!("  stats={st:.0}s index={ix:.0}s")
-                })
-                .unwrap_or_default();
-            if done > 0 {
-                let rate = done as f64 / started.elapsed().as_secs_f64();
-                let (rss, peak) = nostrsearch_indexer::mem::rss_mb();
-                // cgroup usage, not RSS, is what the OOM killer measures: it
-                // includes page cache, which heavy dump reads and index writes
-                // fill even while RSS stays flat.
-                let cg = nostrsearch_indexer::mem::cgroup_usage_mb()
-                    .map(|(cur, anon, file)| {
-                        let pct = limit_mb
-                            .map(|l| format!(" {:.0}% of {}MB", cur as f64 / l as f64 * 100.0, l))
-                            .unwrap_or_default();
-                        let d = nostrsearch_indexer::mem::cgroup_dirty_mb()
-                            .map(|(dirty, wb, slab)| {
-                                format!(" dirty={dirty}MB wb={wb}MB slab={slab}MB")
-                            })
-                            .unwrap_or_default();
-                        format!("  cgroup={cur}MB (anon={anon}MB cache={file}MB{d}){pct}")
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let done = total_prog.load(Ordering::Relaxed);
+                let stages = stage_pipe
+                    .try_lock()
+                    .map(|p| {
+                        let (st, ix) = p.stage_secs();
+                        format!("  stats={st:.0}s index={ix:.0}s")
                     })
                     .unwrap_or_default();
-                eprintln!(
-                    "  processed={done}  rate={rate:.0}/s  elapsed={:.0}s{stages}  rss={rss}MB peak={peak}MB{cg}",
-                    started.elapsed().as_secs_f64()
-                );
+                if done > 0 {
+                    let rate = done as f64 / started.elapsed().as_secs_f64();
+                    let (rss, peak) = nostrsearch_indexer::mem::rss_mb();
+                    // cgroup usage, not RSS, is what the OOM killer measures: it
+                    // includes page cache, which heavy dump reads and index writes
+                    // fill even while RSS stays flat.
+                    let cg = nostrsearch_indexer::mem::cgroup_usage_mb()
+                        .map(|(cur, anon, file)| {
+                            let pct = limit_mb
+                                .map(|l| {
+                                    format!(" {:.0}% of {}MB", cur as f64 / l as f64 * 100.0, l)
+                                })
+                                .unwrap_or_default();
+                            let d = nostrsearch_indexer::mem::cgroup_dirty_mb()
+                                .map(|(dirty, wb, slab)| {
+                                    format!(" dirty={dirty}MB wb={wb}MB slab={slab}MB")
+                                })
+                                .unwrap_or_default();
+                            format!("  cgroup={cur}MB (anon={anon}MB cache={file}MB{d}){pct}")
+                        })
+                        .unwrap_or_default();
+                    eprintln!(
+                        "  processed={done}  rate={rate:.0}/s  elapsed={:.0}s{stages}  rss={rss}MB peak={peak}MB{cg}",
+                        started.elapsed().as_secs_f64()
+                    );
+                }
             }
         });
     }
@@ -320,14 +375,14 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
             anyhow::bail!("--input-dir {} is not a directory", input_dir.display());
         }
         let parallelism = if args.parallelism == 0 {
-            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
         } else {
             args.parallelism
         };
         tracing::info!(dir = %input_dir.display(), parallelism, "starting archive backfill");
 
-        let pipe = pipeline.clone();
-        let total_cb = total.clone();
         let chunk_size = args.chunk_size;
         let sort_batches = args.sort_batches;
 
@@ -343,8 +398,7 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
             let pending = pending_ids.clone();
             let pipe_ck = pipeline.clone();
             tokio::spawn(async move {
-                let mut tick =
-                    tokio::time::interval(std::time::Duration::from_secs(60));
+                let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
                 tick.tick().await; // skip immediate fire
                 loop {
                     tick.tick().await;
@@ -370,49 +424,93 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
             });
         }
 
-        let ck_store = id_store.clone();
-        let ck_pending = pending_ids.clone();
-        tokio::task::spawn_blocking(move || {
-            let cursor = NostrCursor::new(input_dir).with_parallelism(parallelism);
-            cursor.walk_with_chunked_sync(
-                move |events: Vec<nostr_archive_cursor::NostrEventBorrowed>| {
-                    let mut batch: Vec<NostrEvent> = events.iter().map(to_core).collect();
-                    // Group each chunk by time so events land shard-by-shard.
-                    // Archives are not necessarily date-ordered, and writing in
-                    // arbitrary month order thrashes the open-shard set: each
-                    // switch can evict a writer that is needed again a moment
-                    // later, paying a commit + fsync every time.
-                    if sort_batches {
-                        batch.sort_unstable_by_key(|e| e.created_at);
-                    }
-                    let mut p = pipe.lock().unwrap();
-                    match &ck_store {
-                        Some(store) => {
-                            let mut pending = ck_pending.lock().unwrap();
-                            let mut n = 0u64;
-                            for ev in &batch {
-                                let Some(id) = hex32(&ev.id) else { continue };
-                                if store.contains(&id) {
-                                    continue;
-                                }
-                                p.process(ev);
-                                pending.push(id);
-                                n += 1;
-                            }
-                            total_cb.fetch_add(n, Ordering::Relaxed);
-                        }
-                        None => {
-                            for ev in &batch {
-                                p.process(ev);
-                            }
-                            total_cb.fetch_add(batch.len() as u64, Ordering::Relaxed);
-                        }
-                    }
-                },
-                chunk_size,
+        // Analyses that depend on another analysis's results (the activity and
+        // active-user reports read follower/WoT data from `follow_graph`)
+        // cannot be folded in the same pass that produces those results: on a
+        // cold corpus the world is still empty, so every author would look
+        // untrusted. Replay the archive once per dependency stage instead —
+        // the streaming equivalent of the staged in-memory runner. Only pass 0
+        // indexes; later passes exist purely to feed the dependent analyses.
+        let passes = pipeline.lock().unwrap().backfill_passes();
+        if passes > 1 {
+            tracing::info!(
+                passes,
+                "archive will be replayed once per dependency stage; only pass 0 indexes"
             );
-        })
-        .await?;
+        }
+
+        loop {
+            let pass = pipeline.lock().unwrap().current_pass();
+            let indexing_pass = pass == 0;
+            tracing::info!(
+                pass,
+                passes,
+                indexing = indexing_pass,
+                "archive pass starting"
+            );
+
+            let pipe = pipeline.clone();
+            let total_cb = total.clone();
+            let input_dir = input_dir.clone();
+            // The id store records what has been *indexed*. Later passes must see
+            // those same events again, so the dedupe gate applies to pass 0 only.
+            let ck_store = if indexing_pass {
+                id_store.clone()
+            } else {
+                None
+            };
+            let ck_pending = pending_ids.clone();
+            tokio::task::spawn_blocking(move || {
+                let cursor = NostrCursor::new(input_dir).with_parallelism(parallelism);
+                cursor.walk_with_chunked_sync(
+                    move |events: Vec<nostr_archive_cursor::NostrEventBorrowed>| {
+                        let mut batch: Vec<NostrEvent> = events.iter().map(to_core).collect();
+                        // Group each chunk by time so events land shard-by-shard.
+                        // Archives are not necessarily date-ordered, and writing in
+                        // arbitrary month order thrashes the open-shard set: each
+                        // switch can evict a writer that is needed again a moment
+                        // later, paying a commit + fsync every time.
+                        if sort_batches {
+                            batch.sort_unstable_by_key(|e| e.created_at);
+                        }
+                        let mut p = pipe.lock().unwrap();
+                        match &ck_store {
+                            Some(store) => {
+                                let mut pending = ck_pending.lock().unwrap();
+                                let mut n = 0u64;
+                                for ev in &batch {
+                                    let Some(id) = hex32(&ev.id) else { continue };
+                                    if store.contains(&id) {
+                                        continue;
+                                    }
+                                    p.process(ev);
+                                    pending.push(id);
+                                    n += 1;
+                                }
+                                total_cb.fetch_add(n, Ordering::Relaxed);
+                            }
+                            None => {
+                                for ev in &batch {
+                                    p.process(ev);
+                                }
+                                // Later passes replay already-counted events.
+                                if indexing_pass {
+                                    total_cb.fetch_add(batch.len() as u64, Ordering::Relaxed);
+                                }
+                            }
+                        }
+                    },
+                    chunk_size,
+                );
+            })
+            .await?;
+
+            // Materialize this stage into the world so the next pass's
+            // consumers can read it; stop when every stage has folded.
+            if !pipeline.lock().unwrap().advance_pass() {
+                break;
+            }
+        }
 
         // finalize backfill and (if no firehose) commit + exit
         pipeline.lock().unwrap().go_live();
@@ -487,7 +585,11 @@ fn to_core(ev: &nostr_archive_cursor::NostrEventBorrowed) -> NostrEvent {
         pubkey: ev.pubkey.to_string(),
         created_at: ev.created_at,
         kind: ev.kind as u16,
-        tags: ev.tags.iter().map(|t| t.iter().map(|s| s.to_string()).collect()).collect(),
+        tags: ev
+            .tags
+            .iter()
+            .map(|t| t.iter().map(|s| s.to_string()).collect())
+            .collect(),
         content: ev.content.to_string(),
         sig: ev.sig.to_string(),
     }

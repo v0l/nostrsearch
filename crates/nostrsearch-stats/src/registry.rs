@@ -31,6 +31,7 @@ pub trait DynAnalysis: Send + Sync {
     fn contribute(&self, world: &mut World);
     fn merge_dyn(&mut self, other: Box<dyn DynAnalysis>) -> Result<(), Box<dyn DynAnalysis>>;
     fn snapshot_json(&self) -> serde_json::Value;
+    fn drain_delta_json(&mut self) -> Option<serde_json::Value>;
     fn checkpoint_bin(&self) -> Result<Vec<u8>>;
     fn restore_bin(&mut self, bytes: &[u8]) -> Result<()>;
     fn into_any(self: Box<Self>) -> Box<dyn Any>;
@@ -78,6 +79,9 @@ where
     }
     fn snapshot_json(&self) -> serde_json::Value {
         serde_json::to_value(Analysis::snapshot(self)).unwrap_or(serde_json::Value::Null)
+    }
+    fn drain_delta_json(&mut self) -> Option<serde_json::Value> {
+        Analysis::drain_delta(self)
     }
     fn checkpoint_bin(&self) -> Result<Vec<u8>> {
         Ok(bincode::serialize(self)?)
@@ -208,7 +212,11 @@ impl Registry {
 
     pub fn persist(&self, store: &StatStore) -> Result<()> {
         for e in &self.entries {
-            store.save(e.analysis.name(), &e.analysis.checkpoint_bin()?, &e.progress)?;
+            store.save(
+                e.analysis.name(),
+                &e.analysis.checkpoint_bin()?,
+                &e.progress,
+            )?;
         }
         Ok(())
     }
@@ -321,16 +329,39 @@ impl Registry {
     /// analyses still needing backfill. The watermark tracks the max
     /// `created_at` seen so the live tail can resume after it.
     ///
-    /// NOTE: single-pass, so it correctly serves only **independent / stage-0**
-    /// producers (e.g. the WoT producers). Analyses that depend on another
-    /// analysis's completed `World` need the staged multipass runner.
+    /// Feeds **every** analysis, so it is correct on its own only for
+    /// independent / stage-0 producers. Analyses that depend on another
+    /// analysis's completed `World` must be driven one stage per pass with
+    /// [`observe_backfill_stage`](Registry::observe_backfill_stage).
     pub fn observe_backfill(&mut self, ev: &NostrEvent, now: u64, world: &World) {
+        let all: Vec<usize> = (0..self.entries.len()).collect();
+        self.observe_backfill_stage(&all, ev, now, world);
+    }
+
+    /// Unordered-backfill fold restricted to the entries in `stage`.
+    ///
+    /// This is the streaming counterpart of [`backfill_in_memory`]'s staged
+    /// passes: the caller replays the corpus once per stage, so that by the
+    /// time stage *n* folds, every stage below it has finished and
+    /// `contribute`d to `world`. Without this, a consumer like the daily
+    /// activity report reads an empty `World` on a cold backfill and silently
+    /// records every author as untrusted.
+    ///
+    /// [`backfill_in_memory`]: crate::run::backfill_in_memory
+    pub fn observe_backfill_stage(
+        &mut self,
+        stage: &[usize],
+        ev: &NostrEvent,
+        now: u64,
+        world: &World,
+    ) {
         let (author, id) = match (Hash32::from_hex(&ev.pubkey), Hash32::from_hex(&ev.id)) {
             (Some(a), Some(i)) => (a, i),
             _ => return,
         };
         let mut touched = false;
-        for e in &mut self.entries {
+        for &i in stage {
+            let e = &mut self.entries[i];
             // An analysis still doing its initial scan folds everything: the
             // archive is unordered, so the watermark rule would drop earlier
             // events as soon as a later one bumped the mark.
@@ -417,6 +448,26 @@ impl Registry {
                 self.emit(&MetricsEvent::BackfillComplete { name });
             }
         }
+    }
+
+    /// Drain every analysis's pending partial changes.
+    ///
+    /// Returns only the analyses that both support deltas and actually changed,
+    /// so an idle pipeline produces an empty vec (and therefore no dashboard
+    /// traffic). Destructive: see [`crate::delta`] for the contract.
+    pub fn drain_deltas(&mut self) -> Vec<crate::delta::ReportDelta> {
+        self.entries
+            .iter_mut()
+            .filter_map(|e| {
+                let name = e.analysis.name();
+                e.analysis
+                    .drain_delta_json()
+                    .map(|patch| crate::delta::ReportDelta {
+                        name: name.to_string(),
+                        patch,
+                    })
+            })
+            .collect()
     }
 
     pub fn snapshots(&self) -> Vec<(&'static str, serde_json::Value)> {

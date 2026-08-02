@@ -41,6 +41,16 @@ pub fn router_full(
     archive: Option<crate::archive::ArchiveState>,
     relay: Option<crate::relay::RelayState>,
 ) -> Router {
+    router_all(state, archive, relay, None)
+}
+
+/// Everything, plus the analysis reports published by the writer task.
+pub fn router_all(
+    state: SharedState,
+    archive: Option<crate::archive::ArchiveState>,
+    relay: Option<crate::relay::RelayState>,
+    reports: Option<crate::reports::ReportStore>,
+) -> Router {
     let mut app = Router::new()
         .route("/search", get(search_get).post(search_post))
         .route("/event/{id}", get(get_event))
@@ -52,14 +62,15 @@ pub fn router_full(
         app = app.nest("/archive", crate::archive::router(a));
     }
 
+    if let Some(r) = reports {
+        app = app.nest("/reports", crate::reports::router(r));
+    }
+
     if let Some(r) = relay {
         // Nostr relays live at the root path; a websocket upgrade here is
         // handed to LocalRelay, anything else falls through to the archive
         // index page (or 400 if archive serving is off).
-        app = app.route(
-            "/",
-            get(crate::relay::ws_handler).with_state(r),
-        );
+        app = app.route("/", get(crate::relay::ws_handler).with_state(r));
     }
 
     app.layer(tower_http::cors::CorsLayer::permissive())
@@ -199,10 +210,7 @@ impl From<SearchFilterDto> for SearchFilter {
     }
 }
 
-fn run_search(
-    state: SharedState,
-    filter: SearchFilter,
-) -> Result<Json<Vec<SearchHit>>, ApiError> {
+fn run_search(state: SharedState, filter: SearchFilter) -> Result<Json<Vec<SearchHit>>, ApiError> {
     let mut reg = state.registry.lock().map_err(|_| ApiError::Poisoned)?;
     let hits = reg.search(&filter).map_err(ApiError::Registry)?;
     Ok(Json(hits))

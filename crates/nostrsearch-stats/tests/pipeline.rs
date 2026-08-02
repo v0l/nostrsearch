@@ -1,12 +1,10 @@
 //! End-to-end: dependency staging, publisher filtering, additive backfill,
 //! resumable binary persistence, and realtime metrics emission.
 
+use nostrsearch_core::event::NostrEvent;
 use nostrsearch_stats::analyses::{FollowGraph, KindBreakdown, Pagerank};
 use nostrsearch_stats::metrics::MetricsEvent;
-use nostrsearch_stats::{
-    BufferObserver, PublisherFilter, Registry, StatStore, backfill_in_memory,
-};
-use nostrsearch_core::event::NostrEvent;
+use nostrsearch_stats::{BufferObserver, PublisherFilter, Registry, StatStore, backfill_in_memory};
 use std::sync::Arc;
 
 fn pk(seed: u8) -> String {
@@ -75,10 +73,17 @@ fn dependency_staging_publisher_filter_and_metrics() {
     assert!(refreshed, "pagerank should have emitted a Refreshed event");
 
     // an initial Snapshot was emitted, and metrics show throughput + filtering
-    assert!(matches!(obs.recent().first(), Some(MetricsEvent::Snapshot(_))));
+    assert!(matches!(
+        obs.recent().first(),
+        Some(MetricsEvent::Snapshot(_))
+    ));
     let m = reg.metrics(world.len());
     assert!(m.total_events > 0);
-    let kbm = m.analyses.iter().find(|a| a.name == "kind_breakdown").unwrap();
+    let kbm = m
+        .analyses
+        .iter()
+        .find(|a| a.name == "kind_breakdown")
+        .unwrap();
     assert_eq!(kbm.consumed, 3, "only star's 3 notes cleared the filter");
     // 10 kind-3 authors (0 followers) + nobody's 2 notes are all filtered.
     assert_eq!(kbm.filtered, 12);
@@ -182,7 +187,13 @@ fn rerunning_backfill_over_newer_events_still_updates_stats() {
     // Round 2: a later dump adds 5 more followers for `star`.
     let mut later = Vec::new();
     for i in 10..15u8 {
-        later.push(ev(&id(500 + i as u16), &pk(i), 3, 1_000 + i as u64, &[pk(200)]));
+        later.push(ev(
+            &id(500 + i as u16),
+            &pk(i),
+            3,
+            1_000 + i as u64,
+            &[pk(200)],
+        ));
     }
 
     let mut reg = Registry::new();

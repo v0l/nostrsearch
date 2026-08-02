@@ -15,6 +15,7 @@
 //! | `WOT_REFRESH_EVERY` | events between WoT rebuilds | `100000` |
 //! | `WOT_MIN_REFRESH_SECS` | wall-clock floor between rebuilds | `60` |
 //! | `STATS_PERSIST_SECS` | analysis-state persist cadence | `300` |
+
 //!
 //! Defaults are CWD-relative so the binaries work from a checkout; the
 //! container image overrides them to absolute paths under the data volume,

@@ -15,7 +15,7 @@
 use crate::shard_writer::{ShardManager, ShardWriterConfig};
 use anyhow::Result;
 use nostrsearch_core::event::NostrEvent;
-use nostrsearch_stats::analyses::{FollowGraph, Pagerank};
+use nostrsearch_stats::analyses::{ActiveUsers, Activity, Clients, FollowGraph, Pagerank};
 use nostrsearch_stats::{Registry, SharedWot, StatStore, World, WotIndex};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -65,6 +65,11 @@ pub struct Pipeline {
     store: Option<StatStore>,
     cfg: PipelineConfig,
     live: bool,
+    /// Dependency stages, computed once at construction. A streaming backfill
+    /// must replay the corpus once per stage (see [`Pipeline::advance_pass`]).
+    stages: Vec<Vec<usize>>,
+    /// Which stage the current backfill pass is folding.
+    pass: usize,
     since_refresh: u64,
     last_refresh: Instant,
     last_persist: Instant,
@@ -89,6 +94,15 @@ impl Pipeline {
             .register(FollowGraph::default())
             .register(Pagerank::default());
 
+        // Dashboard reports (ported from nostr-dashboard). Activity,
+        // `Clients` is independent (stage 0). `Activity` and `ActiveUsers`
+        // read follower/WoT data for their trusted/untrusted split, so they
+        // depend on `follow_graph` and fold in a later pass.
+        registry
+            .register(Activity::default())
+            .register(ActiveUsers::default())
+            .register(Clients::default());
+
         let store = match &cfg.state_dir {
             Some(dir) => {
                 let s = StatStore::new(dir)?;
@@ -98,6 +112,8 @@ impl Pipeline {
             None => None,
         };
 
+        let stages = registry.stages()?;
+
         let mut me = Self {
             manager,
             registry,
@@ -106,6 +122,8 @@ impl Pipeline {
             store,
             cfg,
             live: false,
+            stages,
+            pass: 0,
             since_refresh: 0,
             // Allow the first refresh immediately.
             last_refresh: Instant::now() - Duration::from_secs(86_400),
@@ -119,7 +137,8 @@ impl Pipeline {
         // WoT lookup is populated from event #1. Without this, everything
         // indexed before the first scheduled refresh would be written with
         // tier 0 even though we already know the trust graph.
-        if me.registry.total_events() > 0 || me.registry.entries().iter().any(|e| !e.needs_backfill())
+        if me.registry.total_events() > 0
+            || me.registry.entries().iter().any(|e| !e.needs_backfill())
         {
             me.refresh_wot();
             tracing::info!("warm start: WoT materialized from restored analysis state");
@@ -139,6 +158,19 @@ impl Pipeline {
         self.wot.clone()
     }
 
+    /// Current snapshot of every registered analysis, as `(name, json)`.
+    /// Used to publish reports to the HTTP layer.
+    pub fn reports(&self) -> Vec<(&'static str, serde_json::Value)> {
+        self.registry.snapshots()
+    }
+
+    /// Drain each analysis's partial changes since the last call, for streaming
+    /// to a live dashboard. Empty when nothing moved. See
+    /// [`nostrsearch_stats::delta`] for the merge-patch contract.
+    pub fn drain_report_deltas(&mut self) -> Vec<nostrsearch_stats::ReportDelta> {
+        self.registry.drain_deltas()
+    }
+
     fn now() -> u64 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -152,12 +184,23 @@ impl Pipeline {
         let now = Self::now();
         let t0 = Instant::now();
         if self.live {
+            // Live tail: the world is already materialized, so one pass feeds
+            // every stage.
             self.registry.observe(ev, now, &self.world);
         } else {
-            self.registry.observe_backfill(ev, now, &self.world);
+            // Backfill: fold only the stage this pass is responsible for, so
+            // consumers never read a half-built world.
+            let stage = std::mem::take(&mut self.stages[self.pass]);
+            self.registry
+                .observe_backfill_stage(&stage, ev, now, &self.world);
+            self.stages[self.pass] = stage;
         }
         let t1 = Instant::now();
-        if let Err(e) = self.manager.index_event(ev) {
+        // Index exactly once. Later backfill passes replay the same events
+        // purely to feed dependent analyses.
+        if (self.live || self.pass == 0)
+            && let Err(e) = self.manager.index_event(ev)
+        {
             tracing::warn!(error = %e, "index_event failed");
         }
         self.stats_ns += (t1 - t0).as_nanos() as u64;
@@ -229,8 +272,10 @@ impl Pipeline {
         // Persisting serializes the entire follow/pagerank graph — far more
         // expensive than the above — so it runs on its own cadence.
         let mut persist_ms = 0;
-        if let Some(store) = &self.store {
-            if force_persist || self.last_persist.elapsed() >= self.cfg.persist_interval {
+        if let Some(store) = &self.store
+            && (force_persist || self.last_persist.elapsed() >= self.cfg.persist_interval)
+        {
+            {
                 let t1 = Instant::now();
                 if let Err(e) = self.registry.persist(store) {
                     tracing::warn!(error = %e, "stats persist failed");
@@ -247,6 +292,54 @@ impl Pipeline {
             persist_ms,
             "WoT refreshed"
         );
+    }
+
+    /// Number of times a streaming backfill must replay the corpus — one pass
+    /// per dependency stage. With the default analysis set this is 2: the WoT
+    /// producers and client stats fold in pass 0, then the reports that read
+    /// follower/WoT data fold in pass 1.
+    pub fn backfill_passes(&self) -> usize {
+        self.stages.len()
+    }
+
+    /// Which stage the current backfill pass is folding (0-based).
+    pub fn current_pass(&self) -> usize {
+        self.pass
+    }
+
+    /// Whether the events indexed so far still need replaying for a later
+    /// stage. `false` once every stage has folded.
+    pub fn needs_another_pass(&self) -> bool {
+        self.pass + 1 < self.stages.len()
+    }
+
+    /// Finish the current backfill pass: materialize the stage that just
+    /// completed into the [`World`] (so the next stage's consumers can read
+    /// its follower counts / WoT tiers), mark it backfilled, and advance.
+    ///
+    /// Returns `true` if another pass over the corpus is required.
+    pub fn advance_pass(&mut self) -> bool {
+        let stage = self.stages[self.pass].clone();
+        let now_wall = Self::now();
+        self.registry
+            .materialize_stage(&stage, now_wall, &mut self.world);
+        self.registry.mark_backfilled(&stage);
+
+        // Publish the freshly materialized trust data to the index writer too,
+        // so a later pass (and the live tail) score with real tiers.
+        self.wot.replace(WotIndex::from_world(&self.world));
+
+        if !self.needs_another_pass() {
+            return false;
+        }
+        self.pass += 1;
+        tracing::info!(
+            pass = self.pass,
+            passes = self.stages.len(),
+            world = self.world.len(),
+            "backfill advancing to next dependency stage"
+        );
+        true
     }
 
     /// Switch from backfill to live mode: finalize backfill, refresh WoT once,

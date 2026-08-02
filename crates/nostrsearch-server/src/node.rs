@@ -109,6 +109,18 @@ pub fn spawn_writer(
     queue_size: usize,
     commit_every: std::time::Duration,
 ) -> anyhow::Result<(EventSink, WriterHandle)> {
+    spawn_writer_with_reports(cfg, queue_size, commit_every, None)
+}
+
+/// As [`spawn_writer`], but also publishes analysis snapshots into `reports`
+/// on each commit tick so the HTTP layer can serve them without touching the
+/// pipeline (which this task owns exclusively).
+pub fn spawn_writer_with_reports(
+    cfg: PipelineConfig,
+    queue_size: usize,
+    commit_every: std::time::Duration,
+    reports: Option<crate::reports::ReportStore>,
+) -> anyhow::Result<(EventSink, WriterHandle)> {
     let mut pipeline = Pipeline::new(cfg)?;
     // Live tail semantics: everything from here on is realtime.
     pipeline.go_live();
@@ -120,6 +132,14 @@ pub fn spawn_writer(
         let mut tick = tokio::time::interval(commit_every);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         tick.tick().await; // consume the immediate first tick
+
+        // Deltas stream far more often than commits: they are cheap (only what
+        // changed) and their whole point is to make the dashboard move in
+        // something close to realtime, which a 30s commit cadence cannot do.
+        let mut delta_tick = tokio::time::interval(DELTA_INTERVAL);
+        delta_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        delta_tick.tick().await;
+
         let mut dirty = false;
 
         loop {
@@ -139,7 +159,14 @@ pub fn spawn_writer(
                         if let Err(e) = pipeline.commit() {
                             tracing::warn!(error = %e, "commit failed");
                         }
+                        publish_reports(&pipeline, reports.as_ref());
                         dirty = false;
+                    }
+                }
+                _ = delta_tick.tick() => {
+                    if let Some(store) = reports.as_ref() {
+                        let deltas = pipeline.drain_report_deltas();
+                        store.apply_deltas(unix_now(), deltas);
                     }
                 }
                 _ = sd_rx.changed() => {
@@ -159,10 +186,36 @@ pub fn spawn_writer(
         if let Err(e) = pipeline.finish() {
             tracing::warn!(error = %e, "final flush failed");
         }
+        publish_reports(&pipeline, reports.as_ref());
         tracing::info!("writer task stopped (flushed)");
     });
 
-    Ok((EventSink(tx), WriterHandle { shutdown: sd_tx, join }))
+    Ok((
+        EventSink(tx),
+        WriterHandle {
+            shutdown: sd_tx,
+            join,
+        },
+    ))
+}
+
+/// How often the writer drains partial report changes for the live stream.
+const DELTA_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Copy the pipeline's current analysis snapshots into the shared store.
+///
+/// Publishing replaces wholesale, so it also clears any drift accumulated by
+/// incremental patches between commits.
+fn publish_reports(pipeline: &Pipeline, reports: Option<&crate::reports::ReportStore>) {
+    let Some(store) = reports else { return };
+    store.publish(unix_now(), pipeline.reports());
 }
 
 /// Nostr database for the relay: archives to the corpus **and** forwards to the
@@ -275,7 +328,9 @@ async fn run_firehose(
         .collect();
 
     loop {
-        let filter = Filter::default().kinds(kinds.clone()).since(Timestamp::now());
+        let filter = Filter::default()
+            .kinds(kinds.clone())
+            .since(Timestamp::now());
         if let Err(e) = client.subscribe(filter, None).await {
             tracing::error!(error = %e, "firehose subscribe failed; retrying in 5s");
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -285,9 +340,7 @@ async fn run_firehose(
         let mut rx = client.notifications();
         loop {
             match rx.recv().await {
-                Ok(RelayPoolNotification::Event { event, .. }) => {
-                    sink.send(to_core(&event)).await
-                }
+                Ok(RelayPoolNotification::Event { event, .. }) => sink.send(to_core(&event)).await,
                 Ok(RelayPoolNotification::Shutdown) => return Ok(()),
                 Ok(_) => {}
                 Err(_) => break,

@@ -22,6 +22,7 @@
 
 pub mod analyses;
 pub mod ctx;
+pub mod delta;
 pub mod graph;
 pub mod metrics;
 pub mod progress;
@@ -31,7 +32,8 @@ pub mod store;
 pub mod types;
 pub mod wot;
 
-pub use ctx::{AnalysisCtx, PublisherFilter, PubkeyStat, World};
+pub use ctx::{AnalysisCtx, PubkeyStat, PublisherFilter, World};
+pub use delta::{ReportDelta, merge_patch};
 pub use graph::{GraphStore, SharedGraph};
 pub use metrics::{
     AnalysisMetrics, BufferObserver, MetricsEvent, MetricsObserver, NullObserver, Phase,
@@ -135,6 +137,26 @@ pub trait Analysis: Send + Sync {
 
     /// Snapshot the current typed result for serving.
     fn snapshot(&self) -> Self::Output;
+
+    /// Drain the changes accumulated since the previous call, as a JSON merge
+    /// patch over this analysis's [`snapshot`](Analysis::snapshot) shape.
+    ///
+    /// This is what lets a dashboard show numbers moving in realtime instead
+    /// of re-fetching a whole report: the pipeline drains deltas on a short
+    /// cadence and streams them to subscribers, who
+    /// [`merge_patch`](crate::merge_patch) them into the snapshot they hold.
+    ///
+    /// Each impl chooses its own granularity — the activity report emits only
+    /// the day buckets it touched, the client report only the clients that
+    /// published. Returning `None` (the default) means "no incremental view";
+    /// consumers then just poll [`snapshot`](Analysis::snapshot).
+    ///
+    /// Implementors must reset their dirty set here: draining twice with no
+    /// intervening [`observe`](Analysis::observe) returns `None` the second
+    /// time. See [`delta`](crate::delta) for the full contract.
+    fn drain_delta(&mut self) -> Option<serde_json::Value> {
+        None
+    }
 
     /// Does this analysis want to see `ev`? (honours [`kinds`](Analysis::kinds).)
     fn wants(&self, ev: &NostrEvent) -> bool {

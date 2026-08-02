@@ -26,7 +26,9 @@ use nostrsearch_indexer::env;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    rustls::crypto::ring::default_provider().install_default().ok();
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -48,7 +50,7 @@ async fn main() -> anyhow::Result<()> {
     if soft < 8192 {
         tracing::warn!(
             nofile_soft = soft,
-            "low descriptor limit; raise the container runtime's hard limit (LimitNOFILE / --ulimit nofile)"
+            "low descriptor limit; raise the container's hard limit (LimitNOFILE / --ulimit nofile)"
         );
     }
 
@@ -85,6 +87,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── Writer task: single owner of the Pipeline (index + stats + WoT) ─────
+    // Reports are published from the writer into this store; a read-only node
+    // leaves it empty (and `/reports` reports generated_at = 0).
+    let reports = nostrsearch_server::reports::ReportStore::new();
     let mut writer_handle = None;
     let sink = if is_writer {
         let cfg = PipelineConfig {
@@ -99,10 +104,11 @@ async fn main() -> anyhow::Result<()> {
             persist_interval: env::persist_interval(),
             wot_out: Some(env::wot_out()),
         };
-        let (sink, handle) = nostrsearch_server::spawn_writer(
+        let (sink, handle) = nostrsearch_server::node::spawn_writer_with_reports(
             cfg,
             10_000,
             std::time::Duration::from_secs(30),
+            Some(reports.clone()),
         )?;
         writer_handle = Some(handle);
         Some(sink)
@@ -135,7 +141,10 @@ async fn main() -> anyhow::Result<()> {
     // ── Firehose: shares the same archive handle and writer task ────────────
     if want_firehose {
         if let Some(sink) = &sink {
-            let db = archive.as_ref().and_then(|a| a.db.as_ref()).map(|d| (**d).clone());
+            let db = archive
+                .as_ref()
+                .and_then(|a| a.db.as_ref())
+                .map(|d| (**d).clone());
             tracing::info!(
                 relays = relays.len(),
                 archiving = db.is_some(),
@@ -175,7 +184,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let app = nostrsearch_server::http::router_full(state, archive, relay);
+    let app = nostrsearch_server::http::router_all(state, archive, relay, Some(reports));
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(bind = %bind, "nostrsearch node listening");
     axum::serve(

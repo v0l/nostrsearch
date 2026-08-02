@@ -2,22 +2,14 @@
 //! via a [`PublisherFilter`] — when set it depends on `follow_graph` so
 //! follower/WoT data is materialized first.
 
+use super::counter::TrustedCount;
 use crate::{Analysis, AnalysisCtx, PublisherFilter};
 use nostrsearch_core::event::NostrEvent;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
-pub struct KindCount {
-    pub trusted: u64,
-    pub untrusted: u64,
-}
-
-impl KindCount {
-    pub fn total(&self) -> u64 {
-        self.trusted + self.untrusted
-    }
-}
+/// Per-kind trusted/untrusted counts. Alias of the shared [`TrustedCount`].
+pub type KindCount = TrustedCount;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct KindBreakdown {
@@ -52,25 +44,21 @@ impl Analysis for KindBreakdown {
     }
 
     fn observe(&mut self, ev: &NostrEvent, ctx: &AnalysisCtx) -> bool {
-        if let Some(f) = &self.filter {
-            if !f.allows(ctx) {
-                return false; // filtered out (reported in metrics)
-            }
+        if let Some(f) = &self.filter
+            && !f.allows(ctx)
+        {
+            return false; // filtered out (reported in metrics)
         }
-        let c = self.counts.entry(ev.kind).or_default();
-        if ctx.author_trusted() {
-            c.trusted += 1;
-        } else {
-            c.untrusted += 1;
-        }
+        self.counts
+            .entry(ev.kind)
+            .or_default()
+            .incr(ctx.author_trusted(), 1);
         true
     }
 
     fn merge(&mut self, other: Self) {
         for (kind, oc) in other.counts {
-            let c = self.counts.entry(kind).or_default();
-            c.trusted += oc.trusted;
-            c.untrusted += oc.untrusted;
+            self.counts.entry(kind).or_default().merge(oc);
         }
     }
 

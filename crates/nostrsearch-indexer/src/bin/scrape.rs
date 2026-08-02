@@ -13,7 +13,7 @@
 use nostrsearch_core::event::NostrEvent;
 use nostrsearch_indexer::id_store::IdStore;
 use nostrsearch_indexer::scrape::{
-    discover_relays, normalize_relay_url, parse_date, RelayInfo, ScrapeConfig, ScrapeState, Sink,
+    RelayInfo, ScrapeConfig, ScrapeState, Sink, discover_relays, normalize_relay_url, parse_date,
 };
 use nostrsearch_indexer::{Pipeline, PipelineConfig, ShardWriterConfig};
 use std::collections::HashSet;
@@ -74,10 +74,14 @@ impl Args {
                     a.max_relays = val("--max-relays")?.parse().map_err(|_| "bad max-relays")?
                 }
                 "--min-sources" => {
-                    a.min_sources = val("--min-sources")?.parse().map_err(|_| "bad min-sources")?
+                    a.min_sources = val("--min-sources")?
+                        .parse()
+                        .map_err(|_| "bad min-sources")?
                 }
                 "--concurrency" => {
-                    a.concurrency = val("--concurrency")?.parse().map_err(|_| "bad concurrency")?
+                    a.concurrency = val("--concurrency")?
+                        .parse()
+                        .map_err(|_| "bad concurrency")?
                 }
                 "--floor-mins" => {
                     a.floor_secs = val("--floor-mins")?
@@ -93,7 +97,9 @@ impl Args {
                 "--relay" => a.seed_relays.push(val("--relay")?),
                 "--heap-mb" => a.heap_mb = val("--heap-mb")?.parse().map_err(|_| "bad heap-mb")?,
                 "--commit-docs" => {
-                    a.commit_docs = val("--commit-docs")?.parse().map_err(|_| "bad commit-docs")?
+                    a.commit_docs = val("--commit-docs")?
+                        .parse()
+                        .map_err(|_| "bad commit-docs")?
                 }
                 "--max-open-shards" => {
                     a.max_open_shards = val("--max-open-shards")?
@@ -205,7 +211,9 @@ fn to_core(ev: &nostr_sdk::Event) -> NostrEvent {
 }
 
 fn main() -> anyhow::Result<()> {
-    rustls::crypto::ring::default_provider().install_default().ok();
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .ok();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -289,11 +297,7 @@ fn main() -> anyhow::Result<()> {
     rt.block_on(run(args, state, sink))
 }
 
-async fn run(
-    args: Args,
-    state: Arc<ScrapeState>,
-    sink: Arc<PipelineSink>,
-) -> anyhow::Result<()> {
+async fn run(args: Args, state: Arc<ScrapeState>, sink: Arc<PipelineSink>) -> anyhow::Result<()> {
     // SIGTERM (PID 1 in a container): checkpoint and exit cleanly.
     {
         let sink = sink.clone();
@@ -319,8 +323,7 @@ async fn run(
             loop {
                 tick.tick().await;
                 let sink = sink.clone();
-                if let Err(e) = tokio::task::spawn_blocking(move || sink.checkpoint(false)).await
-                {
+                if let Err(e) = tokio::task::spawn_blocking(move || sink.checkpoint(false)).await {
                     tracing::warn!(error = ?e, "checkpoint failed");
                 }
             }

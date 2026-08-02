@@ -22,6 +22,7 @@ tower-http.workspace = true
 chrono.workspace = true
 hex.workspace = true
 tokio-util = { workspace = true }
+futures = { workspace = true }
 nostr-archive-cursor = { git = "https://github.com/v0l/nostr-archive-cursor.git", default-features = false, features = ["sync", "db-rocksdb"] }
 nostr-relay-builder = "0.44"
 nostr-sdk = "0.44"
@@ -30,6 +31,8 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 sha1 = "0.10"
 base64 = "0.22"
 rustls = { version = "0.23", features = ["ring"] }
+async-stream = "0.3.6"
 
 [dev-dependencies]
 tempfile = "3"
+reqwest = { workspace = true, features = ["json"] }

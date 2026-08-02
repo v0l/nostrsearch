@@ -1,0 +1,258 @@
+//! Reports through the **real** `Pipeline`, not the in-memory staged runner.
+//!
+//! The reports ported from nostr-dashboard depend on `follow_graph` for their
+//! trusted/untrusted split. `Pipeline::process` streams events, so it can only
+//! fold one dependency stage per pass over the corpus. An earlier version fed
+//! every analysis in a single pass, which on a cold corpus silently recorded
+//! *every* author as untrusted — these tests pin the multi-pass behaviour that
+//! fixes it, and assert the single-pass result really is wrong (so the test
+//! cannot quietly stop testing anything).
+
+use nostrsearch_core::event::NostrEvent;
+use nostrsearch_indexer::pipeline::{Pipeline, PipelineConfig};
+use nostrsearch_indexer::shard_writer::ShardWriterConfig;
+
+const DAY: u64 = 60 * 60 * 24;
+/// BOLT-11 spec vector: 2500u = 250,000 sats.
+const INV_2500U: &str = "lnbc2500u1pvjluezsp5zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zyg3zygspp5qqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqqqsyqcyq5rqwzqfqypqdq5xysxxatsyp3k7enxv4jsxqzpu9qrsgquk0rl77nj30yxdy8j9vdx85fkpmdla2087ne0xh8nhedh8w27kyke0lp53ut353s06fv3qfegext0eh0ymjpf39tuven09sam30g4vgpfna3rh";
+
+fn pk(seed: u8) -> String {
+    format!("{seed:02x}").repeat(32)
+}
+fn id(seed: u16) -> String {
+    format!("{seed:04x}").repeat(16)
+}
+
+fn ev(idv: &str, pubkey: &str, kind: u16, created_at: u64, tags: Vec<Vec<&str>>) -> NostrEvent {
+    NostrEvent {
+        id: idv.into(),
+        pubkey: pubkey.into(),
+        created_at,
+        kind,
+        tags: tags
+            .into_iter()
+            .map(|t| t.into_iter().map(String::from).collect())
+            .collect(),
+        content: String::new(),
+        sig: "c".repeat(128),
+    }
+}
+
+/// `star` (pk 200) is followed by 10 pubkeys; `nobody` (pk 201) by none.
+fn corpus(day0: u64) -> Vec<NostrEvent> {
+    let star = pk(200);
+    let nobody = pk(201);
+    let mut events = Vec::new();
+
+    for i in 0..10u8 {
+        events.push(ev(
+            &id(i as u16),
+            &pk(i),
+            3,
+            day0 + i as u64,
+            vec![vec!["p", &star]],
+        ));
+    }
+    events.push(ev(
+        &id(1000),
+        &star,
+        1,
+        day0 + 100,
+        vec![vec!["client", "Snort"]],
+    ));
+    events.push(ev(&id(1001), &star, 1, day0 + 200, vec![]));
+    events.push(ev(&id(2000), &nobody, 1, day0 + 300, vec![]));
+
+    // Zap: sent by star (trusted) to nobody (untrusted), signed by an LNURL
+    // server that is itself untrusted.
+    events.push(ev(
+        &id(3000),
+        &pk(250),
+        9735,
+        day0 + 400,
+        vec![
+            vec!["P", &star],
+            vec!["p", &nobody],
+            vec!["bolt11", INV_2500U],
+        ],
+    ));
+    events
+}
+
+fn config(root: &std::path::Path) -> PipelineConfig {
+    PipelineConfig {
+        index_root: root.join("index"),
+        shard: ShardWriterConfig::default(),
+        state_dir: Some(root.join("stats")),
+        wot_refresh_every: u64::MAX, // no mid-pass refreshes
+        min_refresh_interval: std::time::Duration::from_secs(0),
+        persist_interval: std::time::Duration::from_secs(3600),
+        wot_out: None,
+    }
+}
+
+fn report(p: &Pipeline, name: &str) -> serde_json::Value {
+    p.reports()
+        .into_iter()
+        .find(|(n, _)| *n == name)
+        .unwrap_or_else(|| panic!("no report {name}"))
+        .1
+}
+
+/// Drive a full multi-pass backfill, the way `ingest` does.
+fn run_all_passes(p: &mut Pipeline, events: &[NostrEvent]) {
+    loop {
+        for e in events {
+            p.process(e);
+        }
+        if !p.advance_pass() {
+            break;
+        }
+    }
+    p.go_live();
+}
+
+#[test]
+fn multi_pass_backfill_gives_reports_a_materialized_world() {
+    let dir = tempfile::tempdir().unwrap();
+    let day0 = 1_700_000_000 - (1_700_000_000 % DAY);
+    let mut p = Pipeline::new(config(dir.path())).unwrap();
+
+    // follow_graph + pagerank + client_tags in stage 0; activity + active_users
+    // depend on follow_graph, so a second pass is required.
+    assert_eq!(p.backfill_passes(), 2, "reports must fold in a later stage");
+
+    run_all_passes(&mut p, &corpus(day0));
+
+    // --- activity: trust split is real, zaps attributed to the right parties
+    let activity = report(&p, "activity");
+    let d0 = &activity[day0.to_string()];
+    assert_eq!(d0["kinds"]["1"]["trusted"], 2, "star's 2 notes are trusted");
+    assert_eq!(d0["kinds"]["1"]["untrusted"], 1, "nobody's note is not");
+    // sender (star) is trusted; recipient (nobody) is not; the LNURL server
+    // that signed the receipt is irrelevant to both.
+    assert_eq!(d0["zaps_sent_sats"]["trusted"], 250_000);
+    assert_eq!(d0["zaps_sent_sats"]["untrusted"], 0);
+    assert_eq!(d0["zaps_received_sats"]["untrusted"], 250_000);
+    assert_eq!(d0["zap_count"], 1);
+
+    // --- active users: 13 distinct publishers that day
+    // (10 contact-list authors + star + nobody + the LNURL server), each
+    // counted once no matter how often they posted.
+    let au = report(&p, "active_users");
+    // Buckets are keyed by start time so partial updates merge cleanly.
+    let bucket = &au["daily"][day0.to_string()];
+    assert!(!bucket.is_null(), "day0 bucket missing from {au}");
+    let trusted = bucket["users"]["trusted"].as_u64().unwrap();
+    let untrusted = bucket["users"]["untrusted"].as_u64().unwrap();
+    assert_eq!(trusted + untrusted, 13, "distinct publishers on day0");
+    // The exact split is not pinned: tiers come from pagerank *relative to the
+    // graph maximum*, which is degenerate on a 12-node toy graph (a base-rank
+    // node clears 1% of the max and lands in tier 1). What matters here is
+    // that the world was materialized at all — on a single-pass backfill this
+    // is 0, which is the bug these tests exist to catch.
+    assert!(trusted > 0, "report folded against an unmaterialized world");
+
+    // --- client tags: normalized to lowercase, stage 0 so unaffected by passes
+    let clients = report(&p, "client_tags");
+    assert_eq!(clients["snort"]["sum"], 1);
+}
+
+/// The staging contract: during pass 0 a dependent report must not fold at all
+/// (rather than folding against a half-built world and silently recording every
+/// author as untrusted, which is what the single-pass pipeline did).
+#[test]
+fn dependent_reports_do_not_fold_until_their_own_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let day0 = 1_700_000_000 - (1_700_000_000 % DAY);
+    let mut p = Pipeline::new(config(dir.path())).unwrap();
+
+    // Only pass 0 — deliberately stopping before the dependent stage.
+    for e in corpus(day0) {
+        p.process(&e);
+    }
+
+    // Stage-0 analyses have already produced results...
+    let clients = report(&p, "client_tags");
+    assert_eq!(clients["snort"]["sum"], 1, "stage 0 folds in pass 0");
+
+    // ...while the dependent reports are still untouched, rather than holding
+    // an all-untrusted result computed against an empty world.
+    let activity = report(&p, "activity");
+    assert!(
+        activity[day0.to_string()].is_null(),
+        "activity must not fold before follow_graph is materialized, got {activity}"
+    );
+}
+
+/// Partial updates come out of the live pipeline and, applied to a held
+/// snapshot, reproduce the next full snapshot exactly. This is the contract the
+/// realtime dashboard stream depends on.
+#[test]
+fn live_deltas_converge_on_the_full_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let day0 = 1_700_000_000 - (1_700_000_000 % DAY);
+    let mut p = Pipeline::new(config(dir.path())).unwrap();
+
+    run_all_passes(&mut p, &corpus(day0));
+
+    // A dashboard seeds from the full report and clears pending changes.
+    let mut held = report(&p, "client_tags");
+    p.drain_report_deltas();
+
+    // New live activity arrives.
+    p.process(&ev(
+        &id(4000),
+        &pk(200),
+        1,
+        day0 + DAY + 10,
+        vec![vec!["client", "damus"]],
+    ));
+
+    let deltas = p.drain_report_deltas();
+    assert!(
+        !deltas.is_empty(),
+        "live activity must produce partial updates"
+    );
+
+    let patch = deltas
+        .iter()
+        .find(|d| d.name == "client_tags")
+        .expect("client_tags changed");
+    nostrsearch_stats::merge_patch(&mut held, &patch.patch);
+    assert_eq!(held, report(&p, "client_tags"), "delta != next snapshot");
+    assert_eq!(held["damus"]["sum"], 1);
+
+    // Draining again with no new events yields nothing, so an idle node emits
+    // no dashboard traffic.
+    assert!(p.drain_report_deltas().is_empty());
+}
+
+/// Indexing must happen exactly once even though the corpus is replayed.
+#[test]
+fn later_passes_do_not_reindex() {
+    let dir = tempfile::tempdir().unwrap();
+    let day0 = 1_700_000_000 - (1_700_000_000 % DAY);
+    let events = corpus(day0);
+
+    let mut p = Pipeline::new(config(dir.path())).unwrap();
+    run_all_passes(&mut p, &events);
+    p.finish().unwrap();
+
+    // Count documents actually in the index, summing over the month shards.
+    let mut docs = 0u64;
+    for entry in std::fs::read_dir(dir.path().join("index")).expect("index root") {
+        let path = entry.unwrap().path();
+        if !path.is_dir() {
+            continue;
+        }
+        let index = tantivy::Index::open_in_dir(&path).expect("open shard");
+        let reader = index.reader().expect("reader");
+        docs += reader.searcher().num_docs();
+    }
+    assert_eq!(
+        docs,
+        events.len() as u64,
+        "each event should be indexed once, not once per pass"
+    );
+}

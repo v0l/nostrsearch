@@ -339,6 +339,88 @@ adjacency in RAM — fine for the example, but at 1B they need an on-disk graph
 staging / metrics / refresh contract stays identical; only the producer's
 storage backend changes.
 
+### Dashboard reports ported (implemented)
+
+The reports from nostr-dashboard's `shared/reports` now run as first-class
+`Analysis` impls inside the same single pass as indexing:
+
+| Upstream report | Here | Notes |
+|---|---|---|
+| `activity` | `analyses::Activity` | per-day kind counts + zap volume |
+| `active_users` | `analyses::ActiveUsers` | DAU/WAU, exact distinct sets |
+| `clients` (`client_tags`) | `analyses::Clients` | client market share |
+| `followers` | `analyses::FollowGraph` | already present (WoT producer) |
+| `pagerank` | `analyses::Pagerank` | already present |
+| `pubkey_stats` | **not ported** | per-pubkey x day x kind timelines are a
+  profile-page feature, not a search-engine one: O(pubkeys x days x kinds) for
+  something nothing in nostrsearch consumes. Revisit only if a profile view needs it. |
+
+Correctness fixes applied on the way in (upstream bugs, not ports of them):
+
+- **bolt11 parsing** uses the `lightning-invoice` crate instead of a hand-rolled
+  HRP splitter. Upstream's multipliers were each 1000x too small *and* the
+  result was divided by 1000 again; `lnbc` was stripped before `lnbcrt`; and
+  splitting the HRP on `p` confused the pico multiplier with the bech32
+  separator. Verified against the BOLT-11 spec vectors.
+- **Zap attribution.** A kind-9735 receipt is signed by the recipient's LNURL
+  server, so upstream's trusted/untrusted split on `ev.pubkey` measured zapper
+  *services*. Value is now attributed to the `P`/zap-request sender and the `p`
+  recipient (`zaps_sent_sats` / `zaps_received_sats`), and the amount is taken
+  from the receipt's `bolt11` (what was paid) ahead of the request's `amount`
+  (what was asked).
+- **Client key space is bounded.** `client` is attacker-controlled freeform
+  text; the map is now normalized (case, `" - "`/`@` version suffixes, length)
+  and capped at `MAX_CLIENTS`, overflowing into `(other)`.
+
+### Staged streaming backfill (implemented)
+
+`Analysis::deps()` was only honoured by the in-memory staged runner. The
+streaming `Pipeline` fed every analysis in one pass, so on a cold corpus the
+reports folded against an empty `World`: every author read as untrusted and any
+follower-filtered analysis dropped everything.
+
+`Pipeline` is now stage-aware. `backfill_passes()` reports one pass per
+dependency stage, `process()` folds only the current stage, and `advance_pass()`
+materializes the finished stage into the `World` before the next begins.
+**Only pass 0 indexes** — later passes replay the archive purely to feed
+dependent analyses (and the id-store dedupe gate is bypassed for them). With the
+default set this is 2 passes: WoT producers + client stats, then the reports.
+
+The cost is a second read of the corpus. That is the price of a correct trust
+split; an analysis that does not need `World` (like `Clients`) stays in stage 0
+and is unaffected.
+
+### Realtime partial updates (implemented)
+
+Full snapshots cannot show a number *moving*, and the activity report carries
+every day the corpus has seen. So `Analysis::drain_delta()` lets each impl emit
+**its own** partial change since the last drain, as a JSON merge patch (RFC
+7386) over that analysis's snapshot shape:
+
+- `Activity` emits only the day buckets it touched (in practice, today's).
+- `ActiveUsers` emits only buckets whose counts actually moved — a repeat
+  publisher produces no traffic at all.
+- `Clients` emits only the clients that published.
+- Default is `None`: an analysis without an incremental view is simply polled.
+
+`ActiveUsersReport` uses key->bucket maps rather than arrays specifically so a
+patch and a snapshot have the same shape (a JSON array would have to be replaced
+wholesale). Dirty sets are `#[serde(skip)]` — realtime-only, never checkpointed.
+
+Serving: the writer task owns the `Pipeline`, so it *publishes* rather than
+exposing it. Full snapshots go out on the commit tick; deltas are drained every
+second and fanned out over a broadcast channel.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /reports` | available reports + `generated_at` |
+| `GET /reports/{name}` | full snapshot (dashboard seeds from this) |
+| `GET /reports/stream` | SSE of `{name, patch}` frames; `lagged` tells a slow client to re-sync |
+
+The invariant under test: seed from `/reports/{name}`, merge-patch each streamed
+frame, and the result equals the next full snapshot — verified both through the
+real `Pipeline` and over real HTTP.
+
 ## Decisions still open
 
 1. **Stats storage** — nostr-dashboard writes JSON report files + in-memory
