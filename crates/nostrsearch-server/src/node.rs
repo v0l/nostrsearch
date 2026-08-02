@@ -123,11 +123,20 @@ pub enum WriterCmd {
         name: String,
         reply: tokio::sync::oneshot::Sender<Option<Vec<&'static str>>>,
     },
+    /// Declare the dump list for a rebuild run.
+    SetRebuildFiles {
+        files: Vec<String>,
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
     /// Arm each analysis's resume point for a dump and report what the reader
     /// may skip.
     BeginRebuild {
         file: String,
         reply: tokio::sync::oneshot::Sender<nostrsearch_stats::RebuildPlan>,
+    },
+    /// End the rebuild run: clear positions, materialize, persist.
+    FinishRebuildRun {
+        reply: tokio::sync::oneshot::Sender<()>,
     },
     /// Mark a dump fully folded for every analysis rebuilding it.
     FinishRebuildFile {
@@ -157,6 +166,30 @@ pub enum WriterCmd {
 pub struct WriterCtl(mpsc::Sender<WriterCmd>);
 
 impl WriterCtl {
+    /// Declare the dump list for a rebuild run. Blocking, for the reader.
+    pub fn set_rebuild_files_blocking(&self, files: Vec<String>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .0
+            .blocking_send(WriterCmd::SetRebuildFiles { files, reply: tx })
+            .is_ok()
+        {
+            let _ = rx.blocking_recv();
+        }
+    }
+
+    /// End the rebuild run. Blocking, for the reader.
+    pub fn finish_rebuild_run_blocking(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .0
+            .blocking_send(WriterCmd::FinishRebuildRun { reply: tx })
+            .is_ok()
+        {
+            let _ = rx.blocking_recv();
+        }
+    }
+
     /// Arm resume points for `file` and report what the reader may skip.
     ///
     /// Blocking, for the replay reader thread: it must know the plan before it
@@ -367,8 +400,17 @@ pub fn spawn_writer_with_reports(
                     }
                 }
                 Some(cmd) = cmd_rx.recv() => match cmd {
+                    WriterCmd::SetRebuildFiles { files, reply } => {
+                        pipeline.set_rebuild_files(files);
+                        let _ = reply.send(());
+                    }
                     WriterCmd::BeginRebuild { file, reply } => {
                         let _ = reply.send(pipeline.begin_rebuild(&file));
+                    }
+                    WriterCmd::FinishRebuildRun { reply } => {
+                        pipeline.finish_rebuild_run();
+                        publish_reports(&pipeline, reports.as_ref());
+                        let _ = reply.send(());
                     }
                     WriterCmd::FinishRebuildFile { file, reply } => {
                         pipeline.finish_rebuild_file(&file);

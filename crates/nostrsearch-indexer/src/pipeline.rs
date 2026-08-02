@@ -73,6 +73,9 @@ pub struct Pipeline {
     since_refresh: u64,
     last_refresh: Instant,
     last_persist: Instant,
+    /// Stage of the rebuild pass most recently begun, to materialize the world
+    /// exactly once per stage change.
+    rebuild_stage_seen: Option<usize>,
 
     refreshed_once: bool,
     /// Cumulative time spent folding events into analyses, in nanoseconds.
@@ -132,6 +135,7 @@ impl Pipeline {
             // Allow the first refresh immediately.
             last_refresh: Instant::now() - Duration::from_secs(86_400),
             last_persist: Instant::now(),
+            rebuild_stage_seen: None,
 
             refreshed_once: false,
             stats_ns: 0,
@@ -182,8 +186,35 @@ impl Pipeline {
     /// it would silently drop everything still in flight when a process dies.
     /// Arm each analysis's own resume point for `file`, and report what the
     /// reader may skip.
+    /// Start (or resume) a rebuild run over `files`.
+    pub fn set_rebuild_files(&mut self, files: Vec<String>) {
+        if let Err(e) = self.registry.set_rebuild_files(files) {
+            tracing::error!(error = %e, "rebuild run could not be staged");
+        }
+        self.rebuild_stage_seen = None;
+    }
+
     pub fn begin_rebuild(&mut self, file: &str) -> nostrsearch_stats::RebuildPlan {
+        // Materialize the world when the pass changes. The next stage's
+        // analyses label events with what the previous stage built -- fold
+        // activity against a world that predates the follow graph and every
+        // event is recorded untrusted, permanently. This is the same reason
+        // the staged ingest materializes between passes.
+        let stage = self.registry.rebuild_stage();
+        if stage.is_some() && stage != self.rebuild_stage_seen {
+            tracing::info!(?stage, "rebuild pass starting; materializing world");
+            self.refresh_inner(true);
+            self.rebuild_stage_seen = stage;
+        }
         self.registry.begin_rebuild(file)
+    }
+
+    /// End the rebuild run: clear positions, materialize, persist.
+    pub fn finish_rebuild_run(&mut self) {
+        self.registry.finish_rebuild_run();
+        self.rebuild_stage_seen = None;
+        self.refresh_inner(true);
+        tracing::info!("rebuild complete");
     }
 
     /// Mark `file` fully folded for every analysis rebuilding it, and persist

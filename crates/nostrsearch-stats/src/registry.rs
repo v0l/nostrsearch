@@ -128,7 +128,10 @@ pub struct AnalysisStatus {
 /// What a rebuild reader may do with a dump, given where the analyses are.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RebuildPlan {
-    /// Every analysis has already folded this file.
+    /// Every stage has folded every dump: the run is over. The reader stops
+    /// iterating instead of burning a full pass discovering it file by file.
+    Finished,
+    /// Every analysis in the current stage has already folded this file.
     SkipFile,
     /// All of them are at the same point, so the reader can fast-forward past
     /// this id without parsing.
@@ -136,6 +139,17 @@ pub enum RebuildPlan {
     /// They disagree (or all start fresh), so every event must be handed over
     /// and each analysis skips on its own.
     FoldAll,
+}
+
+/// A rebuild run in progress: the dump list and each entry's dependency stage.
+///
+/// Transient -- re-sent by the reader at the start of every run -- because the
+/// registry cannot answer "is this stage finished" without knowing what the
+/// full set of dumps is, and only the reader knows that.
+struct RebuildRun {
+    files: Vec<String>,
+    entry_stage: Vec<usize>,
+    stage_count: usize,
 }
 
 pub struct Entry {
@@ -163,6 +177,8 @@ pub struct Registry {
     total_events: u64,
     rate: RateMeter,
     observer: Option<Arc<dyn MetricsObserver>>,
+    /// The rebuild run in progress, if any. See [`RebuildRun`].
+    rebuild_run: Option<RebuildRun>,
 }
 
 impl Registry {
@@ -443,11 +459,62 @@ impl Registry {
     /// in the reader skips for all of them at once. When they disagree the
     /// reader must hand over every event and each analysis skips on its own,
     /// which costs a parse per line but is the only correct answer.
-    pub fn begin_rebuild(&mut self, file: &str) -> RebuildPlan {
-        let mut positions: Vec<Option<String>> = Vec::new();
+    /// Start (or resume) a rebuild run over `files`.
+    ///
+    /// Must be called before `begin_rebuild`: stage arithmetic needs the full
+    /// dump list, and only the reader knows it.
+    pub fn set_rebuild_files(&mut self, files: Vec<String>) -> Result<()> {
+        let stages = self.stages()?;
+        let mut entry_stage = vec![0usize; self.entries.len()];
+        for (s, idxs) in stages.iter().enumerate() {
+            for &i in idxs {
+                entry_stage[i] = s;
+            }
+        }
+        self.rebuild_run = Some(RebuildRun {
+            files,
+            entry_stage,
+            stage_count: stages.len(),
+        });
+        Ok(())
+    }
 
-        for e in self.entries.iter_mut() {
-            if !e.needs_backfill() || !e.progress.rebuild.needs(file) {
+    /// The dependency stage the rebuild is currently folding, or `None` when
+    /// every stage has folded every dump.
+    ///
+    /// The earliest stage with outstanding work wins. Dependents must not fold
+    /// alongside their dependencies: they label events using the world their
+    /// dependency builds, so folding them in the same pass records everything
+    /// against a world that does not exist yet -- on a cold graph, every event
+    /// permanently untrusted.
+    pub fn rebuild_stage(&self) -> Option<usize> {
+        let run = self.rebuild_run.as_ref()?;
+        (0..run.stage_count).find(|&s| {
+            self.entries.iter().enumerate().any(|(i, e)| {
+                run.entry_stage[i] == s
+                    && e.needs_backfill()
+                    && run.files.iter().any(|f| e.progress.rebuild.needs(f))
+            })
+        })
+    }
+
+    pub fn begin_rebuild(&mut self, file: &str) -> RebuildPlan {
+        let Some(stage) = self.rebuild_stage() else {
+            return RebuildPlan::Finished;
+        };
+
+        let mut positions: Vec<Option<String>> = Vec::new();
+        let run_stage: Vec<usize> = self
+            .rebuild_run
+            .as_ref()
+            .map(|r| r.entry_stage.clone())
+            .unwrap_or_default();
+
+        for (i, e) in self.entries.iter_mut().enumerate() {
+            let participating = run_stage.get(i).copied().unwrap_or(0) == stage
+                && e.needs_backfill()
+                && e.progress.rebuild.needs(file);
+            if !participating {
                 e.resuming = false;
                 continue;
             }
@@ -468,12 +535,41 @@ impl Registry {
         }
     }
 
-    /// Mark `file` fully folded for every analysis that was rebuilding it.
+    /// Mark `file` fully folded for every analysis folding it *in this pass*.
+    ///
+    /// Only the current stage: marking dependents too would record files as
+    /// folded into analyses that never saw them.
     pub fn finish_rebuild_file(&mut self, file: &str) {
-        for e in self.entries.iter_mut() {
-            if e.needs_backfill() {
+        let stage = self.rebuild_stage();
+        let run_stage: Vec<usize> = self
+            .rebuild_run
+            .as_ref()
+            .map(|r| r.entry_stage.clone())
+            .unwrap_or_default();
+        for (i, e) in self.entries.iter_mut().enumerate() {
+            let in_stage = match stage {
+                Some(s) => run_stage.get(i).copied().unwrap_or(0) == s,
+                None => false,
+            };
+            if in_stage && e.needs_backfill() {
                 e.progress.rebuild.finish(file);
             }
+            e.resuming = false;
+        }
+    }
+
+    /// End the rebuild run and clear every position, so `rebuilding()` goes
+    /// quiet and the next run starts from the top.
+    ///
+    /// `backfilled` is deliberately left false: flipping it would put the
+    /// analyses on the watermark path, where the gap scraper's historical
+    /// events -- days or months older than the watermark -- are rejected. The
+    /// analyses keep folding everything, which is the live behaviour that
+    /// works.
+    pub fn finish_rebuild_run(&mut self) {
+        self.rebuild_run = None;
+        for e in self.entries.iter_mut() {
+            e.progress.rebuild = crate::progress::Rebuild::default();
             e.resuming = false;
         }
     }
@@ -504,8 +600,22 @@ impl Registry {
             (Some(a), Some(i)) => (a, i),
             _ => return,
         };
+        let stage = self.rebuild_stage();
+        let run_stage: Vec<usize> = self
+            .rebuild_run
+            .as_ref()
+            .map(|r| r.entry_stage.clone())
+            .unwrap_or_default();
         let mut touched = false;
-        for e in self.entries.iter_mut() {
+        for (i, e) in self.entries.iter_mut().enumerate() {
+            // Dependents wait for their own pass. They label events using the
+            // world their dependency builds, so folding them now would record
+            // everything against a world that does not exist yet.
+            if let Some(s) = stage
+                && run_stage.get(i).copied().unwrap_or(0) != s
+            {
+                continue;
+            }
             if e.resuming {
                 // Still behind this analysis's resume point. The event that
                 // matches is the last one it folded, so it is consumed here

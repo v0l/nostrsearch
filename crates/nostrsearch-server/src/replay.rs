@@ -254,86 +254,125 @@ pub fn spawn(
     });
 
     tokio::task::spawn_blocking(move || {
-        for name in names {
-            if state.cancel.load(Ordering::Relaxed) {
-                break;
-            }
-            // Ask the analyses where they are in this dump. Files every one of
-            // them has folded are skipped outright; when they all sit at the
-            // same point the reader fast-forwards past it without parsing, and
-            // when they disagree it hands over every event and each analysis
-            // skips on its own.
-            let mut resume_after: Option<String> = None;
-            if rebuild && let Some(ctl) = &ctl {
-                match ctl.begin_rebuild_blocking(&name) {
-                    nostrsearch_stats::RebuildPlan::SkipFile => {
-                        tracing::info!(file = %name, "every analysis has folded this dump; skipping");
-                        state.update(|s| s.files_done += 1);
-                        continue;
-                    }
-                    nostrsearch_stats::RebuildPlan::ResumeAfter(id) => resume_after = Some(id),
-                    nostrsearch_stats::RebuildPlan::FoldAll => {}
-                }
-            }
-            let path = dir.join(&name);
-            state.update(|s| s.current = Some(name.clone()));
-
-            let bytes_total = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            let mut fp = FileProgress {
-                name: name.clone(),
-                bytes_total,
-                ..Default::default()
-            };
-
-            match open_dump(&path) {
-                Ok((reader, counter)) => replay_file(
-                    &state,
-                    reader,
-                    counter,
-                    &mut fp,
-                    dedupe.as_deref(),
-                    &submit,
-                    rebuild,
-                    Arc::from(name.as_str()),
-                    resume_after.as_deref(),
-                ),
-                Err(e) => fp.error = Some(format!("open failed: {e}")),
-            }
-
-            // Only a clean read to EOF counts as folded. Recording a file that
-            // errored part-way would strand the remainder: nothing revisits a
-            // completed dump.
-            if fp.complete
-                && rebuild
-                && let Some(ctl) = &ctl
-            {
-                ctl.finish_rebuild_file_blocking(&name);
-            }
-
-            if !fp.complete && fp.error.is_none() && !state.cancel.load(Ordering::Relaxed) {
-                fp.error = Some("file ended early".into());
-            }
-            if let Some(err) = &fp.error {
-                tracing::warn!(file = %name, error = %err, "replay problem");
-            } else {
-                tracing::info!(
-                    file = %name,
-                    events = fp.events,
-                    new = fp.new,
-                    malformed = fp.malformed,
-                    "replayed dump"
-                );
-            }
-
-            state.update(|s| {
-                s.files_done += 1;
-                s.events += fp.events;
-                s.new += fp.new;
-                s.malformed += fp.malformed;
-                s.current_progress = None;
-                s.files.push(fp);
-            });
+        // A rebuild reads the archive once per dependency stage: pass one
+        // folds the analyses nothing depends on (the follow graph above all),
+        // the world is materialized from what they built, and pass two folds
+        // the analyses that label events with it. One pass for everything
+        // would fold activity against a world that does not exist yet and
+        // record every event as untrusted, permanently -- the same bug the
+        // staged ingest exists to prevent.
+        //
+        // The writer owns the stage arithmetic; the reader just re-walks the
+        // file list until it is told the run is finished.
+        if rebuild && let Some(ctl) = &ctl {
+            ctl.set_rebuild_files_blocking(names.clone());
         }
+
+        'run: loop {
+            // Each pass walks the same list, so the per-pass counters restart or
+            // the status would show 638/319 files.
+            state.update(|s| {
+                s.files_done = 0;
+                s.files_total = names.len();
+            });
+            let mut finished = !rebuild; // ingest is single-pass by construction
+            for name in &names {
+                let name = name.clone();
+                if state.cancel.load(Ordering::Relaxed) {
+                    break 'run;
+                }
+                // Ask the analyses where they are in this dump. Files every one of
+                // them has folded are skipped outright; when they all sit at the
+                // same point the reader fast-forwards past it without parsing, and
+                // when they disagree it hands over every event and each analysis
+                // skips on its own.
+                let mut resume_after: Option<String> = None;
+                if rebuild && let Some(ctl) = &ctl {
+                    match ctl.begin_rebuild_blocking(&name) {
+                        nostrsearch_stats::RebuildPlan::Finished => {
+                            finished = true;
+                            break;
+                        }
+                        nostrsearch_stats::RebuildPlan::SkipFile => {
+                            tracing::info!(file = %name, "this pass has folded this dump; skipping");
+                            state.update(|s| s.files_done += 1);
+                            continue;
+                        }
+                        nostrsearch_stats::RebuildPlan::ResumeAfter(id) => resume_after = Some(id),
+                        nostrsearch_stats::RebuildPlan::FoldAll => {}
+                    }
+                }
+                let path = dir.join(&name);
+                state.update(|s| s.current = Some(name.clone()));
+
+                let bytes_total = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let mut fp = FileProgress {
+                    name: name.clone(),
+                    bytes_total,
+                    ..Default::default()
+                };
+
+                match open_dump(&path) {
+                    Ok((reader, counter)) => replay_file(
+                        &state,
+                        reader,
+                        counter,
+                        &mut fp,
+                        dedupe.as_deref(),
+                        &submit,
+                        rebuild,
+                        Arc::from(name.as_str()),
+                        resume_after.as_deref(),
+                    ),
+                    Err(e) => fp.error = Some(format!("open failed: {e}")),
+                }
+
+                // Only a clean read to EOF counts as folded. Recording a file that
+                // errored part-way would strand the remainder: nothing revisits a
+                // completed dump.
+                if fp.complete
+                    && rebuild
+                    && let Some(ctl) = &ctl
+                {
+                    ctl.finish_rebuild_file_blocking(&name);
+                }
+
+                if !fp.complete && fp.error.is_none() && !state.cancel.load(Ordering::Relaxed) {
+                    fp.error = Some("file ended early".into());
+                }
+                if let Some(err) = &fp.error {
+                    tracing::warn!(file = %name, error = %err, "replay problem");
+                } else {
+                    tracing::info!(
+                        file = %name,
+                        events = fp.events,
+                        new = fp.new,
+                        malformed = fp.malformed,
+                        "replayed dump"
+                    );
+                }
+
+                state.update(|s| {
+                    s.files_done += 1;
+                    s.events += fp.events;
+                    s.new += fp.new;
+                    s.malformed += fp.malformed;
+                    s.current_progress = None;
+                    s.files.push(fp);
+                });
+            }
+
+            if finished || !rebuild {
+                if rebuild
+                    && !state.cancel.load(Ordering::Relaxed)
+                    && let Some(ctl) = &ctl
+                {
+                    ctl.finish_rebuild_run_blocking();
+                }
+                break 'run;
+            }
+            // Another pass: the next stage folds the same files.
+        } // 'run
 
         state.update(|s| {
             s.running = false;
