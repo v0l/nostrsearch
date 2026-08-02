@@ -100,6 +100,44 @@ pub struct Progress {
     pub rebuild: Rebuild,
 }
 
+/// [`Progress`] as it was stored before `rebuild` existed.
+///
+/// Progress is persisted with bincode, which is positional and carries no
+/// field names, so `#[serde(default)]` does nothing for it: a struct that
+/// gained a trailing field simply runs off the end of the old bytes and fails
+/// with "unexpected end of file". Adding `rebuild` therefore made every
+/// existing `.progress.bin` undecodable, and the node refused to boot.
+///
+/// Decoding falls back to this layout and fills in the new field, so watermarks,
+/// counters and `backfilled` all survive the upgrade. Any future field needs the
+/// same treatment -- or a format that stores names.
+#[derive(Deserialize)]
+pub(crate) struct ProgressV0 {
+    pub epoch: u32,
+    pub watermark: u64,
+    pub boundary: HashSet<EventId>,
+    pub events: u64,
+    pub backfilled: bool,
+    pub last_refresh_wall: u64,
+    #[serde(default)]
+    pub counters: Counters,
+}
+
+impl From<ProgressV0> for Progress {
+    fn from(v: ProgressV0) -> Self {
+        Self {
+            epoch: v.epoch,
+            watermark: v.watermark,
+            boundary: v.boundary,
+            events: v.events,
+            backfilled: v.backfilled,
+            last_refresh_wall: v.last_refresh_wall,
+            counters: v.counters,
+            rebuild: Rebuild::default(),
+        }
+    }
+}
+
 impl Progress {
     pub fn fresh(epoch: u32) -> Self {
         Self {

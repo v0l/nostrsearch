@@ -79,3 +79,75 @@ fn active_users_epoch_reflects_the_hll_layout_change() {
          pre-sketch checkpoints are discarded instead of mis-parsed"
     );
 }
+
+/// Progress written before `rebuild` existed must still load.
+///
+/// Progress is persisted with bincode, which is positional and stores no field
+/// names, so `#[serde(default)]` does nothing for it: a struct that gains a
+/// trailing field runs off the end of older bytes and fails with "unexpected
+/// end of file". Adding one made every existing .progress.bin undecodable and
+/// the node refused to start:
+///
+///     Error: decoding /data/stats/follow_graph.progress.bin
+///     Caused by: io error: unexpected end of file
+///
+/// State that is merely older must not be a startup failure.
+#[test]
+fn progress_written_before_rebuild_tracking_still_loads() {
+    use nostrsearch_stats::{Progress, StatStore};
+
+    /// Exactly the old on-disk layout: everything except `rebuild`.
+    #[derive(serde::Serialize)]
+    struct ProgressV0 {
+        epoch: u32,
+        watermark: u64,
+        boundary: std::collections::HashSet<[u8; 32]>,
+        events: u64,
+        backfilled: bool,
+        last_refresh_wall: u64,
+        counters: nostrsearch_stats::metrics::Counters,
+    }
+
+    let dir = std::env::temp_dir().join(format!(
+        "nscompat-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let store = StatStore::new(&dir).unwrap();
+
+    let old = ProgressV0 {
+        epoch: 1,
+        watermark: 1_700_000_000,
+        boundary: std::collections::HashSet::new(),
+        events: 987_654,
+        backfilled: true,
+        last_refresh_wall: 1_700_000_100,
+        counters: Default::default(),
+    };
+    std::fs::write(dir.join("activity.state.bin"), b"state").unwrap();
+    std::fs::write(
+        dir.join("activity.progress.bin"),
+        bincode::serialize(&old).unwrap(),
+    )
+    .unwrap();
+
+    let (state, p): (Vec<u8>, Progress) = store
+        .load("activity")
+        .expect("older progress must load, not abort startup")
+        .expect("present");
+
+    assert_eq!(state, b"state");
+    assert_eq!(p.watermark, 1_700_000_000, "watermark must survive");
+    assert_eq!(p.events, 987_654, "totals must survive");
+    assert!(p.backfilled, "backfilled must survive");
+    assert!(
+        p.rebuild.file.is_empty() && p.rebuild.completed.is_empty(),
+        "the new field defaults"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

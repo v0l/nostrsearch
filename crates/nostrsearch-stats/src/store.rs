@@ -46,8 +46,26 @@ impl StatStore {
         if !pp.exists() || !sp.exists() {
             return Ok(None);
         }
-        let progress: Progress = bincode::deserialize(&std::fs::read(&pp)?)
-            .with_context(|| format!("decoding {}", pp.display()))?;
+        let raw = std::fs::read(&pp)?;
+        // Bincode is positional, so a struct that gains a trailing field cannot
+        // read bytes written before it existed -- it runs off the end. Try the
+        // current layout, then the one before it, rather than refusing to boot
+        // on state that is perfectly good apart from being older.
+        let progress: Progress = match bincode::deserialize::<Progress>(&raw) {
+            Ok(p) => p,
+            Err(new_err) => match bincode::deserialize::<crate::progress::ProgressV0>(&raw) {
+                Ok(old) => {
+                    tracing::info!(
+                        analysis = name,
+                        "upgrading progress written before rebuild tracking"
+                    );
+                    old.into()
+                }
+                Err(_) => {
+                    return Err(new_err).with_context(|| format!("decoding {}", pp.display()));
+                }
+            },
+        };
         let state = std::fs::read(&sp)?;
         Ok(Some((state, progress)))
     }
