@@ -2,19 +2,19 @@
 //!
 //! Ported from nostr-dashboard's `reports/active_users.rs`. Differences:
 //!
-//! - Unique publishers are held as [`Pubkey`] (32 bytes) instead of 64-char hex
-//!   `String`s — half the memory and no allocation per event.
-//! - Trust is captured **at observe time** into a parallel trusted set, so the
+//! - Distinct publishers are counted with a [`Hll`] sketch per bucket rather
+//!   than an exact set. Upstream kept a `HashSet<String>` of 64-char hex keys,
+//!   which grows with every publisher ever seen and is re-serialized on every
+//!   checkpoint; at corpus scale that is gigabytes every few minutes. A sketch
+//!   costs a fixed 4 KiB per bucket for ~1.6% error — the right trade for
+//!   "how many people posted today".
+//! - Trust is captured **at observe time** into a parallel sketch, so the
 //!   result survives checkpoint/restore. Upstream recomputed trust from the
 //!   `PreCursor` at save time and its `load` silently dropped every pubkey,
 //!   making resumed runs under-count.
-//!
-//! Scale note: exact distinct-counting keeps one set per bucket. At full-corpus
-//! scale this is the analysis to swap for a HyperLogLog sketch (the trait
-//! contract stays identical — `merge` is already a set union).
 
 use super::counter::TrustedCount;
-use crate::types::Pubkey;
+use crate::hll::Hll;
 use crate::{Analysis, AnalysisCtx};
 use nostrsearch_core::event::NostrEvent;
 use serde::{Deserialize, Serialize};
@@ -43,13 +43,13 @@ pub struct ActiveUsersReport {
     pub weekly: BTreeMap<u64, ActiveUsersBucket>,
 }
 
-/// Unique publishers per day and per week.
+/// Unique publishers per day and per week, as fixed-size sketches.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ActiveUsers {
-    daily: HashMap<u64, HashSet<Pubkey>>,
-    daily_trusted: HashMap<u64, HashSet<Pubkey>>,
-    weekly: HashMap<u64, HashSet<Pubkey>>,
-    weekly_trusted: HashMap<u64, HashSet<Pubkey>>,
+    daily: HashMap<u64, Hll>,
+    daily_trusted: HashMap<u64, Hll>,
+    weekly: HashMap<u64, Hll>,
+    weekly_trusted: HashMap<u64, Hll>,
     /// Buckets whose counts changed since the last drain. Realtime-only, so
     /// skipped during (de)serialization: a restored analysis starts with
     /// nothing pending.
@@ -59,20 +59,20 @@ pub struct ActiveUsers {
     dirty_weekly: HashSet<u64>,
 }
 
-fn union_into(dst: &mut HashMap<u64, HashSet<Pubkey>>, src: HashMap<u64, HashSet<Pubkey>>) {
-    for (bucket, keys) in src {
-        dst.entry(bucket).or_default().extend(keys);
+fn union_into(dst: &mut HashMap<u64, Hll>, src: HashMap<u64, Hll>) {
+    for (bucket, sketch) in src {
+        dst.entry(bucket).or_default().merge(&sketch);
     }
 }
 
 /// Count one bucket, splitting by its trusted subset.
 fn bucket_at(
-    all: &HashMap<u64, HashSet<Pubkey>>,
-    trusted: &HashMap<u64, HashSet<Pubkey>>,
+    all: &HashMap<u64, Hll>,
+    trusted: &HashMap<u64, Hll>,
     start: u64,
 ) -> Option<ActiveUsersBucket> {
-    let total = all.get(&start)?.len() as u64;
-    let t = trusted.get(&start).map(HashSet::len).unwrap_or(0) as u64;
+    let total = all.get(&start)?.len();
+    let t = trusted.get(&start).map(Hll::len).unwrap_or(0);
     Some(ActiveUsersBucket {
         start,
         users: TrustedCount {
@@ -84,8 +84,8 @@ fn bucket_at(
 }
 
 fn buckets(
-    all: &HashMap<u64, HashSet<Pubkey>>,
-    trusted: &HashMap<u64, HashSet<Pubkey>>,
+    all: &HashMap<u64, Hll>,
+    trusted: &HashMap<u64, Hll>,
 ) -> BTreeMap<u64, ActiveUsersBucket> {
     all.keys()
         .filter_map(|&start| Some((start, bucket_at(all, trusted, start)?)))
@@ -93,19 +93,19 @@ fn buckets(
 }
 
 impl ActiveUsers {
-    /// Number of distinct publishers in the day bucket containing `ts`.
-    pub fn dau(&self, ts: u64) -> usize {
+    /// Estimated distinct publishers in the day bucket containing `ts`.
+    pub fn dau(&self, ts: u64) -> u64 {
         self.daily
             .get(&(ts - (ts % DAY)))
-            .map(HashSet::len)
+            .map(Hll::len)
             .unwrap_or(0)
     }
 
-    /// Number of distinct publishers in the week bucket containing `ts`.
-    pub fn wau(&self, ts: u64) -> usize {
+    /// Estimated distinct publishers in the week bucket containing `ts`.
+    pub fn wau(&self, ts: u64) -> u64 {
         self.weekly
             .get(&(ts - (ts % WEEK)))
-            .map(HashSet::len)
+            .map(Hll::len)
             .unwrap_or(0)
     }
 }
@@ -125,8 +125,8 @@ impl Analysis for ActiveUsers {
         let day = ev.created_at - (ev.created_at % DAY);
         let week = ev.created_at - (ev.created_at % WEEK);
 
-        let fresh_day = self.daily.entry(day).or_default().insert(ctx.author);
-        let fresh_week = self.weekly.entry(week).or_default().insert(ctx.author);
+        let fresh_day = self.daily.entry(day).or_default().insert(&ctx.author);
+        let fresh_week = self.weekly.entry(week).or_default().insert(&ctx.author);
 
         let mut new_trust = false;
         if ctx.author_trusted() {
@@ -134,12 +134,12 @@ impl Analysis for ActiveUsers {
                 .daily_trusted
                 .entry(day)
                 .or_default()
-                .insert(ctx.author);
+                .insert(&ctx.author);
             new_trust |= self
                 .weekly_trusted
                 .entry(week)
                 .or_default()
-                .insert(ctx.author);
+                .insert(&ctx.author);
         }
 
         // Only mark dirty when a count actually moved, so a busy relay of
@@ -208,6 +208,7 @@ impl Analysis for ActiveUsers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::Pubkey;
 
     fn ev(created_at: u64, pubkey: &str) -> NostrEvent {
         NostrEvent {

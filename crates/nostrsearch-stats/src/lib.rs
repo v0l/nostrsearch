@@ -24,6 +24,7 @@ pub mod analyses;
 pub mod ctx;
 pub mod delta;
 pub mod graph;
+pub mod hll;
 pub mod metrics;
 pub mod progress;
 pub mod registry;

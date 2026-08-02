@@ -347,7 +347,7 @@ The reports from nostr-dashboard's `shared/reports` now run as first-class
 | Upstream report | Here | Notes |
 |---|---|---|
 | `activity` | `analyses::Activity` | per-day kind counts + zap volume |
-| `active_users` | `analyses::ActiveUsers` | DAU/WAU, exact distinct sets |
+| `active_users` | `analyses::ActiveUsers` | DAU/WAU via HyperLogLog sketches |
 | `clients` (`client_tags`) | `analyses::Clients` | client market share |
 | `followers` | `analyses::FollowGraph` | already present (WoT producer) |
 | `pagerank` | `analyses::Pagerank` | already present |
@@ -389,6 +389,29 @@ default set this is 2 passes: WoT producers + client stats, then the reports.
 The cost is a second read of the corpus. That is the price of a correct trust
 split; an analysis that does not need `World` (like `Clients`) stays in stage 0
 and is unaffected.
+
+### Bounded active-user counting (implemented)
+
+`ActiveUsers` originally kept an exact `HashSet` of publishers per day and per
+week. Correct, but unbounded in two directions at once: the sets grow with every
+publisher the corpus has ever seen, *and* the whole structure is bincode-
+serialized on every checkpoint (`STATS_PERSIST_SECS`, 300s) — gigabytes
+re-serialized every few minutes at corpus scale.
+
+`hll::Hll` replaces the sets with a fixed 16 KiB sketch per bucket. Over a
+synthetic year (365 days x 20k publishers/day) the checkpoint drops from
+233.6 MB to 6.9 MB (34x) with the DAU estimate landing within 0.5%; the sketch
+figure stays constant as publisher counts grow, which is the actual point.
+
+It drops in cleanly because the sketch preserves the two properties the
+framework relies on: `merge` is a register-wise max (associative and
+commutative, exactly like the set union it replaces) and `insert` still reports
+whether anything moved, which is what suppresses no-op delta frames.
+
+Keys are mixed through SplitMix64 rather than used raw. Pubkeys are already
+uniform, but they are *chosen* by the people being counted, and raw bits would
+let someone grind zero-prefixed keys to inflate DAU. Mixing raises that cost
+without pretending to eliminate it.
 
 ### Realtime partial updates (implemented)
 
