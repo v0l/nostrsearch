@@ -42,22 +42,61 @@ pub struct SearchHit {
     pub shard: String,
 }
 
+/// Maximum shard readers held open at once, before the least-recently-used is
+/// evicted (`MAX_OPEN_SHARD_READERS`).
+///
+/// Readers were previously cached without bound: every month a query touched
+/// stayed open for the life of the process, and each one costs a Tantivy
+/// `Index` plus a `ReloadPolicy::OnCommitWithDelay` watcher thread. Over a
+/// multi-year corpus that is hundreds of threads and a steadily growing
+/// resource footprint on a long-lived server.
+fn max_open_readers() -> usize {
+    std::env::var("MAX_OPEN_SHARD_READERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(48)
+}
+
 /// The shard registry: lazily opens indices under a root and answers queries
 /// by fanning out to the pruned shard set and merging top-k.
+///
+/// Open readers are an LRU cache, not a permanent map — see
+/// [`max_open_readers`]. Eviction only drops this registry's handle; an
+/// `Arc<ShardReader>` already handed to an in-flight query stays alive until
+/// that query finishes.
 pub struct ShardRegistry {
     root: PathBuf,
     shards: HashMap<ShardId, Arc<ShardReader>>,
+    /// Monotonic clock for LRU ordering: shard -> tick of last use.
+    used: HashMap<ShardId, u64>,
+    clock: u64,
+    max_open: usize,
     earliest: ShardId,
     weights: ScoreWeights,
 }
 
 impl ShardRegistry {
     /// Open a registry over a root dir, discovering existing `YYYY-MM` shards.
+    /// Reader capacity comes from `MAX_OPEN_SHARD_READERS`.
     pub fn open(root: impl Into<PathBuf>, weights: ScoreWeights) -> Result<Self, RegistryError> {
+        Self::open_with_capacity(root, weights, max_open_readers())
+    }
+
+    /// As [`open`](Self::open) with an explicit reader cap, bypassing the
+    /// environment (tests, or a caller that knows its own descriptor budget).
+    pub fn open_with_capacity(
+        root: impl Into<PathBuf>,
+        weights: ScoreWeights,
+        max_open: usize,
+    ) -> Result<Self, RegistryError> {
         let root = root.into();
         let mut reg = Self {
             root,
             shards: HashMap::new(),
+            used: HashMap::new(),
+            clock: 0,
+            max_open: max_open.max(1),
             earliest: ShardId::new(2020, 11), // nostr genesis-ish default
             weights,
         };
@@ -87,10 +126,40 @@ impl ShardRegistry {
         Ok(())
     }
 
+    /// Number of shard readers currently held open.
+    pub fn open_readers(&self) -> usize {
+        self.shards.len()
+    }
+
+    /// Note a use of `id` for LRU ordering.
+    fn touch(&mut self, id: ShardId) {
+        self.clock += 1;
+        self.used.insert(id, self.clock);
+    }
+
+    /// Drop least-recently-used readers until at most `max_open` remain.
+    fn evict_to_capacity(&mut self) {
+        while self.shards.len() > self.max_open {
+            let Some(victim) = self
+                .used
+                .iter()
+                .filter(|(id, _)| self.shards.contains_key(id))
+                .min_by_key(|(_, tick)| **tick)
+                .map(|(id, _)| *id)
+            else {
+                break;
+            };
+            self.shards.remove(&victim);
+            self.used.remove(&victim);
+            tracing::debug!(shard = %victim.name(), "evicted shard reader (LRU)");
+        }
+    }
+
     /// Open (or return cached) a shard reader.
     fn shard(&mut self, id: ShardId) -> Option<Arc<ShardReader>> {
-        if let Some(s) = self.shards.get(&id) {
-            return Some(s.clone());
+        if let Some(s) = self.shards.get(&id).cloned() {
+            self.touch(id);
+            return Some(s);
         }
         let dir = self.root.join(id.name());
         if !dir.exists() {
@@ -111,6 +180,8 @@ impl ShardRegistry {
             schema: ns,
         });
         self.shards.insert(id, sr.clone());
+        self.touch(id);
+        self.evict_to_capacity();
         Some(sr)
     }
 
@@ -229,10 +300,8 @@ impl ShardRegistry {
             if let Some(shard) = self.shard(id) {
                 let searcher = shard.reader.searcher();
                 let term = tantivy::Term::from_field_text(shard.schema.event_id, event_id);
-                let q = tantivy::query::TermQuery::new(
-                    term,
-                    tantivy::schema::IndexRecordOption::Basic,
-                );
+                let q =
+                    tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
                 let top = searcher.search(&q, &TopDocs::with_limit(1))?;
                 if let Some((_score, addr)) = top.into_iter().next() {
                     let _ = filter;
@@ -274,9 +343,14 @@ impl ShardRegistry {
                 });
             }
         }
+        let (nofile_soft, _) = nostrsearch_indexer::mem::raise_nofile();
         RegistryStats {
             total_docs: total,
             shard_count: per_shard.len(),
+            open_readers: self.shards.len(),
+            max_open_readers: self.max_open,
+            open_fds: nostrsearch_indexer::mem::open_fds(),
+            nofile_soft,
             shards: per_shard,
         }
     }
@@ -296,7 +370,8 @@ fn hydrate(
             .unwrap_or("")
             .to_string()
     };
-    let get_u64 = |f: tantivy::schema::Field| doc.get_first(f).and_then(|v| v.as_u64()).unwrap_or(0);
+    let get_u64 =
+        |f: tantivy::schema::Field| doc.get_first(f).and_then(|v| v.as_u64()).unwrap_or(0);
     Ok(SearchHit {
         event_id: get_text(schema.event_id),
         pubkey: get_text(schema.pubkey),
@@ -312,6 +387,13 @@ fn hydrate(
 pub struct RegistryStats {
     pub total_docs: u64,
     pub shard_count: usize,
+    /// Shard readers currently held open (bounded by `MAX_OPEN_SHARD_READERS`).
+    pub open_readers: usize,
+    pub max_open_readers: usize,
+    /// Descriptors this process holds, and its soft limit — the pair you want
+    /// when diagnosing "Too many open files".
+    pub open_fds: Option<usize>,
+    pub nofile_soft: u64,
     pub shards: Vec<ShardStat>,
 }
 

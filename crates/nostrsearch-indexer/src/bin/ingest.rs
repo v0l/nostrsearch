@@ -152,6 +152,13 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    let (soft, hard) = nostrsearch_indexer::mem::raise_nofile();
+    tracing::info!(
+        nofile_soft = soft,
+        nofile_hard = hard,
+        "file descriptor limit"
+    );
+
     let args = Args::parse().map_err(anyhow::Error::msg)?;
 
     let cfg = PipelineConfig {

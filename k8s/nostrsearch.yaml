@@ -133,8 +133,30 @@ spec:
             # above the number of months the corpus spans — dumps are often
             # not date-ordered, and a smaller cap evicts writers that are
             # immediately needed again, paying a commit + fsync each time.
+            # ── File descriptors ────────────────────────────────────────────
+            # There is deliberately no ulimit/nofile setting here: the Pod spec
+            # has no such field (kubernetes#3595; KEP-5758 is adding
+            # securityContext.ulimits but it is not GA). Containers inherit the
+            # runtime's limits, and containerd dropped LimitNOFILE from its
+            # unit (containerd#8924) in favour of systemd's implicit
+            # 1024 soft / 524288 hard — so pods get a 1024 soft limit.
+            #
+            # That PR's stated expectation is that software needing more should
+            # raise its own soft limit, which is exactly what the server does at
+            # startup (soft -> hard, no privileges required). It logs the result
+            # as `file descriptor limit` and warns if the hard limit is low.
+            #
+            # Only if that warning fires does a node-level change help, e.g.
+            #   /etc/systemd/system/containerd.service.d/limits.conf
+            #   [Service]
+            #   LimitNOFILE=1024:1048576
             - name: MAX_OPEN_SHARDS
               value: "64"
+            # Shard *readers* held open for serving, LRU-evicted beyond this.
+            # Unlike writers these are cheap to reopen, so the cap exists to
+            # bound descriptors and reload-watcher threads, not memory.
+            - name: MAX_OPEN_SHARD_READERS
+              value: "48"
             - name: STATE_DIR
               value: /data/stats
             - name: WOT_OUT

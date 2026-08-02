@@ -11,7 +11,7 @@
 //! store before its document is durable would become a permanent hole on the
 //! next resume.
 
-use rocksdb::{BlockBasedOptions, Cache, Options, WriteBatch, DB};
+use rocksdb::{BlockBasedOptions, Cache, DB, Options, WriteBatch};
 use std::path::Path;
 
 pub struct IdStore {
@@ -30,6 +30,9 @@ impl IdStore {
         opts.set_block_based_table_factory(&bb);
         opts.set_write_buffer_size(64 * 1024 * 1024);
         opts.set_max_background_jobs(2);
+        // Bounded descriptor use: the default (-1) holds an fd per SST file,
+        // which grows without limit as the dedupe set does.
+        opts.set_max_open_files(256);
         Ok(Self {
             db: DB::open(&opts, path)?,
         })

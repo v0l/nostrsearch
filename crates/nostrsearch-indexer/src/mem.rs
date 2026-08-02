@@ -32,7 +32,7 @@ pub fn rss_mb() -> (u64, u64) {
 /// Container memory limit in MB, if running under a cgroup with one set.
 pub fn cgroup_limit_mb() -> Option<u64> {
     for p in [
-        "/sys/fs/cgroup/memory.max",                  // cgroup v2
+        "/sys/fs/cgroup/memory.max",                   // cgroup v2
         "/sys/fs/cgroup/memory/memory.limit_in_bytes", // cgroup v1
     ] {
         if let Ok(v) = std::fs::read_to_string(p) {
@@ -117,4 +117,45 @@ pub fn cgroup_usage_mb() -> Option<(u64, u64, u64)> {
         }
     }
     Some((current, anon, file))
+}
+
+// ── File descriptors ───────────────────────────────────────────────────────
+
+/// Raise the open-file soft limit to the hard limit, returning `(soft, hard)`
+/// as it stands afterwards.
+///
+/// A node serving `/archive` downloads and relay websockets spends descriptors
+/// on *sockets*, on top of RocksDB's SST handles and Tantivy's writer locks.
+/// The usual container default of 1024 is exhausted quickly by that
+/// combination, surfacing as "Too many open files" (EMFILE) on `accept`, which
+/// looks like a bug in whatever happened to call it first.
+///
+/// The soft limit is pure policy — any process may raise it to the hard limit
+/// without privileges — so doing it at startup is both safe and more reliable
+/// than asking every deployment to set `LimitNOFILE` / `--ulimit` correctly.
+pub fn raise_nofile() -> (u64, u64) {
+    unsafe {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
+            return (0, 0);
+        }
+        if lim.rlim_cur < lim.rlim_max {
+            let wanted = libc::rlimit {
+                rlim_cur: lim.rlim_max,
+                rlim_max: lim.rlim_max,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &wanted) == 0 {
+                lim.rlim_cur = lim.rlim_max;
+            }
+        }
+        (lim.rlim_cur, lim.rlim_max)
+    }
+}
+
+/// Number of descriptors this process currently holds (Linux only).
+pub fn open_fds() -> Option<usize> {
+    Some(std::fs::read_dir("/proc/self/fd").ok()?.count())
 }

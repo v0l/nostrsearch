@@ -59,6 +59,12 @@ impl GraphStore {
         // until written back, so a high-throughput writer can be killed while
         // its RSS is still small.
         opts.set_use_direct_io_for_flush_and_compaction(true);
+        // RocksDB defaults to -1 (keep every SST open). At corpus scale the
+        // graph is thousands of SSTs, so that alone can exhaust the process's
+        // descriptor budget and surface as "Too many open files" somewhere
+        // unrelated (an HTTP accept, a Tantivy open). Cap it and let RocksDB
+        // use its table cache instead.
+        opts.set_max_open_files(256);
         let db = DB::open(&opts, path.as_ref())
             .with_context(|| format!("opening graph store at {}", path.as_ref().display()))?;
         Ok(Self { db })

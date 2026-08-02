@@ -15,6 +15,13 @@ services:
     restart: unless-stopped
     ports:
       - "8080:8080"
+    # Archive downloads and relay websockets are descriptors too, on top of
+    # RocksDB SSTs and Tantivy writer locks. The process raises its own soft
+    # limit at startup, but it cannot exceed the hard limit set here.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
     environment:
       INDEX_ROOT: /data/index
       BIND: 0.0.0.0:8080

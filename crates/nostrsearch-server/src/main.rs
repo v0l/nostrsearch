@@ -35,6 +35,23 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // Serving `/archive` downloads and relay websockets spends descriptors on
+    // sockets, on top of RocksDB and Tantivy. Containers commonly default to a
+    // 1024 soft limit, which EMFILEs under real traffic; raise it to the hard
+    // limit before binding anything.
+    let (soft, hard) = nostrsearch_indexer::mem::raise_nofile();
+    tracing::info!(
+        nofile_soft = soft,
+        nofile_hard = hard,
+        "file descriptor limit"
+    );
+    if soft < 8192 {
+        tracing::warn!(
+            nofile_soft = soft,
+            "low descriptor limit; raise the container runtime's hard limit (LimitNOFILE / --ulimit nofile)"
+        );
+    }
+
     let index_root = env::index_root();
     let bind = std::env::var("BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
     let archive_dir = env::archive_dir();
