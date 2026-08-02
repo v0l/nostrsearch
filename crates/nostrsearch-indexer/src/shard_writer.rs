@@ -228,11 +228,7 @@ impl ShardManager {
         deleted: bool,
         superseded: bool,
     ) -> Result<ShardId, ShardError> {
-        let wot = self
-            .wot_lookup
-            .as_ref()
-            .map(|f| f(&ev.pubkey))
-            .unwrap_or(0);
+        let wot = self.wot_lookup.as_ref().map(|f| f(&ev.pubkey)).unwrap_or(0);
 
         // route by timestamp first (borrows self mutably)
         let id = ShardId::from_timestamp(ev.created_at);
@@ -264,22 +260,21 @@ impl ShardManager {
         // shards sequentially stalled the whole pipeline for 15-20s at every
         // checkpoint (the caller holds the pipeline lock); in parallel the
         // stall is the slowest single shard.
-        let results: Vec<(ShardId, u64, Result<(), ShardError>)> =
-            std::thread::scope(|scope| {
-                let handles: Vec<_> = self
-                    .shards
-                    .iter_mut()
-                    .map(|(id, shard)| {
-                        let id = *id;
-                        scope.spawn(move || {
-                            let dirty = shard.docs_since_commit > 0;
-                            let res = shard.commit();
-                            (id, if dirty { shard.total_docs } else { 0 }, res)
-                        })
+        let results: Vec<(ShardId, u64, Result<(), ShardError>)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = self
+                .shards
+                .iter_mut()
+                .map(|(id, shard)| {
+                    let id = *id;
+                    scope.spawn(move || {
+                        let dirty = shard.docs_since_commit > 0;
+                        let res = shard.commit();
+                        (id, if dirty { shard.total_docs } else { 0 }, res)
                     })
-                    .collect();
-                handles.into_iter().map(|h| h.join().unwrap()).collect()
-            });
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
         for (id, docs, res) in results {
             res?;
             if docs > 0 {
@@ -366,8 +361,11 @@ mod tests {
         let shard_dir = dir.path().join(ShardId::from_timestamp(ts).name());
         let (schema, _) = NostrSchema::build();
         let index = Index::open_in_dir(&shard_dir).unwrap_or_else(|_| {
-            Index::open_or_create(tantivy::directory::MmapDirectory::open(&shard_dir).unwrap(), schema)
-                .unwrap()
+            Index::open_or_create(
+                tantivy::directory::MmapDirectory::open(&shard_dir).unwrap(),
+                schema,
+            )
+            .unwrap()
         });
         let reader = index.reader().unwrap();
         assert_eq!(reader.searcher().num_docs(), 2);

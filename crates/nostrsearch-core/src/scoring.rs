@@ -16,10 +16,10 @@
 //! to zero at the half-life, which keeps old-but-relevant content findable
 //! while letting fresh content surface.
 
+use std::sync::Arc;
 use tantivy::collector::{Collector, SegmentCollector};
 use tantivy::columnar::ColumnValues;
 use tantivy::{DocId, Score, SegmentReader};
-use std::sync::Arc;
 
 /// Weights for the composite score.
 #[derive(Debug, Clone, Copy)]

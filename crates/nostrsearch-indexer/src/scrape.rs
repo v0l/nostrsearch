@@ -14,7 +14,7 @@
 //!   finished work instead of re-scraping.
 
 use chrono::{Datelike, TimeZone, Utc};
-use rocksdb::{Options, DB};
+use rocksdb::{DB, Options};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::Path;
@@ -416,14 +416,21 @@ async fn scrape_relay<S: Sink>(
                 consecutive_fails = 0;
                 info.fails = 0;
                 info.last_ok = chrono::Utc::now().timestamp() as u64;
-                state.put_day(&date, url, &DayDone { seen, new, at: info.last_ok });
+                state.put_day(
+                    &date,
+                    url,
+                    &DayDone {
+                        seen,
+                        new,
+                        at: info.last_ok,
+                    },
+                );
                 if seen == 0 {
                     consecutive_empty += 1;
                     if consecutive_empty >= cfg.empty_days_limit {
                         // The horizon is where data was last seen, not where
                         // we noticed: the whole empty streak is before it.
-                        info.birthday =
-                            Some(start + u64::from(cfg.empty_days_limit) * 86_400);
+                        info.birthday = Some(start + u64::from(cfg.empty_days_limit) * 86_400);
                         tracing::info!(
                             relay = url,
                             empty_days = consecutive_empty,

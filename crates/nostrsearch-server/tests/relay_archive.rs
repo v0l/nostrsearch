@@ -76,8 +76,7 @@ async fn signed_event_published_to_relay_lands_in_archive() -> anyhow::Result<()
     assert!(known, "relay-published event should be archived");
 
     // And the archive HTTP listing should expose a file.
-    let body: serde_json::Value =
-        reqwest_get_json(&format!("http://{addr}/archive/files")).await?;
+    let body: serde_json::Value = reqwest_get_json(&format!("http://{addr}/archive/files")).await?;
     assert!(
         body.as_array().map(|a| !a.is_empty()).unwrap_or(false),
         "archive listing should contain at least one file, got {body}"

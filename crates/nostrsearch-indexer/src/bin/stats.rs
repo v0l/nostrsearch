@@ -43,11 +43,25 @@ impl Args {
         let mut it = std::env::args().skip(1);
         while let Some(a) = it.next() {
             match a.as_str() {
-                "--input-dir" => input_dir = Some(PathBuf::from(it.next().ok_or("--input-dir value")?)),
+                "--input-dir" => {
+                    input_dir = Some(PathBuf::from(it.next().ok_or("--input-dir value")?))
+                }
                 "--state-dir" => state_dir = PathBuf::from(it.next().ok_or("--state-dir value")?),
                 "--wot-out" => wot_out = PathBuf::from(it.next().ok_or("--wot-out value")?),
-                "--parallelism" => parallelism = it.next().ok_or("--parallelism value")?.parse().map_err(|_| "bad parallelism")?,
-                "--chunk-size" => chunk_size = it.next().ok_or("--chunk-size value")?.parse().map_err(|_| "bad chunk-size")?,
+                "--parallelism" => {
+                    parallelism = it
+                        .next()
+                        .ok_or("--parallelism value")?
+                        .parse()
+                        .map_err(|_| "bad parallelism")?
+                }
+                "--chunk-size" => {
+                    chunk_size = it
+                        .next()
+                        .ok_or("--chunk-size value")?
+                        .parse()
+                        .map_err(|_| "bad chunk-size")?
+                }
                 "--no-dedupe" => dedupe = false,
                 "-h" | "--help" => {
                     println!("{}", help());
@@ -97,7 +111,10 @@ fn main() -> anyhow::Result<()> {
 
     let args = Args::parse().map_err(anyhow::Error::msg)?;
     if !args.input_dir.is_dir() {
-        anyhow::bail!("--input-dir {} is not a directory", args.input_dir.display());
+        anyhow::bail!(
+            "--input-dir {} is not a directory",
+            args.input_dir.display()
+        );
     }
 
     let store = StatStore::new(&args.state_dir)?;
@@ -122,17 +139,24 @@ fn main() -> anyhow::Result<()> {
 
     // progress reporter
     let total_prog = total.clone();
-    std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_secs(5));
-        let done = total_prog.load(Ordering::Relaxed);
-        if done > 0 {
-            let rate = done as f64 / started.elapsed().as_secs_f64();
-            eprintln!("  scanned={done}  rate={rate:.0}/s  elapsed={:.0}s", started.elapsed().as_secs_f64());
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            let done = total_prog.load(Ordering::Relaxed);
+            if done > 0 {
+                let rate = done as f64 / started.elapsed().as_secs_f64();
+                eprintln!(
+                    "  scanned={done}  rate={rate:.0}/s  elapsed={:.0}s",
+                    started.elapsed().as_secs_f64()
+                );
+            }
         }
     });
 
     let parallelism = if args.parallelism == 0 {
-        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
     } else {
         args.parallelism
     };
@@ -154,7 +178,11 @@ fn main() -> anyhow::Result<()> {
                     pubkey: ev.pubkey.to_string(),
                     created_at: ev.created_at,
                     kind: ev.kind as u16,
-                    tags: ev.tags.iter().map(|t| t.iter().map(|s| s.to_string()).collect()).collect(),
+                    tags: ev
+                        .tags
+                        .iter()
+                        .map(|t| t.iter().map(|s| s.to_string()).collect())
+                        .collect(),
                     content: ev.content.to_string(),
                     sig: ev.sig.to_string(),
                 });

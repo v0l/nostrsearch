@@ -15,14 +15,12 @@
 use nostr_archive_cursor::DefaultJsonFilesDatabase;
 use nostr_sdk::prelude::*;
 use nostrsearch_indexer::id_store::IdStore;
-use nostrsearch_indexer::scrape::{
-    discover_relays, RelayInfo, ScrapeConfig, ScrapeState, Sink,
-};
+use nostrsearch_indexer::scrape::{RelayInfo, ScrapeConfig, ScrapeState, Sink, discover_relays};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::node::{to_core, EventSink};
+use crate::node::{EventSink, to_core};
 
 /// Sink into the unified node: archive DB is the arbiter of novelty, the
 /// writer task feeds index + stats.
@@ -37,7 +35,10 @@ struct NodeSink {
 
 impl NodeSink {
     fn in_dedupe(&self, id: &[u8; 32]) -> bool {
-        self.dedupe.as_ref().map(|s| s.contains(id)).unwrap_or(false)
+        self.dedupe
+            .as_ref()
+            .map(|s| s.contains(id))
+            .unwrap_or(false)
     }
 }
 
@@ -122,9 +123,7 @@ impl ScraperOptions {
             min_date: std::env::var("SCRAPE_MIN_DATE")
                 .ok()
                 .and_then(|v| nostrsearch_indexer::scrape::parse_date(&v))
-                .unwrap_or_else(|| {
-                    nostrsearch_indexer::scrape::parse_date("2022-01-01").unwrap()
-                }),
+                .unwrap_or_else(|| nostrsearch_indexer::scrape::parse_date("2022-01-01").unwrap()),
             max_relays: u("SCRAPE_MAX_RELAYS", 200) as usize,
             min_sources: u("SCRAPE_MIN_SOURCES", 3) as u32,
             concurrency: u("SCRAPE_CONCURRENCY", 8) as usize,
@@ -164,9 +163,7 @@ pub fn spawn_scraper(
         let mut last_discovery = std::time::Instant::now() - opts.rediscover_interval;
         loop {
             // (Re-)discover targets from kind-10002 lists in the index.
-            if last_discovery.elapsed() >= opts.rediscover_interval
-                || state.relays().is_empty()
-            {
+            if last_discovery.elapsed() >= opts.rediscover_interval || state.relays().is_empty() {
                 let root = opts.index_root.clone();
                 match tokio::task::spawn_blocking(move || discover_relays(&root)).await {
                     Ok(Ok(found)) => {
@@ -199,8 +196,7 @@ pub fn spawn_scraper(
                     concurrency: opts.concurrency,
                     empty_days_limit: opts.birthday_days,
                 };
-                nostrsearch_indexer::scrape::run_pass(state.clone(), node_sink.clone(), cfg)
-                    .await;
+                nostrsearch_indexer::scrape::run_pass(state.clone(), node_sink.clone(), cfg).await;
                 tracing::info!(
                     seen = node_sink.seen.load(Ordering::Relaxed),
                     new = node_sink.new.load(Ordering::Relaxed),

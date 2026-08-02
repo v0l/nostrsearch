@@ -30,7 +30,9 @@ pub struct NoQuery;
 
 impl QueryPolicy for NoQuery {
     fn admit_query(&self, _q: &Filter, _addr: &SocketAddr) -> BoxedFuture<'_, PolicyResult> {
-        Box::pin(async move { PolicyResult::Reject("queries not allowed; use /search".to_string()) })
+        Box::pin(
+            async move { PolicyResult::Reject("queries not allowed; use /search".to_string()) },
+        )
     }
 }
 
@@ -45,7 +47,11 @@ impl KindPolicy {
 }
 
 impl WritePolicy for KindPolicy {
-    fn admit_event<'a>(&'a self, ev: &'a Event, _addr: &SocketAddr) -> BoxedFuture<'a, PolicyResult> {
+    fn admit_event<'a>(
+        &'a self,
+        ev: &'a Event,
+        _addr: &SocketAddr,
+    ) -> BoxedFuture<'a, PolicyResult> {
         Box::pin(async move {
             if self.0.contains(&ev.kind) {
                 PolicyResult::Accept
@@ -80,9 +86,8 @@ impl RelayState {
                 notes_per_minute: 100_000,
             });
         if let Some(k) = kinds {
-            builder = builder.write_policy(KindPolicy::new(
-                k.into_iter().map(Kind::Custom).collect(),
-            ));
+            builder =
+                builder.write_policy(KindPolicy::new(k.into_iter().map(Kind::Custom).collect()));
         }
         Self {
             relay: LocalRelay::new(builder),

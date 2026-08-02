@@ -50,7 +50,11 @@ fn index_and_search_real_events() {
                                 pubkey: ev.pubkey.to_string(),
                                 created_at: ev.created_at,
                                 kind: ev.kind as u16,
-                                tags: ev.tags.iter().map(|t| t.iter().map(|s| s.to_string()).collect()).collect(),
+                                tags: ev
+                                    .tags
+                                    .iter()
+                                    .map(|t| t.iter().map(|s| s.to_string()).collect())
+                                    .collect(),
                                 content: ev.content.to_string(),
                                 sig: ev.sig.to_string(),
                             };
@@ -95,7 +99,10 @@ fn index_and_search_real_events() {
     // --- search ---
     let mut reg = ShardRegistry::open(&index_root, ScoreWeights::default()).unwrap();
     let stats = reg.stats();
-    eprintln!("stats: {} docs across {} shards", stats.total_docs, stats.shard_count);
+    eprintln!(
+        "stats: {} docs across {} shards",
+        stats.total_docs, stats.shard_count
+    );
     assert_eq!(stats.total_docs as usize, indexed);
 
     // full-text search for a word we know exists in kind-1 content
@@ -117,7 +124,10 @@ fn index_and_search_real_events() {
         };
         let hits = reg.search(&filter).unwrap();
         eprintln!("full-text hits: {}", hits.len());
-        assert!(!hits.is_empty(), "expected at least one full-text hit for '{term}'");
+        assert!(
+            !hits.is_empty(),
+            "expected at least one full-text hit for '{term}'"
+        );
         assert!(hits.iter().all(|h| h.kind == 1));
     }
 
@@ -132,6 +142,9 @@ fn index_and_search_real_events() {
     assert!(!hits.is_empty());
     // ordered by created_at desc
     for w in hits.windows(2) {
-        assert!(w[0].created_at >= w[1].created_at, "results sorted by recency");
+        assert!(
+            w[0].created_at >= w[1].created_at,
+            "results sorted by recency"
+        );
     }
 }

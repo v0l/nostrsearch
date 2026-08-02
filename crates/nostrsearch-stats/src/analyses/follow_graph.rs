@@ -138,7 +138,10 @@ mod tests {
             pubkey: pk_hex(author),
             created_at,
             kind: 3,
-            tags: follows.iter().map(|p| vec!["p".into(), pk_hex(*p)]).collect(),
+            tags: follows
+                .iter()
+                .map(|p| vec!["p".into(), pk_hex(*p)])
+                .collect(),
             content: String::new(),
             sig: "c".repeat(128),
         }
@@ -177,9 +180,18 @@ mod tests {
 
         let mut world = World::new();
         g.contribute(&mut world);
-        assert_eq!(world.follower_count(&Pubkey::from_hex(&pk_hex(3)).unwrap()), 2);
-        assert_eq!(world.follower_count(&Pubkey::from_hex(&pk_hex(4)).unwrap()), 0);
-        assert_eq!(world.follower_count(&Pubkey::from_hex(&pk_hex(7)).unwrap()), 0);
+        assert_eq!(
+            world.follower_count(&Pubkey::from_hex(&pk_hex(3)).unwrap()),
+            2
+        );
+        assert_eq!(
+            world.follower_count(&Pubkey::from_hex(&pk_hex(4)).unwrap()),
+            0
+        );
+        assert_eq!(
+            world.follower_count(&Pubkey::from_hex(&pk_hex(7)).unwrap()),
+            0
+        );
 
         drop(g);
         drop(store);

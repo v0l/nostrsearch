@@ -76,7 +76,11 @@ impl Analysis for TrendingHashtags {
                 mentions: self.mentions.get(tag).copied().unwrap_or(0),
             })
             .collect();
-        out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        out.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         out.truncate(100);
         out
     }
@@ -92,7 +96,10 @@ mod tests {
             pubkey: "b".repeat(64),
             created_at,
             kind: 1,
-            tags: tags.iter().map(|t| vec!["t".to_string(), t.to_string()]).collect(),
+            tags: tags
+                .iter()
+                .map(|t| vec!["t".to_string(), t.to_string()])
+                .collect(),
             content: String::new(),
             sig: "c".repeat(128),
         }

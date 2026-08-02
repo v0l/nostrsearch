@@ -79,7 +79,9 @@ pub fn router(state: ArchiveState) -> Router {
 }
 
 /// JSON listing of archive files, newest first.
-async fn files_json(State(st): State<ArchiveState>) -> Result<Json<Vec<ArchiveFileInfo>>, Response> {
+async fn files_json(
+    State(st): State<ArchiveState>,
+) -> Result<Json<Vec<ArchiveFileInfo>>, Response> {
     let mut files = list(&st).await?;
     files.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
     Ok(Json(files))
@@ -121,7 +123,11 @@ async fn list(st: &ArchiveState) -> Result<Vec<ArchiveFileInfo>, Response> {
     .await
     .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")).into_response())?
     .map_err(|e| {
-        (StatusCode::INTERNAL_SERVER_ERROR, format!("list failed: {e}")).into_response()
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("list failed: {e}"),
+        )
+            .into_response()
     })?;
     Ok(entries)
 }
@@ -132,7 +138,10 @@ async fn serve_file(
     AxPath(file): AxPath<String>,
 ) -> Result<Response, Response> {
     // Reject traversal and anything that isn't an archive dump.
-    if file.contains("..") || file.contains('/') || file.contains('\\') || !file.starts_with("events_")
+    if file.contains("..")
+        || file.contains('/')
+        || file.contains('\\')
+        || !file.starts_with("events_")
     {
         return Err((StatusCode::BAD_REQUEST, "invalid file name").into_response());
     }

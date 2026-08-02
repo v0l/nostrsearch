@@ -22,11 +22,11 @@
 //!   between them keeps memory flat over a 763 GiB corpus.
 
 pub mod env;
-pub mod mem;
 pub mod firehose;
 pub mod id_store;
-pub mod scrape;
+pub mod mem;
 pub mod pipeline;
+pub mod scrape;
 pub mod shard_writer;
 
 pub use pipeline::{Pipeline, PipelineConfig};

@@ -208,8 +208,7 @@ impl<'a> QueryPlanner<'a> {
         let text_query: Option<Box<dyn Query>> = if free_terms.is_empty() {
             None
         } else {
-            let qp =
-                QueryParser::for_index(self.index, vec![self.schema.content]);
+            let qp = QueryParser::for_index(self.index, vec![self.schema.content]);
             let joined = free_terms.join(" ");
             Some(qp.parse_query(&joined)?)
         };

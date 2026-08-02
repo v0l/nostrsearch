@@ -84,7 +84,7 @@ impl NostrEvent {
             | 30024    // draft long-form
             | 30078    // app-specific data (often descriptive)
             | 30402    // classified listing (NIP-99)
-            | 34550    // community definition (NIP-72)
+            | 34550 // community definition (NIP-72)
         )
     }
 }
@@ -112,7 +112,12 @@ mod tests {
     fn tag_values_filters_and_skips_short_tags() {
         let e = ev(
             1,
-            vec![vec!["t", "nostr"], vec!["t"], vec!["p", "x"], vec!["t", "bitcoin"]],
+            vec![
+                vec!["t", "nostr"],
+                vec!["t"],
+                vec!["p", "x"],
+                vec!["t", "bitcoin"],
+            ],
         );
         let t: Vec<&str> = e.tag_values("t").collect();
         assert_eq!(t, vec!["nostr", "bitcoin"]);

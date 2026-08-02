@@ -26,7 +26,10 @@ pub struct ShardId {
 impl ShardId {
     /// The shard that owns a given `created_at` (unix seconds).
     pub fn from_timestamp(ts: u64) -> Self {
-        let dt = Utc.timestamp_opt(ts as i64, 0).single().unwrap_or_else(Utc::now);
+        let dt = Utc
+            .timestamp_opt(ts as i64, 0)
+            .single()
+            .unwrap_or_else(Utc::now);
         Self {
             year: dt.year(),
             month: dt.month(),
@@ -41,7 +44,11 @@ impl ShardId {
 
     /// First unix second of this shard (inclusive).
     pub fn start_ts(&self) -> u64 {
-        self.start_date().and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp() as u64
+        self.start_date()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+            .timestamp() as u64
     }
 
     /// First unix second of the *next* shard (exclusive upper bound).
@@ -90,11 +97,7 @@ impl std::fmt::Display for ShardId {
 /// `None` bounds are open-ended. An open `since` starts at the earliest shard
 /// the caller knows about (`earliest`), an open `until` ends at the current
 /// month. This is the shard-pruning entry point.
-pub fn shards_in_range(
-    since: Option<u64>,
-    until: Option<u64>,
-    earliest: ShardId,
-) -> Vec<ShardId> {
+pub fn shards_in_range(since: Option<u64>, until: Option<u64>, earliest: ShardId) -> Vec<ShardId> {
     let now = Utc::now();
     let current = ShardId::new(now.year(), now.month());
 
