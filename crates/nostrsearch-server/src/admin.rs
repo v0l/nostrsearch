@@ -269,6 +269,7 @@ async fn auth(State(st): State<AdminState>, req: Request, next: Next) -> Respons
 pub fn router(state: AdminState) -> Router {
     Router::new()
         .route("/analyses", get(analyses))
+        .route("/analyses/reset-all", post(reset_all))
         .route("/analyses/{name}/reset", post(reset_analysis))
         .route("/ingest", get(ingest_status).post(start_ingest))
         .route("/ingest/cancel", post(cancel_ingest))
@@ -295,6 +296,91 @@ struct ResetResult {
     reset: Vec<&'static str>,
     rebuild: bool,
     detail: String,
+}
+
+/// `POST /admin/analyses/reset-all`
+///
+/// Discards every analysis -- external storage included, so the follow graph
+/// goes too -- and rebuilds the lot from the archive.
+///
+/// This is the operation to reach for when report numbers are not trusted.
+/// Resetting analyses individually leaves the rest holding totals folded from
+/// state that has since been discarded, and answering "is this number still
+/// right?" for each one is harder than rebuilding everything.
+///
+/// Cancels any replay in flight: an ingest that was running would otherwise
+/// keep the rebuild from starting, and its own progress is meaningless once the
+/// analyses it was feeding have been emptied.
+async fn reset_all(State(st): State<AdminState>) -> Response {
+    let Some(rp) = st.replay.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "error": "this node has no archive to rebuild from; refusing to \
+                          empty the analyses with no way to refill them"
+            })),
+        )
+            .into_response();
+    };
+
+    rp.state.cancel();
+    for _ in 0..50 {
+        if !rp.state.is_running() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    if rp.state.is_running() {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "a replay is still stopping; retry shortly"
+            })),
+        )
+            .into_response();
+    }
+
+    let reset = match st.ctl.reset_all().await {
+        Ok(names) => names,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response();
+        }
+    };
+
+    let started = crate::replay::spawn(
+        rp.state.clone(),
+        rp.dir,
+        crate::replay::ReplaySelection {
+            files: Vec::new(), // every dump
+            rebuild: true,
+        },
+        rp.dedupe,
+        rp.sink,
+        Some(st.ctl.clone()),
+    );
+
+    match started {
+        Ok(()) => Json(ResetResult {
+            reset,
+            rebuild: true,
+            detail: "all analyses cleared; rebuilding from the whole archive, \
+                     poll GET /admin/ingest"
+                .into(),
+        })
+        .into_response(),
+        Err(e) => (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("analyses were cleared but the rebuild did not start: {e}"),
+                "reset": reset,
+            })),
+        )
+            .into_response(),
+    }
 }
 
 /// `POST /admin/analyses/{name}/reset`

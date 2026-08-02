@@ -73,6 +73,17 @@ pub trait Analysis: Send + Sync {
     /// Stable identifier — used as the file/endpoint name.
     fn name(&self) -> &'static str;
 
+    /// Discard state this analysis keeps *outside* itself.
+    ///
+    /// Called on reset, while the handles are still live, before the struct is
+    /// replaced with its default. Without it an analysis backed by external
+    /// storage cannot be reset at all: clearing the struct leaves the store
+    /// fully populated, and `follow_graph` then rejects every replayed contact
+    /// list as not-newer-than what it already holds, folding nothing. Its
+    /// report stayed empty through a reset and a full archive rebuild, with
+    /// `observed=1102, consumed=0` the only sign anything was wrong.
+    fn on_reset(&mut self) {}
+
     /// Attach shared external storage. Called by the registry after `load`
     /// and before any `observe`, so analyses whose state is too large for RAM
     /// (the follow graph) can keep it on disk instead of serializing it.

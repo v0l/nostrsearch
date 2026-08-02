@@ -204,6 +204,23 @@ impl Pipeline {
         self.registry.rebuilding()
     }
 
+    /// Reset every analysis and persist immediately, so a restart cannot
+    /// resurrect the old state.
+    pub fn reset_all_analyses(&mut self) -> Vec<&'static str> {
+        let names = self.registry.reset_all();
+        // The world is derived from analyses that no longer hold anything, so
+        // leaving it in place would keep labelling events with a web of trust
+        // that has been discarded.
+        self.world = Default::default();
+        if let Some(store) = &self.store
+            && let Err(e) = self.registry.persist(store)
+        {
+            tracing::warn!(error = %e, "persisting reset failed");
+        }
+        tracing::info!(reset = ?names, "all analyses reset; rebuilding from the archive");
+        names
+    }
+
     /// Relay targets from the `relays` report, most advertised first.
     ///
     /// Empty until something has folded a relay list, which tells the scraper

@@ -294,3 +294,44 @@ async fn resetting_an_analysis_requires_auth_and_reports_unknown_names() -> anyh
 
     Ok(())
 }
+
+/// `reset-all` clears every analysis and reports what it cleared.
+#[tokio::test]
+async fn reset_all_clears_every_analysis() -> anyhow::Result<()> {
+    let admin = Keys::generate();
+    let base = serve(&admin).await?;
+    let http = reqwest::Client::new();
+    let url = format!("{base}/admin/analyses/reset-all");
+
+    // Unauthenticated is refused, like every other admin route.
+    let r = http.post(&url).send().await?;
+    assert_eq!(r.status(), 401);
+
+    let r = http
+        .post(&url)
+        .header("Authorization", nip98(&admin, &url, "POST", None).await?)
+        .send()
+        .await?;
+
+    // Without an archive the node refuses rather than emptying the analyses
+    // with no way to refill them.
+    if r.status() == 503 {
+        let body: serde_json::Value = r.json().await?;
+        assert!(
+            body["error"].as_str().unwrap_or("").contains("archive"),
+            "503 must explain the missing archive: {body}"
+        );
+        return Ok(());
+    }
+
+    assert_eq!(r.status(), 200);
+    let body: serde_json::Value = r.json().await?;
+    let reset = body["reset"].as_array().expect("names of what was cleared");
+    for expected in ["follow_graph", "activity", "active_users", "client_tags"] {
+        assert!(
+            reset.iter().any(|n| n == expected),
+            "reset-all must clear {expected}: {reset:?}"
+        );
+    }
+    Ok(())
+}

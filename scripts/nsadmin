@@ -12,7 +12,7 @@
 #   nsadmin [-u URL] [-k NSEC] <command> [args]
 #
 #   reset-analysis <name>...   re-derive one or more reports
-#   reset-all-reports          reset activity, active_users, client_tags
+#   reset-all                  clear every analysis and rebuild from the archive
 #   analyses                   per-analysis progress
 #   ingest [file]...           replay archive dumps (all dumps if none given)
 #   ingest-status              replay progress
@@ -119,14 +119,13 @@ case "$cmd" in
       call POST "/admin/analyses/${name}/reset" || rc=1
     done ;;
 
-  reset-all-reports)
-    # The three ported dashboard reports. follow_graph and pagerank are left
-    # alone: they hold the web-of-trust the search ranking depends on, and
-    # rebuilding them is expensive.
-    for name in activity active_users client_tags; do
-      printf '== reset %s\n' "$name"
-      call POST "/admin/analyses/${name}/reset" || rc=1
-    done ;;
+  reset-all)
+    # Everything, follow graph included, then a rebuild over the whole archive.
+    #
+    # Resetting reports one at a time leaves the others holding totals folded
+    # from state that has since been discarded, so the numbers stay wrong in a
+    # way nothing reports. If the reports are not trusted, rebuild the lot.
+    call POST "/admin/analyses/reset-all" ;;
 
   ingest)
     q=""

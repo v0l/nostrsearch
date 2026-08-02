@@ -46,7 +46,7 @@ fn contacts(author: &str, follows: &[String], created_at: u64) -> NostrEvent {
 }
 
 #[test]
-fn resetting_follow_graph_keeps_the_web_of_trust() {
+fn losing_the_checkpoint_keeps_the_web_of_trust() {
     let dir = tempdir("wot");
     let store = StatStore::new(&dir).unwrap();
     let world = World::new();
@@ -71,12 +71,25 @@ fn resetting_follow_graph_keeps_the_web_of_trust() {
     assert_eq!(before.follower_count(&star_key), 20);
     assert!(before.wot_tier(&star_key) >= 1, "should be trusted");
 
-    // Operator resets the analysis, then it is re-attached as on restart.
-    assert!(reg.reset("follow_graph").is_some());
-    reg.attach_all(store.dir()).unwrap();
+    // A restart that loses the serialized state but keeps the graph: a corrupt
+    // checkpoint, or an epoch bump. The adjacency on disk is untouched, so the
+    // follower counts are derivable and must not be thrown away -- rebuilding
+    // them from contact lists would take longer than collecting the corpus did.
+    //
+    // This is deliberately *not* a reset. A reset clears the graph as well, so
+    // the web of trust is empty until the rebuild refills it; that is what
+    // reset means, and `reset_lets_the_graph_re_derive_from_replayed_events`
+    // covers it.
+    // Drop the first registry: RocksDB holds an exclusive lock, so this is
+    // also what makes it a restart rather than two live handles.
+    drop(reg);
+
+    let mut restarted = Registry::new();
+    restarted.register(FollowGraph::default());
+    restarted.attach_all(store.dir()).unwrap();
 
     let mut after = World::new();
-    reg.materialize_all(2000, &mut after).unwrap();
+    restarted.materialize_all(2000, &mut after).unwrap();
 
     assert_eq!(
         after.follower_count(&star_key),
@@ -86,7 +99,7 @@ fn resetting_follow_graph_keeps_the_web_of_trust() {
     assert_eq!(
         after.wot_tier(&star_key),
         before.wot_tier(&star_key),
-        "resetting an analysis must not silently drop the web of trust"
+        "losing the checkpoint must not silently drop the web of trust"
     );
 
     std::fs::remove_dir_all(&dir).ok();
@@ -138,6 +151,68 @@ fn resetting_a_dependency_cascades_to_its_dependents() {
     );
 
     assert!(reg.reset("nope").is_none(), "unknown names are reported");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// After a reset, replaying the same contact lists must rebuild the graph.
+///
+/// Contact lists are replaceable, so `FollowGraph::observe` drops any event not
+/// newer than what the store already holds. Reset cleared the in-memory struct
+/// and left the RocksDB adjacency fully populated, so every replayed list was
+/// rejected as stale and the graph re-derived nothing -- on the live node,
+/// `observed=1102, consumed=0` after a reset and an archive rebuild, with the
+/// report simply staying empty.
+#[test]
+fn reset_lets_the_graph_re_derive_from_replayed_events() {
+    let dir = tempdir("rederive");
+    let store = StatStore::new(&dir).unwrap();
+    let world = World::new();
+    let star = pk(200);
+
+    let mut reg = Registry::new();
+    reg.register(FollowGraph::default());
+    reg.load(&store).unwrap();
+
+    let events: Vec<_> = (0..20u8)
+        .map(|i| contacts(&pk(i), std::slice::from_ref(&star), 1000 + i as u64))
+        .collect();
+    for ev in &events {
+        reg.observe(ev, 2000, &world);
+    }
+
+    let mut before = World::new();
+    reg.materialize_all(2000, &mut before).unwrap();
+    let star_key = nostrsearch_stats::Pubkey::from_hex(&star).unwrap();
+    assert_eq!(before.follower_count(&star_key), 20);
+
+    // Reset, then replay exactly the same events, as a rebuild over the
+    // archive does.
+    reg.reset("follow_graph").expect("exists");
+    reg.attach_all(store.dir()).unwrap();
+
+    for ev in &events {
+        reg.observe(ev, 2000, &world);
+    }
+    let consumed: u64 = reg
+        .status()
+        .into_iter()
+        .find(|s| s.name == "follow_graph")
+        .map(|s| s.consumed)
+        .unwrap_or(0);
+    assert!(
+        consumed > 0,
+        "a reset graph must accept replayed contact lists, not reject them as stale \
+         (observed them and consumed none is exactly the live symptom)"
+    );
+
+    let mut after = World::new();
+    reg.materialize_all(2000, &mut after).unwrap();
+    assert_eq!(
+        after.follower_count(&star_key),
+        20,
+        "the graph must re-derive to the same shape from the same events"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }

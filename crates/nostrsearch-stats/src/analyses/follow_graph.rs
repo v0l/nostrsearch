@@ -89,6 +89,17 @@ impl Analysis for FollowGraph {
         Ok(())
     }
 
+    fn on_reset(&mut self) {
+        // The adjacency is the analysis. Clearing `counts` alone leaves every
+        // stored contact list in place, and `observe` drops anything not newer
+        // than what it holds -- so a reset would fold nothing, for ever.
+        if let Some(store) = &self.store
+            && let Err(e) = store.clear()
+        {
+            tracing::error!(error = %e, "clearing the follow graph failed; reset is incomplete");
+        }
+    }
+
     fn kinds(&self) -> Option<&[u16]> {
         Some(KIND_CONTACTS)
     }

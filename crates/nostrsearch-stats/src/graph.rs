@@ -93,6 +93,30 @@ impl GraphStore {
     }
 
     /// Replace an author's contact list.
+    /// Delete every adjacency record.
+    ///
+    /// Needed for reset to mean anything: contact lists are replaceable, so
+    /// `FollowGraph` drops any event not newer than what it already holds. A
+    /// reset that left the store populated made every replayed contact list
+    /// look stale, and the graph could never be re-derived from the archive.
+    pub fn clear(&self) -> Result<()> {
+        let mut batch = rocksdb::WriteBatch::default();
+        let mut n = 0u64;
+        for kv in self.db.iterator(rocksdb::IteratorMode::Start) {
+            let Ok((k, _)) = kv else { break };
+            batch.delete(&k);
+            n += 1;
+            // Bounded batches: the graph holds millions of authors and one
+            // batch for all of them is a large allocation plus a long stall.
+            if batch.len() >= 10_000 {
+                self.db.write(std::mem::take(&mut batch))?;
+            }
+        }
+        self.db.write(batch)?;
+        tracing::info!(authors = n, "cleared follow graph");
+        Ok(())
+    }
+
     pub fn put(&self, author: &Pubkey, created_at: u64, follows: &[Pubkey]) -> Result<()> {
         let mut buf = Vec::with_capacity(8 + follows.len() * 32);
         buf.extend_from_slice(&created_at.to_le_bytes());

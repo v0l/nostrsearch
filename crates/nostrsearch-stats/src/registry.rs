@@ -90,6 +90,9 @@ where
         Analysis::drain_delta(self)
     }
     fn reset_to_default(&mut self) {
+        // Clear external storage first, while this value still holds the
+        // handles to it. Replacing self drops them.
+        Analysis::on_reset(self);
         *self = A::default();
     }
     fn checkpoint_bin(&self) -> Result<Vec<u8>> {
@@ -702,6 +705,26 @@ impl Registry {
         }
         doomed.sort_unstable();
         Some(doomed)
+    }
+
+    /// Reset every analysis, external storage included.
+    ///
+    /// Returns the names cleared. Unlike resetting one analysis there is no
+    /// dependency question to answer -- everything goes -- which makes this the
+    /// honest way to rebuild reports whose numbers are suspect, rather than
+    /// resetting them one at a time and reasoning about what each one's stored
+    /// totals were derived from.
+    pub fn reset_all(&mut self) -> Vec<&'static str> {
+        let mut names = Vec::with_capacity(self.entries.len());
+        for e in self.entries.iter_mut() {
+            e.analysis.reset_to_default();
+            e.progress = Progress::fresh(e.analysis.epoch());
+            e.resuming = false;
+            names.push(e.analysis.name());
+        }
+        self.total_events = 0;
+        names.sort_unstable();
+        names
     }
 
     /// Names of analyses that have not completed a backfill over the corpus.
