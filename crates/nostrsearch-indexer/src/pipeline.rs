@@ -345,8 +345,18 @@ impl Pipeline {
     /// Switch from backfill to live mode: finalize backfill, refresh WoT once,
     /// and start applying the watermark-gated live fold.
     pub fn go_live(&mut self) {
-        if let Err(e) = self.registry.mark_all_backfilled() {
-            tracing::warn!(error = %e, "mark_all_backfilled failed");
+        // Only analyses that actually consumed events are complete. A live-only
+        // node (the server) never replays the corpus, so claiming otherwise
+        // leaves a newly added report looking like "barely any activity"
+        // instead of "not computed yet".
+        let outstanding = self.registry.mark_backfilled_where_observed();
+        if !outstanding.is_empty() {
+            tracing::warn!(
+                analyses = ?outstanding,
+                "these analyses have never seen the corpus; their reports cover only \
+                 events observed from now on. Run `ingest --input-dir <archive>` against \
+                 the same --state-dir to backfill them"
+            );
         }
         self.refresh_inner(true);
         self.live = true;

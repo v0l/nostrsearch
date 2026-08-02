@@ -18,6 +18,11 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// How far ahead of the reference clock a `created_at` may be and still be
+/// allowed to advance an analysis watermark. Publisher clocks drift; the year
+/// 55913 is not drift.
+pub const FUTURE_SKEW_SECS: u64 = 300;
+
 /// Object-safe view over any [`Analysis`].
 pub trait DynAnalysis: Send + Sync {
     fn name(&self) -> &'static str;
@@ -192,7 +197,26 @@ impl Registry {
                     // indistinguishable from a slow boot. Re-derive that one
                     // analysis from the corpus instead.
                     match e.analysis.restore_bin(&state) {
-                        Ok(()) => e.progress = progress,
+                        Ok(()) => {
+                            e.progress = progress;
+                            // Repair a watermark poisoned by a future-dated
+                            // event before `advance_bounded` existed. Left
+                            // alone, the analysis consumes nothing until
+                            // wall-clock time reaches that timestamp.
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            let max_ts = now.saturating_add(FUTURE_SKEW_SECS);
+                            if e.progress.clamp_watermark(max_ts) {
+                                tracing::warn!(
+                                    analysis = name,
+                                    max_ts,
+                                    "watermark was ahead of now; clamped so the analysis \
+                                     resumes consuming events"
+                                );
+                            }
+                        }
                         Err(err) => {
                             tracing::warn!(
                                 analysis = name,
@@ -326,7 +350,8 @@ impl Registry {
                     e.progress.counters.filtered += 1;
                 }
             }
-            e.progress.advance(ev.created_at, id);
+            e.progress
+                .advance_bounded(ev.created_at, id, now.saturating_add(FUTURE_SKEW_SECS));
             touched = true;
         }
         if touched {
@@ -408,7 +433,8 @@ impl Registry {
                 }
                 e.progress.events += 1;
             } else {
-                e.progress.advance(ev.created_at, id);
+                e.progress
+                    .advance_bounded(ev.created_at, id, now.saturating_add(FUTURE_SKEW_SECS));
             }
             touched = true;
         }
@@ -456,6 +482,34 @@ impl Registry {
             }
             self.entries[i].analysis.contribute(world);
         }
+    }
+
+    /// Mark backfilled only those analyses that have actually consumed events,
+    /// returning the names of the ones left outstanding.
+    ///
+    /// A live-only node never replays the corpus, so blanket-marking everything
+    /// backfilled makes a freshly registered analysis *claim* to be complete
+    /// while holding nothing. The report then reads as "almost no activity"
+    /// rather than "not computed yet", which is the worse of the two failure
+    /// modes: silently wrong instead of visibly missing.
+    pub fn mark_backfilled_where_observed(&mut self) -> Vec<&'static str> {
+        let mut outstanding = Vec::new();
+        for e in &mut self.entries {
+            if e.progress.backfilled {
+                continue;
+            }
+            if e.progress.events > 0 {
+                e.progress.backfilled = true;
+                if let Some(obs) = &self.observer {
+                    obs.emit(&MetricsEvent::BackfillComplete {
+                        name: e.analysis.name(),
+                    });
+                }
+            } else {
+                outstanding.push(e.analysis.name());
+            }
+        }
+        outstanding
     }
 
     pub fn mark_backfilled(&mut self, stage: &[usize]) {

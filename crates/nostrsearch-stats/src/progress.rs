@@ -47,6 +47,37 @@ impl Progress {
         }
     }
 
+    /// Advance the watermark, ignoring timestamps beyond `max_ts`.
+    ///
+    /// Nostr `created_at` is publisher-supplied and unvalidated. A single event
+    /// dated in the year 55913 (the corpus contains them) would otherwise park
+    /// the watermark there, after which [`should_consume`](Self::should_consume)
+    /// rejects **every** real event forever — the analysis silently stops
+    /// counting and never recovers. The event is still folded and counted; it
+    /// just does not get to define "how far we have consumed".
+    pub fn advance_bounded(&mut self, created_at: u64, id: EventId, max_ts: u64) {
+        if created_at > max_ts {
+            self.events += 1;
+            return;
+        }
+        self.advance(created_at, id);
+    }
+
+    /// Pull a watermark that is implausibly far ahead back to `max_ts`.
+    ///
+    /// Repairs state already poisoned by the above before it was fixed:
+    /// without this, a node restarts with the bad watermark still persisted and
+    /// stays stuck until wall-clock time catches up with it. Returns whether a
+    /// repair was needed.
+    pub fn clamp_watermark(&mut self, max_ts: u64) -> bool {
+        if self.watermark > max_ts {
+            self.watermark = max_ts;
+            self.boundary.clear();
+            return true;
+        }
+        false
+    }
+
     /// Should this event be folded? Enforces monotonic, count-once semantics
     /// given an ascending event stream.
     pub fn should_consume(&self, created_at: u64, id: &EventId) -> bool {

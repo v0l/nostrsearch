@@ -42,6 +42,32 @@ pub struct RelayInfo {
     pub birthday: Option<u64>,
 }
 
+/// One completed (relay, day), flattened for the status page.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DayEntry {
+    pub date: String,
+    pub relay: String,
+    pub seen: u64,
+    pub new: u64,
+    pub at: u64,
+}
+
+/// Aggregate scrape progress across every relay and day.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ScrapeProgress {
+    /// Distinct dates with at least one relay completed.
+    pub days: u64,
+    /// Completed (relay, day) pairs.
+    pub relay_days: u64,
+    /// Events relays returned, and how many were new to the index.
+    pub events_seen: u64,
+    pub events_new: u64,
+    pub oldest_day: Option<String>,
+    pub newest_day: Option<String>,
+    /// Most recently completed (relay, day) results, newest first.
+    pub recent: Vec<DayEntry>,
+}
+
 /// Outcome of one fully-scraped (relay, day).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DayDone {
@@ -66,6 +92,8 @@ impl ScrapeState {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         let mut opts = Options::default();
         opts.create_if_missing(true);
+        // Bounded descriptor use; the default (-1) keeps an fd per SST.
+        opts.set_max_open_files(256);
         Ok(Self {
             db: DB::open(&opts, path)?,
         })
@@ -105,6 +133,53 @@ impl ScrapeState {
         if let Ok(v) = bincode::serialize(done) {
             let _ = self.db.put(Self::day_key(date, url), v);
         }
+    }
+
+    /// Aggregate view of everything scraped so far, for the sync status page.
+    ///
+    /// One pass over the `d|` prefix. Completion is tracked per (relay, day),
+    /// so `days` counts distinct dates while `relay_days` counts the pairs.
+    pub fn progress(&self, recent_limit: usize) -> ScrapeProgress {
+        let mut p = ScrapeProgress::default();
+        let mut recent: Vec<DayEntry> = Vec::new();
+        let mut dates: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+        for kv in self.db.prefix_iterator(b"d|") {
+            let Ok((k, v)) = kv else { break };
+            if !k.starts_with(b"d|") {
+                break;
+            }
+            let rest = String::from_utf8_lossy(&k[2..]).into_owned();
+            let Some((date, url)) = rest.split_once('|') else {
+                continue;
+            };
+            let Ok(done) = bincode::deserialize::<DayDone>(&v) else {
+                continue;
+            };
+
+            p.relay_days += 1;
+            p.events_seen += done.seen;
+            p.events_new += done.new;
+            dates.insert(date.to_string());
+
+            recent.push(DayEntry {
+                date: date.to_string(),
+                relay: url.to_string(),
+                seen: done.seen,
+                new: done.new,
+                at: done.at,
+            });
+        }
+
+        p.days = dates.len() as u64;
+        p.oldest_day = dates.iter().next().cloned();
+        p.newest_day = dates.iter().next_back().cloned();
+
+        // Most recently completed first.
+        recent.sort_by(|a, b| b.at.cmp(&a.at));
+        recent.truncate(recent_limit);
+        p.recent = recent;
+        p
     }
 
     fn day_key(date: &str, url: &str) -> Vec<u8> {

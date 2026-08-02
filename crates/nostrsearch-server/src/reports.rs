@@ -131,6 +131,102 @@ struct ReportIndex {
     reports: Vec<String>,
 }
 
+/// Scrape/sync progress, served at `/sync`.
+///
+/// Reads the live [`ScrapeState`] the scraper task owns — RocksDB takes an
+/// exclusive per-process lock, so the handle is shared rather than reopened.
+pub fn sync_router(state: std::sync::Arc<nostrsearch_indexer::scrape::ScrapeState>) -> Router {
+    Router::new().route("/", get(sync_status)).with_state(state)
+}
+
+#[derive(Serialize)]
+struct SyncStatus {
+    /// Relays discovered from kind-10002 lists, and how they are behaving.
+    relays: SyncRelays,
+    /// Day-by-day backfill coverage.
+    scrape: nostrsearch_indexer::scrape::ScrapeProgress,
+}
+
+#[derive(Serialize)]
+struct SyncRelays {
+    total: usize,
+    /// Relays that accepted a negentropy reconciliation.
+    negentropy: usize,
+    /// Probed and refused negentropy (windowed REQ fallback).
+    no_negentropy: usize,
+    /// Not yet probed.
+    unprobed: usize,
+    /// Currently failing (consecutive day-level failures).
+    failing: usize,
+    top: Vec<SyncRelay>,
+}
+
+#[derive(Serialize)]
+struct SyncRelay {
+    url: String,
+    sources: u32,
+    negentropy: Option<bool>,
+    cap: u32,
+    fails: u32,
+    last_ok: u64,
+    birthday: Option<u64>,
+}
+
+async fn sync_status(
+    State(state): State<std::sync::Arc<nostrsearch_indexer::scrape::ScrapeState>>,
+) -> impl IntoResponse {
+    // RocksDB scans are blocking work; keep them off the async worker.
+    let out = tokio::task::spawn_blocking(move || {
+        let relays = state.relays();
+        let mut top: Vec<SyncRelay> = relays
+            .iter()
+            .map(|(url, i)| SyncRelay {
+                url: url.clone(),
+                sources: i.sources,
+                negentropy: i.negentropy,
+                cap: i.cap,
+                fails: i.fails,
+                last_ok: i.last_ok,
+                birthday: i.birthday,
+            })
+            .collect();
+        // Most-advertised relays first: the ones that matter for coverage.
+        top.sort_by(|a, b| b.sources.cmp(&a.sources));
+        top.truncate(50);
+
+        SyncStatus {
+            relays: SyncRelays {
+                total: relays.len(),
+                negentropy: relays
+                    .iter()
+                    .filter(|(_, i)| i.negentropy == Some(true))
+                    .count(),
+                no_negentropy: relays
+                    .iter()
+                    .filter(|(_, i)| i.negentropy == Some(false))
+                    .count(),
+                unprobed: relays
+                    .iter()
+                    .filter(|(_, i)| i.negentropy.is_none())
+                    .count(),
+                failing: relays.iter().filter(|(_, i)| i.fails > 0).count(),
+                top,
+            },
+            scrape: state.progress(25),
+        }
+    })
+    .await;
+
+    match out {
+        Ok(s) => Json(s).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": "sync status unavailable"})),
+        )
+            .into_response(),
+    }
+}
+
 /// `/reports` (index), `/reports/stream` (live deltas), `/reports/{name}`.
 pub fn router(store: ReportStore) -> Router {
     Router::new()

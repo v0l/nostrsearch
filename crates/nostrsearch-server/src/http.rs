@@ -51,6 +51,17 @@ pub fn router_all(
     relay: Option<crate::relay::RelayState>,
     reports: Option<crate::reports::ReportStore>,
 ) -> Router {
+    router_all_sync(state, archive, relay, reports, None)
+}
+
+/// Everything, plus scrape/sync progress at `/sync`.
+pub fn router_all_sync(
+    state: SharedState,
+    archive: Option<crate::archive::ArchiveState>,
+    relay: Option<crate::relay::RelayState>,
+    reports: Option<crate::reports::ReportStore>,
+    scrape: Option<std::sync::Arc<nostrsearch_indexer::scrape::ScrapeState>>,
+) -> Router {
     let mut app = Router::new()
         .route("/search", get(search_get).post(search_post))
         .route("/event/{id}", get(get_event))
@@ -64,6 +75,10 @@ pub fn router_all(
 
     if let Some(r) = reports {
         app = app.nest("/reports", crate::reports::router(r));
+    }
+
+    if let Some(s) = scrape {
+        app = app.nest("/sync", crate::reports::sync_router(s));
     }
 
     if let Some(r) = relay {

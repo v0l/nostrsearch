@@ -139,12 +139,17 @@ impl ScraperOptions {
 }
 
 /// Spawn the continuous scraper. Runs for the life of the process.
+///
+/// Returns the shared [`ScrapeState`] so the HTTP layer can report progress
+/// from the same handle. RocksDB takes an exclusive per-process lock, so this
+/// must be shared rather than reopened.
 pub fn spawn_scraper(
     opts: ScraperOptions,
     db: DefaultJsonFilesDatabase,
     sink: EventSink,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Arc<ScrapeState>> {
     let state = Arc::new(ScrapeState::open(&opts.state_dir.join("scrape"))?);
+    let state_out = state.clone();
     let dedupe_path = opts.index_root.join(".dedupe");
     let dedupe = if dedupe_path.exists() {
         Some(IdStore::open(&dedupe_path)?)
@@ -206,5 +211,5 @@ pub fn spawn_scraper(
             tokio::time::sleep(opts.pass_interval).await;
         }
     });
-    Ok(())
+    Ok(state_out)
 }
