@@ -278,6 +278,7 @@ a {
 .bars {
   display: flex;
   align-items: flex-end;
+  justify-content: flex-start;
   gap: 2px;
   height: 132px;
   margin-top: 14px;
@@ -288,6 +289,9 @@ a {
 .bar {
   flex: 1 1 0;
   min-width: 2px;
+  /* A young node has one or two buckets; without a cap each becomes a
+     full-width slab that says nothing. */
+  max-width: 26px;
   position: relative;
   background: color-mix(in srgb, var(--patina) 22%, transparent);
   transform-origin: bottom;
@@ -330,6 +334,75 @@ a {
   color: var(--slate);
   border-top: 1px solid var(--rule);
   margin-top: 14px;
+}
+
+/* ---------------------------------------------------- composition bar -- */
+
+.composition {
+  display: flex;
+  height: 68px;
+  margin-top: 14px;
+  border: 1px solid var(--rule-strong);
+  overflow: hidden;
+}
+
+.composition .seg {
+  min-width: 1px;
+  border-right: 1px solid color-mix(in srgb, var(--panel) 60%, transparent);
+  animation: widen 640ms cubic-bezier(0.2, 0.8, 0.2, 1) backwards;
+}
+
+.composition .seg:last-child {
+  border-right: 0;
+}
+
+@keyframes widen {
+  from {
+    transform: scaleX(0.01);
+    transform-origin: left;
+  }
+}
+
+.legend {
+  list-style: none;
+  margin: 14px 0 0;
+  padding: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 4px 20px;
+}
+
+.legend li {
+  display: grid;
+  grid-template-columns: 10px 1fr auto auto;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 12px;
+}
+
+.legend i {
+  width: 10px;
+  height: 10px;
+  border: 1px solid var(--rule-strong);
+}
+
+.legend .nm {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.legend b {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.legend .pc {
+  color: var(--slate);
+  font-variant-numeric: tabular-nums;
+  min-width: 44px;
+  text-align: right;
 }
 
 /* --------------------------------------------------------------- tables -- */

@@ -1,98 +1,88 @@
-import type { RegistryStats, SyncStatus } from "../types";
-import { Bars, Chip, Readout, compact, num } from "../ui";
+import type { RegistryStats } from "../types";
+import { Bars, Panel, Readout, compact, num } from "../ui";
+
+/** Shards are named `YYYY-MM`; anything else is not a month we can place. */
+const MONTH = /^(\d{4})-(\d{2})$/;
 
 /**
- * The signature element: the corpus ribbon.
+ * The index laid out in time: one bar per monthly shard, height for documents.
  *
- * Each bar is one calendar day the scraper has finished. Height is how many
- * events relays returned for that day; the solid fill rising from the baseline
- * is the share that was new to the index. A tall hollow bar means the day was
- * re-read for nothing — the shape of the backfill, not a decorative chart.
+ * Nostr started in late 2020, so shards dated before that hold events whose
+ * `created_at` is wrong — a 1970 bucket is a broken clock, not history. They
+ * are counted and named rather than silently folded in, because they are the
+ * reason a shard count looks larger than the corpus's real span.
  */
-function Ribbon({ sync }: { sync: SyncStatus | null }) {
-  const recent = sync?.scrape.recent ?? [];
+function Timeline({ stats }: { stats: RegistryStats | null }) {
+  const shards = (stats?.shards ?? [])
+    .filter((s) => MONTH.test(s.shard))
+    .sort((a, b) => a.shard.localeCompare(b.shard));
 
-  const byDay = new Map<string, { seen: number; fresh: number; relays: number }>();
-  for (const d of recent) {
-    const e = byDay.get(d.date) ?? { seen: 0, fresh: 0, relays: 0 };
-    e.seen += d.seen;
-    e.fresh += d.new;
-    e.relays += 1;
-    byDay.set(d.date, e);
-  }
-  const days = [...byDay.entries()].sort((a, b) => a[0].localeCompare(b[0]));
-  const peak = Math.max(1, ...days.map(([, v]) => v.seen));
+  const era = shards.filter((s) => s.shard >= "2020-01");
+  const preEra = shards.filter((s) => s.shard < "2020-01");
+  const preDocs = preEra.reduce((n, s) => n + s.docs, 0);
+  const peak = Math.max(1, ...era.map((s) => s.docs));
 
   return (
     <div class="ribbon">
       <div class="ribbon-head">
-        <span>Backfill · events returned per day, new events filled</span>
-        <b>{days.length ? `${days.length} days on screen` : "no completed days yet"}</b>
+        <span>Documents per monthly shard</span>
+        <b>{era.length ? `${era.length} months` : "no shards mounted"}</b>
       </div>
 
       <Bars
-        items={days.map(([date, v]) => ({
-          key: date,
-          height: v.seen / peak,
-          fill: v.seen > 0 ? v.fresh / v.seen : 0,
-          title: `${date} — ${num(v.seen)} returned, ${num(v.fresh)} new, ${v.relays} relay${v.relays === 1 ? "" : "s"}`,
+        items={era.map((s) => ({
+          key: s.shard,
+          height: s.docs / peak,
+          fill: 1,
+          title: `${s.shard} — ${num(s.docs)} documents`,
         }))}
-        left={days.length ? days[0][0] : undefined}
-        center={days.length ? `peak ${compact(peak)} events/day` : undefined}
-        right={days.length ? days[days.length - 1][0] : undefined}
-        empty="The scraper has not finished a relay-day yet. Bars appear as days complete."
+        left={era.length ? era[0].shard : undefined}
+        center={era.length ? `peak ${compact(peak)} in one month` : undefined}
+        right={era.length ? era[era.length - 1].shard : undefined}
+        empty="No shards mounted yet."
       />
+
+      {preEra.length > 0 ? (
+        <div class="mono-key" style={{ padding: "0 0 12px" }}>
+          {num(preEra.length)} shards dated before nostr existed hold {num(preDocs)} documents —
+          events with a broken `created_at`, kept but not shown here.
+        </div>
+      ) : null}
     </div>
   );
 }
 
-export function Corpus({
-  stats,
-  sync,
-  live,
-}: {
-  stats: RegistryStats | null;
-  sync: SyncStatus | null;
-  live: boolean;
-}) {
-  const p = sync?.scrape;
-  const span =
-    p?.oldest_day && p?.newest_day ? `${p.oldest_day} → ${p.newest_day}` : "range unknown";
-  const hitRate =
-    p && p.events_seen > 0 ? `${((p.events_new / p.events_seen) * 100).toFixed(1)}% were new` : undefined;
+export function Corpus({ stats }: { stats: RegistryStats | null }) {
+  const shards = (stats?.shards ?? []).filter((s) => MONTH.test(s.shard));
+  const era = shards.filter((s) => s.shard >= "2020-01").sort((a, b) => a.shard.localeCompare(b.shard));
+  const busiest = shards.slice().sort((a, b) => b.docs - a.docs)[0];
 
   return (
-    <section id="corpus" class="stack">
-      <div class="row tight" style={{ justifyContent: "space-between" }}>
-        <div class="row tight">
-          <Chip tone={live ? "ok" : "mute"} dot={live}>
-            {live ? "Live" : "Offline"}
-          </Chip>
-          <Chip tone="mute">{span}</Chip>
-        </div>
-        <span class="mono-key">{p ? `${num(p.relay_days)} relay-days recorded` : ""}</span>
-      </div>
+    <Panel
+      id="corpus"
+      label="Corpus"
+      aside={stats ? `${num(stats.shard_count)} shards` : undefined}
+      note="Events are indexed into one Tantivy shard per month, so a query bounded in time only ever touches the shards it needs."
+    >
+      <Timeline stats={stats} />
 
-      <Ribbon sync={sync} />
-
-      <div class="readouts">
+      <div class="readouts" style={{ marginTop: "18px" }}>
         <Readout
           value={compact(stats?.total_docs)}
           label="Documents indexed"
-          sub={`across ${num(stats?.shard_count)} shards`}
+          sub={stats ? `${num(stats.shard_count)} shards on disk` : undefined}
         />
         <Readout
-          value={compact(p?.relay_days)}
-          label="Relay-days covered"
-          sub={`${num(p?.days)} distinct dates`}
+          value={num(era.length)}
+          label="Months covered"
+          sub={era.length ? `${era[0].shard} onward` : undefined}
         />
-        <Readout value={compact(p?.events_new)} label="Events kept" sub={hitRate} />
         <Readout
-          value={compact(sync?.relays.total)}
-          label="Relays known"
-          sub={`${num(sync?.relays.negentropy)} speak negentropy`}
+          value={compact(busiest?.docs)}
+          label="Busiest month"
+          sub={busiest?.shard}
         />
       </div>
-    </section>
+    </Panel>
   );
 }

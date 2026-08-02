@@ -1,7 +1,57 @@
 import { useState } from "preact/hooks";
 import { api } from "../api";
 import type { SyncStatus } from "../types";
-import { Chip, ConfirmButton, Panel, ago, num, useNotify } from "../ui";
+import { Bars, Chip, ConfirmButton, Panel, ago, compact, num, useNotify } from "../ui";
+
+/**
+ * Backfill coverage: one bar per calendar day the scraper has finished, height
+ * for the events relays returned and a solid fill for the share that was new to
+ * the index. A tall hollow bar is a day that was re-read for nothing.
+ *
+ * Secondary to everything the reports say — this is how the corpus is being
+ * filled, not what is in it.
+ */
+function Backfill({ sync }: { sync: SyncStatus | null }) {
+  const byDay = new Map<string, { seen: number; fresh: number; relays: number }>();
+  for (const d of sync?.scrape.recent ?? []) {
+    const e = byDay.get(d.date) ?? { seen: 0, fresh: 0, relays: 0 };
+    e.seen += d.seen;
+    e.fresh += d.new;
+    e.relays += 1;
+    byDay.set(d.date, e);
+  }
+  const days = [...byDay.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  const peak = Math.max(1, ...days.map(([, v]) => v.seen));
+  const p = sync?.scrape;
+
+  return (
+    <>
+      <div class="row tight" style={{ marginBottom: "12px" }}>
+        <Chip tone="mute">{num(p?.relay_days)} relay-days done</Chip>
+        <Chip tone="mute">{num(p?.days)} dates</Chip>
+        <Chip tone="mute">{compact(p?.events_new)} events kept</Chip>
+        {p?.oldest_day && p?.newest_day ? (
+          <Chip tone="mute">
+            {p.oldest_day} → {p.newest_day}
+          </Chip>
+        ) : null}
+      </div>
+      <Bars
+        items={days.map(([date, v]) => ({
+          key: date,
+          height: v.seen / peak,
+          fill: v.seen > 0 ? v.fresh / v.seen : 0,
+          title: `${date} — ${num(v.seen)} returned, ${num(v.fresh)} new, ${v.relays} relay${v.relays === 1 ? "" : "s"}`,
+        }))}
+        height={72}
+        left={days.length ? days[0][0] : undefined}
+        center={days.length ? `peak ${compact(peak)} events/day` : undefined}
+        right={days.length ? days[days.length - 1][0] : undefined}
+        empty="The scraper has not finished a relay-day yet."
+      />
+    </>
+  );
+}
 
 function negentropy(v: boolean | null) {
   if (v === true) return <Chip tone="ok">Negentropy</Chip>;
@@ -67,6 +117,10 @@ export function Relays({
       aside={sync ? `${num(sync.relays.failing)} failing` : undefined}
       note="Relays discovered from published relay lists, ranked by how many people advertise them. Forgetting a relay clears what the scraper learned about it — horizon, failures and page size — and it starts over."
     >
+      <Backfill sync={sync} />
+
+      <hr class="hr" />
+
       <div class="row tight" style={{ marginBottom: "16px" }}>
         <Chip tone="mute">{num(sync?.relays.total)} known</Chip>
         <Chip tone="ok">{num(sync?.relays.negentropy)} negentropy</Chip>

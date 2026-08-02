@@ -115,10 +115,22 @@ const reports: Record<string, unknown> = {
 const json = (v: unknown) =>
   new Response(JSON.stringify(v), { headers: { "content-type": "application/json" } });
 
+// `LIVE=https://archive.v0l.io bun mock.ts` serves the local build against a
+// real node's data, which is the only way to catch a shape the fixtures got
+// wrong. Admin routes are proxied too, but unsigned, so they will 401.
+const LIVE = process.env.LIVE;
+
 Bun.serve({
   port: 5199,
-  fetch(req) {
+  async fetch(req) {
     const p = new URL(req.url).pathname;
+
+    if (LIVE && p !== "/") {
+      const upstream = new URL(p + new URL(req.url).search, LIVE);
+      const r = await fetch(upstream, { headers: { accept: req.headers.get("accept") ?? "*/*" } });
+      return new Response(r.body, { status: r.status, headers: r.headers });
+    }
+
     if (p === "/stats")
       return json({
         total_docs: 812_449_301,

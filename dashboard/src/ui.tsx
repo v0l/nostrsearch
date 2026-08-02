@@ -37,6 +37,9 @@ export function ago(unix: number | null | undefined): string {
   return `${Math.floor(s / 86400)}d ago`;
 }
 
+export const plural = (n: number, one: string, many = `${one}s`): string =>
+  `${NF.format(n)} ${n === 1 ? one : many}`;
+
 export const shortKey = (hex: string): string =>
   hex.length > 16 ? `${hex.slice(0, 8)}…${hex.slice(-8)}` : hex;
 

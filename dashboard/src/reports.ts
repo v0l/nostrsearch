@@ -40,6 +40,8 @@ export interface Reports {
   updatedName: string | null;
   live: boolean;
   loading: boolean;
+  /** Set when the node could not be reached; distinct from "nothing published". */
+  error: string | null;
 }
 
 export function useReports(): Reports {
@@ -49,6 +51,7 @@ export function useReports(): Reports {
   const [updated, setUpdated] = useState<{ at: number; name: string } | null>(null);
   const [live, setLive] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const seeding = useRef(false);
 
   useEffect(() => {
@@ -58,18 +61,25 @@ export function useReports(): Reports {
       if (seeding.current) return;
       seeding.current = true;
       try {
-        const idx = await reportIndex();
+        const idx = await retry(reportIndex);
         if (!alive) return;
         setNames(idx.reports);
         setGeneratedAt(idx.generated_at);
-        const loaded = await Promise.all(
-          idx.reports.map(async (n) => [n, await report(n).catch(() => null)] as const),
-        );
-        if (!alive) return;
-        setData(Object.fromEntries(loaded.filter(([, v]) => v !== null)));
-      } catch {
-        // The panels render their own empty state; a failed seed just means
-        // the writer has not published yet.
+        setError(null);
+
+        // Sequential on purpose. Fanning these out is a burst of simultaneous
+        // connections to the same host, which is the pattern DDoS scrubbing
+        // drops SYNs from — and a report that silently fails to load looks
+        // exactly like an analysis with nothing in it.
+        for (const name of idx.reports) {
+          const v = await retry(() => report(name)).catch(() => null);
+          if (!alive) return;
+          if (v !== null) setData((prev) => ({ ...prev, [name]: v }));
+        }
+      } catch (e) {
+        // Say the node is unreachable rather than letting every panel claim
+        // its analysis has published nothing.
+        if (alive) setError(e instanceof Error ? e.message : String(e));
       } finally {
         if (alive) setLoading(false);
         seeding.current = false;
@@ -105,7 +115,18 @@ export function useReports(): Reports {
     updatedName: updated?.name ?? null,
     live,
     loading,
+    error,
   };
+}
+
+/** One retry with a short pause: a dropped SYN is not a missing report. */
+async function retry<T>(fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch {
+    await new Promise((r) => setTimeout(r, 600));
+    return fn();
+  }
 }
 
 // --- report shapes ---------------------------------------------------------

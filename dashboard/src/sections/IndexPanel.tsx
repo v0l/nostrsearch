@@ -29,9 +29,15 @@ function Gauge(props: {
   );
 }
 
+/** A node with a shard per month has hundreds; list the ones that matter. */
+const SHARDS_SHOWN = 12;
+
 export function IndexPanel({ stats }: { stats: RegistryStats | null }) {
   const m = stats?.memory;
-  const shards = (stats?.shards ?? []).slice().sort((a, b) => b.docs - a.docs);
+  const all = (stats?.shards ?? []).slice().sort((a, b) => b.docs - a.docs);
+  const shards = all.slice(0, SHARDS_SHOWN);
+  const rest = all.slice(SHARDS_SHOWN);
+  const restDocs = rest.reduce((n, s) => n + s.docs, 0);
 
   return (
     <Panel
@@ -84,7 +90,7 @@ export function IndexPanel({ stats }: { stats: RegistryStats | null }) {
             <table>
               <thead>
                 <tr>
-                  <th>Shard</th>
+                  <th>Largest shards</th>
                   <th class="num">Documents</th>
                   <th class="num">Share</th>
                 </tr>
@@ -108,13 +114,28 @@ export function IndexPanel({ stats }: { stats: RegistryStats | null }) {
                     </td>
                   </tr>
                 ) : (
-                  <tr>
-                    <td style={{ fontWeight: 600 }}>Total</td>
-                    <td class="num" style={{ fontWeight: 600 }}>
-                      {compact(stats.total_docs)}
-                    </td>
-                    <td />
-                  </tr>
+                  <>
+                    {rest.length > 0 ? (
+                      <tr>
+                        <td style={{ color: "var(--slate)" }}>{num(rest.length)} smaller shards</td>
+                        <td class="num" style={{ color: "var(--slate)" }}>
+                          {num(restDocs)}
+                        </td>
+                        <td class="num" style={{ color: "var(--slate)" }}>
+                          {stats.total_docs > 0
+                            ? `${((restDocs / stats.total_docs) * 100).toFixed(1)}%`
+                            : "—"}
+                        </td>
+                      </tr>
+                    ) : null}
+                    <tr>
+                      <td style={{ fontWeight: 600 }}>Total</td>
+                      <td class="num" style={{ fontWeight: 600 }}>
+                        {compact(stats.total_docs)}
+                      </td>
+                      <td />
+                    </tr>
+                  </>
                 )}
               </tbody>
             </table>

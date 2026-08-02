@@ -149,7 +149,9 @@ async function signed<T>(path: string, method: "GET" | "POST" = "GET"): Promise<
 
 export const api = {
   stats: () => open<RegistryStats>("/stats"),
-  sync: () => open<SyncStatus>("/sync/"),
+  // No trailing slashes: axum's nest("/sync", …) with a "/" child matches the
+  // prefix exactly, and 404s on "/sync/".
+  sync: () => open<SyncStatus>("/sync"),
   archiveFiles: () => open<ArchiveFileInfo[]>("/archive/files"),
 
   analyses: () => signed<AnalysisStatus[]>("/admin/analyses"),
@@ -188,7 +190,7 @@ function qstr(q: Record<string, string | undefined>): string {
 }
 
 /** The names the writer has published, and when. */
-export const reportIndex = () => open<ReportIndex>("/reports/");
+export const reportIndex = () => open<ReportIndex>("/reports");
 
 /** One report's full snapshot, the shape its deltas patch. */
 export const report = (name: string) =>

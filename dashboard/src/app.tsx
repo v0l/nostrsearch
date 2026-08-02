@@ -9,11 +9,13 @@ import { Ingest } from "./sections/Ingest";
 import { IndexPanel } from "./sections/IndexPanel";
 import { Relays } from "./sections/Relays";
 import { Reports } from "./sections/Reports";
+import { Today } from "./sections/Today";
 import { Chip, Toasts, ago, num, shortKey, usePoll, useNotify } from "./ui";
 
 const SECTIONS = [
-  { id: "corpus", label: "Corpus" },
+  { id: "today", label: "Today" },
   { id: "reports", label: "Reports" },
+  { id: "corpus", label: "Corpus" },
   { id: "ingest", label: "Replay" },
   { id: "analyses", label: "Analyses" },
   { id: "relays", label: "Relays" },
@@ -172,8 +174,8 @@ function Console() {
 
   const counts: Record<string, string> = {
     reports: reports.names.length ? num(reports.names.length) : "",
+    corpus: stats.data ? `${num(stats.data.shard_count)} shards` : "",
     relays: sync.data ? num(sync.data.relays.total) : "",
-    index: stats.data ? `${num(stats.data.shard_count)} shards` : "",
   };
 
   return (
@@ -189,8 +191,9 @@ function Console() {
         counts={counts}
       />
       <main class="main">
-        <Corpus stats={stats.data} sync={sync.data} live={reports.live} />
+        <Today reports={reports} />
         <Reports reports={reports} />
+        <Corpus stats={stats.data} />
         <Ingest authed={authed} gate={gate} />
         <Analyses authed={authed} gate={gate} />
         <Relays sync={sync.data} authed={authed} gate={gate} />
