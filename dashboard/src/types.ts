@@ -95,10 +95,13 @@ export interface ReplayStatus {
   finished_at: number;
   files_total: number;
   files_done: number;
+  /** Totals across *completed* files only. */
   events: number;
   new: number;
   malformed: number;
   current: string | null;
+  /** Live progress for the file being read, absent between files. */
+  current_progress: FileProgress | null;
   files: FileProgress[];
 }
 

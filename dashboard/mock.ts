@@ -112,6 +112,8 @@ const reports: Record<string, unknown> = {
   pagerank: [],
 };
 
+const replayStart = Date.now() - 900_000;
+
 const json = (v: unknown) =>
   new Response(JSON.stringify(v), { headers: { "content-type": "application/json" } });
 
@@ -194,23 +196,41 @@ Bun.serve({
           }),
         ),
       );
-    if (p === "/admin/ingest")
+    if (p === "/admin/ingest") {
+      // Advance the read head so the panel's rate and ETA have something real
+      // to measure between polls.
+      // Loops through the file so the rate readout always has movement to
+      // measure; set STALL=1 to exercise the stalled state instead.
+      const elapsed = (Date.now() - replayStart) / 1000;
+      const read = process.env.STALL ? 96e9 : 40e9 + ((elapsed * 180e6) % 170e9);
       return json({
         running: true,
         cancelled: false,
-        started_at: Math.floor(Date.now() / 1000) - 900,
+        started_at: Math.floor(replayStart / 1000),
         finished_at: 0,
         files_total: 9,
-        files_done: 6,
-        events: 412_000_000,
-        new: 18_400_000,
-        malformed: 812,
+        files_done: 2,
+        events: 21_400_000,
+        new: 900_000,
+        malformed: 4,
         current: "combined.jsonl",
+        current_progress: {
+          name: "combined.jsonl",
+          bytes_total: 214e9,
+          bytes_read: Math.round(read),
+          malformed: 812,
+          events: Math.round(read / 520),
+          new: Math.round(read / 11_000),
+          complete: false,
+          error: null,
+        },
         files: [
-          { name: "combined.jsonl", bytes_total: 214e9, bytes_read: 96e9, malformed: 812, events: 412e6, new: 18.4e6, complete: false, error: null },
           { name: "events_2024-07.jsonl.zst", bytes_total: 3.1e9, bytes_read: 3.1e9, malformed: 0, events: 21e6, new: 400e3, complete: true, error: null },
+          { name: "events_2024-06.jsonl.zst", bytes_total: 2.9e9, bytes_read: 2.9e9, malformed: 4, events: 400e3, new: 500e3, complete: true, error: null },
+          { name: "events_2024-05.jsonl.zst", bytes_total: 2.8e9, bytes_read: 1.2e9, malformed: 0, events: 90e3, new: 1e3, complete: false, error: "unexpected end of zstd frame" },
         ],
       });
+    }
     if (p === "/reports/" || p === "/reports")
       return json({ generated_at: Math.floor(Date.now() / 1000) - 40, reports: Object.keys(reports) });
     if (p.startsWith("/reports/")) {

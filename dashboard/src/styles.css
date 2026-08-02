@@ -655,6 +655,46 @@ label.field {
   color: var(--slate);
 }
 
+/* -------------------------------------------------------------- replay -- */
+
+.current {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 16px;
+  border: 1px solid var(--rule-strong);
+  background: color-mix(in srgb, var(--paper) 45%, var(--panel));
+}
+
+.current .pct {
+  font-family: var(--display);
+  font-weight: 600;
+  font-size: 20px;
+  letter-spacing: -0.03em;
+  font-variant-numeric: tabular-nums;
+}
+
+.current .meter {
+  height: 10px;
+}
+
+.finished summary {
+  cursor: pointer;
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--slate);
+  padding: 6px 0;
+}
+
+.finished summary:hover {
+  color: var(--ink);
+}
+
+.finished[open] summary {
+  margin-bottom: 8px;
+}
+
 /* ---------------------------------------------------------------- files -- */
 
 .filelist {
