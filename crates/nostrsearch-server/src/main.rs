@@ -55,6 +55,25 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let index_root = env::index_root();
+
+    // This node writes to the index (firehose, relay, scraper), so it has the
+    // same exposure `ingest` does: dirty pages are charged to the cgroup and
+    // cannot be reclaimed until they reach disk, so a writer that dirties
+    // faster than writeback retires gets OOM-killed while its own heap is
+    // modest. `ingest` has always forced periodic writeback; the server never
+    // did, despite having become a writer.
+    {
+        let sync_root = index_root.clone();
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(10));
+                nostrsearch_indexer::mem::syncfs(&sync_root);
+            }
+        });
+    }
+    if let Some(limit) = nostrsearch_indexer::mem::cgroup_limit_mb() {
+        tracing::info!(limit_mb = limit, "cgroup memory limit");
+    }
     let bind = std::env::var("BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
     let archive_dir = env::archive_dir();
     let relays = env::relays();

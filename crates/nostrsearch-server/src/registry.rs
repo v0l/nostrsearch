@@ -351,6 +351,7 @@ impl ShardRegistry {
             max_open_readers: self.max_open,
             open_fds: nostrsearch_indexer::mem::open_fds(),
             nofile_soft,
+            memory: MemoryStats::collect(),
             shards: per_shard,
         }
     }
@@ -394,7 +395,44 @@ pub struct RegistryStats {
     /// when diagnosing "Too many open files".
     pub open_fds: Option<usize>,
     pub nofile_soft: u64,
+    pub memory: MemoryStats,
     pub shards: Vec<ShardStat>,
+}
+
+/// Memory, split the way it actually needs reading on a search node.
+///
+/// `rss_mb` alone is misleading here: Tantivy mmaps every segment, so resident
+/// file-backed pages inflate RSS without being "used" in any sense that
+/// matters — the kernel reclaims them on demand. The number to watch is
+/// `cgroup_anon_mb` (real heap), while `cgroup_file_mb` is page cache doing
+/// its job. Both count toward `cgroup_limit_mb`, which is why a node can look
+/// enormous and still be healthy.
+#[derive(Debug, serde::Serialize)]
+pub struct MemoryStats {
+    pub rss_mb: u64,
+    pub peak_rss_mb: u64,
+    /// Total charged to the cgroup (anon + page cache).
+    pub cgroup_current_mb: Option<u64>,
+    /// Anonymous memory: heaps, writer arenas, in-RAM maps.
+    pub cgroup_anon_mb: Option<u64>,
+    /// Page cache, including mmap'd index segments. Reclaimable.
+    pub cgroup_file_mb: Option<u64>,
+    pub cgroup_limit_mb: Option<u64>,
+}
+
+impl MemoryStats {
+    pub fn collect() -> Self {
+        let (rss_mb, peak_rss_mb) = nostrsearch_indexer::mem::rss_mb();
+        let usage = nostrsearch_indexer::mem::cgroup_usage_mb();
+        Self {
+            rss_mb,
+            peak_rss_mb,
+            cgroup_current_mb: usage.map(|(c, _, _)| c),
+            cgroup_anon_mb: usage.map(|(_, a, _)| a),
+            cgroup_file_mb: usage.map(|(_, _, f)| f),
+            cgroup_limit_mb: nostrsearch_indexer::mem::cgroup_limit_mb(),
+        }
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
