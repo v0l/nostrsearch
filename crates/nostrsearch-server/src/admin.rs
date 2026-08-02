@@ -319,14 +319,26 @@ pub struct ScrapeResetQuery {
 /// Re-reads archive dumps through the live writer, so gaps are filled without
 /// stopping the relay. Already-indexed events are skipped via the dedupe set,
 /// and the replay is fed to the writer at lower priority than live traffic.
-#[derive(Debug, Deserialize)]
-pub struct IngestQuery {
-    /// Repeatable. Omitted = every dump in the archive directory.
-    #[serde(default)]
-    pub file: Vec<String>,
+/// Parsed by hand from the raw query rather than through [`Query`].
+///
+/// axum's `Query` uses `serde_urlencoded`, which has no notion of repeated
+/// keys: `?file=a&file=b` fails to deserialize into a `Vec` with "invalid
+/// type: string, expected a sequence". Repeating the parameter is the natural
+/// spelling here, so parse the pairs directly.
+fn ingest_files(raw: Option<&str>) -> Vec<String> {
+    let Some(raw) = raw else { return Vec::new() };
+    url::form_urlencoded::parse(raw.as_bytes())
+        .filter(|(k, _)| k == "file")
+        .map(|(_, v)| v.into_owned())
+        .filter(|v| !v.is_empty())
+        .collect()
 }
 
-async fn start_ingest(State(st): State<AdminState>, Query(q): Query<IngestQuery>) -> Response {
+async fn start_ingest(
+    State(st): State<AdminState>,
+    axum::extract::RawQuery(raw): axum::extract::RawQuery,
+) -> Response {
+    let files = ingest_files(raw.as_deref());
     let Some(rp) = st.replay.clone() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -337,7 +349,7 @@ async fn start_ingest(State(st): State<AdminState>, Query(q): Query<IngestQuery>
 
     // Reject traversal outright rather than sanitising: these names come from
     // the archive listing, so anything else is a mistake or an attack.
-    if q.file.iter().any(|f| f.contains('/') || f.contains("..")) {
+    if files.iter().any(|f| f.contains('/') || f.contains("..")) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "error": "file must be a bare name from /archive/files" })),
@@ -346,12 +358,12 @@ async fn start_ingest(State(st): State<AdminState>, Query(q): Query<IngestQuery>
     }
 
     let selection = crate::replay::ReplaySelection {
-        files: q.file.clone(),
+        files: files.clone(),
     };
     match crate::replay::spawn(rp.state.clone(), rp.dir, selection, rp.dedupe, rp.sink) {
         Ok(()) => Json(serde_json::json!({
             "started": true,
-            "files": q.file,
+            "files": files,
             "detail": "replaying at lower priority than live traffic; poll GET /admin/ingest",
         }))
         .into_response(),
@@ -511,5 +523,40 @@ async fn reset_relay(State(st): State<AdminState>, Query(q): Query<RelayResetQue
             Json(serde_json::json!({ "error": "reset failed" })),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod query_tests {
+    use super::ingest_files;
+
+    #[test]
+    fn repeated_file_params_parse() {
+        // The spelling the CLI produces. axum's Query rejects this outright.
+        assert_eq!(
+            ingest_files(Some("file=combined.jsonl&file=events_20260802.jsonl.zst")),
+            vec!["combined.jsonl", "events_20260802.jsonl.zst"]
+        );
+        assert_eq!(
+            ingest_files(Some("file=combined.jsonl")),
+            vec!["combined.jsonl"]
+        );
+    }
+
+    #[test]
+    fn no_files_means_every_dump() {
+        assert!(ingest_files(None).is_empty());
+        assert!(ingest_files(Some("")).is_empty());
+        assert!(ingest_files(Some("file=")).is_empty());
+        // Unrelated params are ignored rather than mistaken for a filename.
+        assert!(ingest_files(Some("other=1")).is_empty());
+    }
+
+    #[test]
+    fn percent_encoding_is_decoded() {
+        assert_eq!(
+            ingest_files(Some("file=my%20dump.jsonl")),
+            vec!["my dump.jsonl"]
+        );
     }
 }

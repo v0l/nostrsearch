@@ -1,0 +1,694 @@
+/*
+  nostrsearch node console
+  ------------------------
+  Direction: a mono-first instrument panel printed on cold pressed paper.
+  Everything on this screen is a hash, a URL, a count or a timestamp, so the
+  interface is set in mono by default and the display face appears only twice:
+  the wordmark and the four corpus readouts. Colour is oxidised copper on
+  grey-green stock — signal colours (rust, brass) are reserved for state, never
+  decoration.
+*/
+
+@import url("https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap");
+
+:root {
+  --paper: #dfe3dc;
+  --panel: #eef0ea;
+  --ink: #14181a;
+  --slate: #6b746e;
+  --patina: #1f6f5c;
+  --rust: #a8371f;
+  --brass: #9a7220;
+
+  --rule: color-mix(in srgb, var(--ink) 14%, transparent);
+  --rule-strong: color-mix(in srgb, var(--ink) 32%, transparent);
+  --wash: color-mix(in srgb, var(--ink) 5%, transparent);
+
+  --mono: "IBM Plex Mono", ui-monospace, "SF Mono", "Cascadia Mono", Menlo, monospace;
+  --display: "Archivo", "Helvetica Neue", Inter, system-ui, sans-serif;
+
+  --rail: 232px;
+  --gap: 24px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--paper);
+  color: var(--ink);
+  font: 400 13px/1.5 var(--mono);
+  font-feature-settings: "zero" 1;
+  -webkit-font-smoothing: antialiased;
+  /* Faint machine ruling; the paper this console is printed on. */
+  background-image: repeating-linear-gradient(
+    to bottom,
+    transparent 0 27px,
+    color-mix(in srgb, var(--ink) 3%, transparent) 27px 28px
+  );
+}
+
+a {
+  color: var(--patina);
+}
+
+::selection {
+  background: var(--patina);
+  color: var(--panel);
+}
+
+:focus-visible {
+  outline: 2px solid var(--patina);
+  outline-offset: 2px;
+}
+
+/* ---------------------------------------------------------------- shell -- */
+
+.shell {
+  display: grid;
+  grid-template-columns: var(--rail) minmax(0, 1fr);
+  min-height: 100%;
+}
+
+.rail {
+  position: sticky;
+  top: 0;
+  align-self: start;
+  height: 100vh;
+  padding: 28px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+  border-right: 1px solid var(--rule-strong);
+  background: color-mix(in srgb, var(--panel) 55%, transparent);
+  backdrop-filter: blur(2px);
+}
+
+.wordmark {
+  font-family: var(--display);
+  font-weight: 700;
+  font-size: 19px;
+  letter-spacing: -0.03em;
+  line-height: 1;
+}
+
+.wordmark span {
+  color: var(--patina);
+}
+
+.wordmark small {
+  display: block;
+  margin-top: 6px;
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--slate);
+}
+
+.nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.nav a {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  color: var(--ink);
+  text-decoration: none;
+  border-left: 2px solid transparent;
+  font-size: 12px;
+}
+
+.nav a:hover {
+  background: var(--wash);
+}
+
+.nav a[aria-current="true"] {
+  border-left-color: var(--patina);
+  background: var(--wash);
+  font-weight: 600;
+}
+
+.nav a b {
+  font-weight: 500;
+  color: var(--slate);
+}
+
+.rail-foot {
+  margin-top: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.main {
+  padding: 40px 40px 96px;
+  max-width: 1180px;
+  display: flex;
+  flex-direction: column;
+  gap: 52px;
+}
+
+/* --------------------------------------------------------------- panels -- */
+
+.panel {
+  position: relative;
+  border: 1px solid var(--rule-strong);
+  background: var(--panel);
+  padding: 28px 24px 24px;
+}
+
+/* The bezel plate: a section's label sits on its top edge, not above it. */
+.panel > .plate {
+  position: absolute;
+  top: -9px;
+  left: 16px;
+  padding: 0 8px;
+  background: var(--panel);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--slate);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.panel > .plate em {
+  font-style: normal;
+  color: var(--patina);
+  letter-spacing: 0.06em;
+  text-transform: none;
+}
+
+.panel-note {
+  margin: 0 0 18px;
+  color: var(--slate);
+  max-width: 68ch;
+}
+
+/* ------------------------------------------------------------- readouts -- */
+
+.readouts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  border-top: 1px solid var(--rule);
+}
+
+.readout {
+  padding: 16px 18px;
+  border-bottom: 1px solid var(--rule);
+  border-right: 1px solid var(--rule);
+}
+
+.readout:last-child {
+  border-right: 0;
+}
+
+.readout .v {
+  font-family: var(--display);
+  font-weight: 600;
+  font-size: clamp(26px, 3.2vw, 38px);
+  letter-spacing: -0.045em;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+
+.readout .k {
+  margin-top: 8px;
+  font-size: 10px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--slate);
+}
+
+.readout .s {
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--slate);
+}
+
+/* ---------------------------------------------- signature: corpus ribbon -- */
+
+.ribbon {
+  border: 1px solid var(--rule-strong);
+  background: linear-gradient(to bottom, var(--panel), color-mix(in srgb, var(--panel) 82%, var(--paper)));
+  padding: 18px 18px 0;
+}
+
+.ribbon-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 16px;
+  font-size: 11px;
+  color: var(--slate);
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+
+.ribbon-head b {
+  color: var(--ink);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: none;
+}
+
+.bars {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 132px;
+  margin-top: 14px;
+  padding-bottom: 1px;
+  overflow: hidden;
+}
+
+.bar {
+  flex: 1 1 0;
+  min-width: 2px;
+  position: relative;
+  background: color-mix(in srgb, var(--patina) 22%, transparent);
+  transform-origin: bottom;
+  animation: raise 620ms cubic-bezier(0.2, 0.8, 0.2, 1) backwards;
+}
+
+/* The new-events share, drawn as solid patina rising from the baseline. */
+.bar i {
+  position: absolute;
+  inset: auto 0 0 0;
+  background: var(--patina);
+  display: block;
+}
+
+.bar:hover {
+  background: color-mix(in srgb, var(--patina) 40%, transparent);
+  outline: 1px solid var(--ink);
+}
+
+@keyframes raise {
+  from {
+    transform: scaleY(0.02);
+  }
+}
+
+.scale {
+  display: flex;
+  justify-content: space-between;
+  border-top: 1px solid var(--rule-strong);
+  padding: 6px 0 12px;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  color: var(--slate);
+}
+
+.ribbon-empty {
+  height: 132px;
+  display: grid;
+  place-items: center;
+  color: var(--slate);
+  border-top: 1px solid var(--rule);
+  margin-top: 14px;
+}
+
+/* --------------------------------------------------------------- tables -- */
+
+.table-wrap {
+  overflow-x: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+th {
+  text-align: left;
+  font-weight: 600;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--slate);
+  padding: 0 10px 8px 0;
+  border-bottom: 1px solid var(--rule-strong);
+  white-space: nowrap;
+}
+
+td {
+  padding: 8px 10px 8px 0;
+  border-bottom: 1px solid var(--rule);
+  vertical-align: middle;
+}
+
+td.num,
+th.num {
+  text-align: right;
+  padding-right: 16px;
+}
+
+tbody tr:hover {
+  background: var(--wash);
+}
+
+.trunc {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ------------------------------------------------------------- controls -- */
+
+button {
+  font: 500 12px/1 var(--mono);
+  color: var(--ink);
+  background: transparent;
+  border: 1px solid var(--rule-strong);
+  border-radius: 2px;
+  padding: 8px 12px;
+  cursor: pointer;
+  letter-spacing: 0.02em;
+  transition: background 120ms ease, border-color 120ms ease, color 120ms ease;
+}
+
+button:hover:not(:disabled) {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--panel);
+}
+
+button:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+button.primary {
+  border-color: var(--patina);
+  color: var(--patina);
+  font-weight: 600;
+}
+
+button.primary:hover:not(:disabled) {
+  background: var(--patina);
+  border-color: var(--patina);
+  color: var(--panel);
+}
+
+button.danger {
+  border-color: color-mix(in srgb, var(--rust) 45%, transparent);
+  color: var(--rust);
+}
+
+button.danger:hover:not(:disabled) {
+  background: var(--rust);
+  border-color: var(--rust);
+  color: var(--panel);
+}
+
+button.tiny {
+  padding: 4px 8px;
+  font-size: 11px;
+}
+
+input,
+select {
+  font: 400 12px/1 var(--mono);
+  color: var(--ink);
+  background: color-mix(in srgb, var(--paper) 60%, var(--panel));
+  border: 1px solid var(--rule-strong);
+  border-radius: 2px;
+  padding: 8px 10px;
+}
+
+input::placeholder {
+  color: color-mix(in srgb, var(--slate) 70%, transparent);
+}
+
+label.field {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--slate);
+}
+
+.row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: flex-end;
+}
+
+.row.tight {
+  gap: 8px;
+  align-items: center;
+}
+
+/* ---------------------------------------------------------------- chips -- */
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border: 1px solid var(--rule-strong);
+  border-radius: 2px;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.chip.ok {
+  color: var(--patina);
+  border-color: color-mix(in srgb, var(--patina) 45%, transparent);
+}
+
+.chip.warn {
+  color: var(--brass);
+  border-color: color-mix(in srgb, var(--brass) 45%, transparent);
+}
+
+.chip.bad {
+  color: var(--rust);
+  border-color: color-mix(in srgb, var(--rust) 45%, transparent);
+}
+
+.chip.mute {
+  color: var(--slate);
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: currentColor;
+}
+
+.dot.live {
+  animation: pulse 2.4s ease-in-out infinite;
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.25;
+  }
+}
+
+/* ----------------------------------------------------------------- meter -- */
+
+.meter {
+  height: 6px;
+  background: var(--wash);
+  border: 1px solid var(--rule);
+  overflow: hidden;
+}
+
+.meter i {
+  display: block;
+  height: 100%;
+  background: var(--patina);
+  transition: width 400ms ease;
+}
+
+.meter.brass i {
+  background: var(--brass);
+}
+
+.meter.rust i {
+  background: var(--rust);
+}
+
+/* ---------------------------------------------------------------- files -- */
+
+.filelist {
+  max-height: 260px;
+  overflow-y: auto;
+  border: 1px solid var(--rule);
+  padding: 4px;
+}
+
+.filerow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 8px;
+  cursor: pointer;
+}
+
+.filerow:hover {
+  background: var(--wash);
+}
+
+.filerow input {
+  accent-color: var(--patina);
+  padding: 0;
+}
+
+.filerow .nm {
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.filerow .sz {
+  color: var(--slate);
+  font-size: 11px;
+}
+
+/* --------------------------------------------------------------- toasts -- */
+
+.toasts {
+  position: fixed;
+  right: 20px;
+  bottom: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 50;
+  max-width: 380px;
+}
+
+.toast {
+  border: 1px solid var(--ink);
+  background: var(--ink);
+  color: var(--panel);
+  padding: 10px 12px;
+  font-size: 12px;
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  animation: slide 240ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.toast.err {
+  background: var(--rust);
+  border-color: var(--rust);
+}
+
+.toast b {
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  font-size: 10px;
+  padding-top: 1px;
+}
+
+@keyframes slide {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+
+/* ----------------------------------------------------------------- misc -- */
+
+.empty {
+  padding: 22px 0;
+  color: var(--slate);
+}
+
+.gate {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  align-items: flex-start;
+  padding: 6px 0 2px;
+  color: var(--slate);
+}
+
+.mono-key {
+  font-size: 11px;
+  color: var(--slate);
+  word-break: break-all;
+}
+
+.flash {
+  animation: flash 900ms ease-out;
+}
+
+@keyframes flash {
+  from {
+    background: color-mix(in srgb, var(--patina) 30%, transparent);
+  }
+}
+
+.hr {
+  border: 0;
+  border-top: 1px solid var(--rule);
+  margin: 22px 0;
+}
+
+.stack {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+@media (max-width: 900px) {
+  .shell {
+    grid-template-columns: 1fr;
+  }
+  .rail {
+    position: static;
+    height: auto;
+    border-right: 0;
+    border-bottom: 1px solid var(--rule-strong);
+  }
+  .nav {
+    flex-direction: row;
+    flex-wrap: wrap;
+  }
+  .main {
+    padding: 24px 16px 72px;
+    gap: 40px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+  }
+}

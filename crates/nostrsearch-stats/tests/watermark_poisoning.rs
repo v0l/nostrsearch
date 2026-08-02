@@ -94,7 +94,11 @@ fn events_within_clock_skew_still_advance_normally() {
     // holding 70 events: count-once is guaranteed by the id set, not by
     // insisting the stream arrive in timestamp order.
     reg.observe(&ev(2, NOW + 59), NOW, &world);
-    assert_eq!(counted(&reg), 2, "out-of-order delivery must not be dropped");
+    assert_eq!(
+        counted(&reg),
+        2,
+        "out-of-order delivery must not be dropped"
+    );
 
     // Re-delivering one of them is what must not double count.
     reg.observe(&ev(1, NOW + 60), NOW, &world);

@@ -1,0 +1,144 @@
+#!/usr/bin/env bash
+# nsadmin — call nostrsearch admin endpoints with NIP-98 auth.
+#
+# The admin API authenticates with a signed kind-27235 event naming the exact
+# URL and method (NIP-98), so there is no shared token to leak. This wraps
+# nak + curl so the signing is not something you assemble by hand.
+#
+# Every request needs its own freshly signed event: the server accepts each
+# auth event id exactly once, so a captured header cannot be replayed.
+#
+# Usage:
+#   nsadmin [-u URL] [-k NSEC] <command> [args]
+#
+#   reset-analysis <name>...   re-derive one or more reports
+#   reset-all-reports          reset activity, active_users, client_tags
+#   analyses                   per-analysis progress
+#   ingest [file]...           replay archive dumps (all dumps if none given)
+#   ingest-status              replay progress
+#   ingest-cancel              stop a running replay
+#   scrape [query]             scrape state, e.g. 'relay=wss://x&from=2026-01-01'
+#   reset-scrape <query>       forget (relay, day) completions
+#   reset-relay <url>          clear a relay's learned state
+#   raw <METHOD> <path>        anything else, e.g. raw GET /admin/analyses
+#
+# The key is read from, in order: -k, $NOSTR_SECRET_KEY, then an interactive
+# prompt. Passing it as an argument puts it in your shell history — prefer the
+# prompt or the environment.
+set -euo pipefail
+
+BASE="${NOSTRSEARCH_URL:-https://archive.v0l.io}"
+SEC="${NOSTR_SECRET_KEY:-}"
+
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+for tool in nak curl; do
+  command -v "$tool" >/dev/null || die "$tool is required but not on PATH"
+done
+command -v base64 >/dev/null || die "base64 is required"
+
+while getopts ":u:k:h" opt; do
+  case "$opt" in
+    u) BASE="${OPTARG%/}" ;;
+    k) SEC="$OPTARG" ;;
+    h) sed -n '2,30p' "$0"; exit 0 ;;
+    :) die "-$OPTARG needs a value" ;;
+    \?) die "unknown flag -$OPTARG" ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+[ $# -ge 1 ] || { sed -n '2,30p' "$0"; exit 1; }
+
+if [ -z "$SEC" ]; then
+  # -s keeps it off the terminal; </dev/tty so it still works when stdin is a pipe.
+  printf 'nsec (input hidden): ' >&2
+  read -rs SEC < /dev/tty
+  printf '\n' >&2
+fi
+[ -n "$SEC" ] || die "no secret key supplied"
+
+# Sign one request and run it. A new auth event per call is required, not just
+# good hygiene: the server rejects a repeated event id.
+call() {
+  local method="$1" path="$2" url auth event code body
+  url="${BASE}${path}"
+
+  event=$(nak event --sec "$SEC" -k 27235 \
+            -t "u=${url}" -t "method=${method}" -c "" 2>/dev/null) \
+    || die "could not sign the auth event (is the nsec valid?)"
+
+  # NIP-98 wants base64 of the event JSON. -w0 is GNU; macOS base64 has no
+  # such flag and does not wrap by default, so try both.
+  auth=$(printf '%s' "$event" | base64 -w0 2>/dev/null || printf '%s' "$event" | base64)
+
+  body=$(curl -sS -m 120 -X "$method" \
+           -H "Authorization: Nostr ${auth}" \
+           -w '\n%{http_code}' "$url") || die "request failed: $method $url"
+
+  code="${body##*$'\n'}"
+  body="${body%$'\n'*}"
+
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$body" | jq . 2>/dev/null || printf '%s\n' "$body"
+  else
+    printf '%s\n' "$body"
+  fi
+
+  case "$code" in
+    2*) return 0 ;;
+    401) printf '  -> 401: is this pubkey in ADMIN_PUBKEYS? (%s)\n' \
+           "$(nak key public "$SEC" 2>/dev/null || echo '?')" >&2; return 1 ;;
+    404) printf '  -> 404: unknown name or route\n' >&2; return 1 ;;
+    503) printf '  -> 503: node lacks that subsystem (not the writer, or no archive)\n' >&2; return 1 ;;
+    *)   printf '  -> HTTP %s\n' "$code" >&2; return 1 ;;
+  esac
+}
+
+cmd="$1"; shift || true
+rc=0
+
+case "$cmd" in
+  analyses)      call GET  "/admin/analyses" ;;
+  ingest-status) call GET  "/admin/ingest" ;;
+  ingest-cancel) call POST "/admin/ingest/cancel" ;;
+
+  reset-analysis)
+    [ $# -ge 1 ] || die "usage: reset-analysis <name>..."
+    for name in "$@"; do
+      printf '== reset %s\n' "$name"
+      call POST "/admin/analyses/${name}/reset" || rc=1
+    done ;;
+
+  reset-all-reports)
+    # The three ported dashboard reports. follow_graph and pagerank are left
+    # alone: they hold the web-of-trust the search ranking depends on, and
+    # rebuilding them is expensive.
+    for name in activity active_users client_tags; do
+      printf '== reset %s\n' "$name"
+      call POST "/admin/analyses/${name}/reset" || rc=1
+    done ;;
+
+  ingest)
+    q=""
+    for f in "$@"; do q="${q}${q:+&}file=${f}"; done
+    call POST "/admin/ingest${q:+?$q}" ;;
+
+  scrape)        call GET  "/admin/scrape${1:+?$1}" ;;
+  reset-scrape)
+    [ $# -ge 1 ] || die "usage: reset-scrape 'relay=..&from=..&to=..'"
+    call POST "/admin/scrape/reset?$1" ;;
+  reset-relay)
+    [ $# -ge 1 ] || die "usage: reset-relay <wss://...>"
+    # URL-encode the relay argument; it contains :// and maybe /.
+    enc=$(printf '%s' "$1" | sed -e 's|%|%25|g' -e 's|:|%3A|g' -e 's|/|%2F|g' -e 's|?|%3F|g' -e 's|&|%26|g')
+    call POST "/admin/scrape/relay/reset?relay=${enc}" ;;
+
+  raw)
+    [ $# -ge 2 ] || die "usage: raw <METHOD> <path>"
+    call "$1" "$2" ;;
+
+  *) die "unknown command: $cmd" ;;
+esac
+
+exit $rc
