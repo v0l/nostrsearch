@@ -218,6 +218,7 @@ async fn main() -> anyhow::Result<()> {
                         (**db).clone(),
                         sink.clone(),
                         shared_dedupe.clone(),
+                        writer_ctl.clone(),
                     ) {
                         Ok(st) => scrape_state = Some(st),
                         Err(e) => tracing::warn!(error = %e, "scraper failed to start"),

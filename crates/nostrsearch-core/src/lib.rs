@@ -11,6 +11,7 @@
 
 pub mod event;
 pub mod query;
+pub mod relay;
 pub mod schema;
 pub mod scoring;
 pub mod shard;

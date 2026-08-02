@@ -148,6 +148,9 @@ pub fn spawn_scraper(
     db: DefaultJsonFilesDatabase,
     sink: EventSink,
     dedupe: Option<Arc<IdStore>>,
+    // Writer handle, for reading relay targets out of the `relays` report.
+    // Without one the scraper falls back to scanning the index.
+    ctl: Option<crate::node::WriterCtl>,
 ) -> anyhow::Result<Arc<ScrapeState>> {
     let state = Arc::new(ScrapeState::open(&opts.state_dir.join("scrape"))?);
     let state_out = state.clone();
@@ -160,32 +163,72 @@ pub fn spawn_scraper(
     });
 
     tokio::spawn(async move {
-        let mut last_discovery = std::time::Instant::now() - opts.rediscover_interval;
         loop {
-            // (Re-)discover targets from kind-10002 lists in the index.
-            if last_discovery.elapsed() >= opts.rediscover_interval || state.relays().is_empty() {
-                let root = opts.index_root.clone();
-                match tokio::task::spawn_blocking(move || discover_relays(&root)).await {
-                    Ok(Ok(found)) => {
+            // Discovery is due on wall-clock time, read from the state
+            // database rather than an in-process timer.
+            //
+            // An `Instant` cannot survive the restart a deploy causes, so the
+            // old timer made the most expensive thing the scraper does run in
+            // full on every boot, however recently it had last finished.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let due = state
+                .last_discovery()
+                .is_none_or(|t| now.saturating_sub(t) >= opts.rediscover_interval.as_secs());
+
+            if due || state.relays().is_empty() {
+                // Prefer the `relays` report: the indexer folds kind-10002
+                // events as they stream past, so the answer is already
+                // computed. Scanning the index for it means opening every
+                // shard and fetching a stored document per hit, which is
+                // minutes of solid disk read.
+                let from_report = match &ctl {
+                    Some(c) => c.relay_targets().await,
+                    None => Vec::new(),
+                };
+
+                let found = if from_report.is_empty() {
+                    // Nothing has folded a relay list yet -- a node whose
+                    // reports predate this report, or one that has never seen
+                    // one. Pay for the scan this once; the report takes over
+                    // as soon as it has data.
+                    tracing::info!(
+                        "scraper: relays report empty, falling back to an index scan (slow)"
+                    );
+                    let root = opts.index_root.clone();
+                    match tokio::task::spawn_blocking(move || discover_relays(&root)).await {
+                        Ok(Ok(v)) => Ok(v.into_iter().map(|(u, n)| (u, n as u64)).collect()),
+                        other => {
+                            tracing::warn!(?other, "scraper: relay discovery failed");
+                            Err(())
+                        }
+                    }
+                } else {
+                    tracing::info!(relays = from_report.len(), "scraper: targets from report");
+                    Ok(from_report)
+                };
+
+                match found {
+                    Ok(found) => {
                         let existing: std::collections::HashMap<String, RelayInfo> =
                             state.relays().into_iter().collect();
                         let mut kept = 0;
                         for (url, sources) in found
                             .iter()
-                            .filter(|(_, n)| *n >= opts.min_sources)
+                            .filter(|(_, n)| *n >= opts.min_sources as u64)
                             .take(opts.max_relays)
                         {
                             let mut info = existing.get(url).cloned().unwrap_or_default();
-                            info.sources = *sources;
+                            info.sources = *sources as u32;
                             state.put_relay(url, &info);
                             kept += 1;
                         }
                         tracing::info!(found = found.len(), kept, "scraper: relay discovery");
-                        last_discovery = std::time::Instant::now();
+                        state.set_last_discovery(now);
                     }
-                    other => {
-                        tracing::warn!(?other, "scraper: relay discovery failed");
-                    }
+                    Err(()) => {}
                 }
             }
 

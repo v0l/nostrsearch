@@ -15,7 +15,7 @@
 use crate::shard_writer::{ShardManager, ShardWriterConfig};
 use anyhow::Result;
 use nostrsearch_core::event::NostrEvent;
-use nostrsearch_stats::analyses::{ActiveUsers, Activity, Clients, FollowGraph, Pagerank};
+use nostrsearch_stats::analyses::{ActiveUsers, Activity, Clients, FollowGraph, Pagerank, Relays};
 use nostrsearch_stats::{Registry, SharedWot, StatStore, World, WotIndex};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -102,7 +102,10 @@ impl Pipeline {
         registry
             .register(Activity::default())
             .register(ActiveUsers::default())
-            .register(Clients::default());
+            .register(Clients::default())
+            // Feeds the scraper its relay targets, replacing a full-index scan
+            // that ran on every boot.
+            .register(Relays::default());
 
         let store = match &cfg.state_dir {
             Some(dir) => {
@@ -199,6 +202,30 @@ impl Pipeline {
     /// startup.
     pub fn rebuilding(&self) -> Vec<&'static str> {
         self.registry.rebuilding()
+    }
+
+    /// Relay targets from the `relays` report, most advertised first.
+    ///
+    /// Empty until something has folded a relay list, which tells the scraper
+    /// to fall back to scanning the index that one time.
+    pub fn relay_targets(&self) -> Vec<(String, u64)> {
+        self.registry
+            .snapshots()
+            .into_iter()
+            .find(|(n, _)| *n == "relays")
+            .and_then(|(_, v)| {
+                serde_json::from_value::<
+                    std::collections::HashMap<String, nostrsearch_stats::analyses::RelayStats>,
+                >(v)
+                .ok()
+            })
+            .map(|m| {
+                let mut out: Vec<(String, u64)> =
+                    m.into_iter().map(|(u, s)| (u, s.advertisers)).collect();
+                out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+                out
+            })
+            .unwrap_or_default()
     }
 
     /// Discard one analysis's state, and every analysis that depends on it, so

@@ -9,6 +9,7 @@ mod counter;
 mod follow_graph;
 mod kind_breakdown;
 mod pagerank;
+mod relays;
 mod trending_hashtags;
 
 pub use active_users::{ActiveUsers, ActiveUsersBucket, ActiveUsersReport};
@@ -18,4 +19,5 @@ pub use counter::TrustedCount;
 pub use follow_graph::FollowGraph;
 pub use kind_breakdown::KindBreakdown;
 pub use pagerank::Pagerank;
+pub use relays::{MAX_RELAYS, RelayStats, Relays};
 pub use trending_hashtags::TrendingHashtags;

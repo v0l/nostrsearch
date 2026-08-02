@@ -14,6 +14,7 @@
 //!   finished work instead of re-scraping.
 
 use chrono::{Datelike, TimeZone, Utc};
+pub use nostrsearch_core::relay::normalize_relay_url;
 use rocksdb::{DB, Options};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -112,6 +113,26 @@ impl ScrapeState {
             }
         }
         out
+    }
+
+    /// Unix seconds when relay discovery last completed, if ever.
+    ///
+    /// Persisted because discovery is the single most expensive thing the
+    /// scraper does -- it opens every shard and fetches a stored document per
+    /// kind-10002 hit -- and an in-process timer cannot survive the restart
+    /// that a deploy causes. Without this, discovery ran in full on every boot
+    /// however recently it had last finished.
+    pub fn last_discovery(&self) -> Option<u64> {
+        self.db
+            .get(b"meta|last_discovery")
+            .ok()
+            .flatten()
+            .and_then(|v| v.try_into().ok())
+            .map(u64::from_be_bytes)
+    }
+
+    pub fn set_last_discovery(&self, unix: u64) {
+        let _ = self.db.put(b"meta|last_discovery", unix.to_be_bytes());
     }
 
     pub fn put_relay(&self, url: &str, info: &RelayInfo) {
@@ -313,32 +334,6 @@ impl ScrapeState {
 
 /// Normalize a relay URL for use as a stable target key. Returns `None` for
 /// anything we don't want to scrape (onions, localhost, non-websocket).
-pub fn normalize_relay_url(raw: &str) -> Option<String> {
-    let url = raw.trim().trim_end_matches('/');
-    let lower = url.to_lowercase();
-    if !(lower.starts_with("wss://") || lower.starts_with("ws://")) {
-        return None;
-    }
-    let host = lower
-        .split("://")
-        .nth(1)?
-        .split(['/', '?', '#'])
-        .next()?
-        .split(':')
-        .next()?;
-    if host.is_empty()
-        || host.ends_with(".onion")
-        || host.ends_with(".local")
-        || host == "localhost"
-        || host.parse::<std::net::IpAddr>().is_ok()
-    {
-        return None;
-    }
-    // Keep scheme + host + path, drop query/fragment noise.
-    let scheme = lower.split("://").next()?;
-    let rest = lower.split("://").nth(1)?.split(['?', '#']).next()?;
-    Some(format!("{scheme}://{}", rest.trim_end_matches('/')))
-}
 
 /// Scan the Tantivy index for kind-10002 relay lists and count distinct
 /// authors per relay. Returns `(url, distinct_authors)` sorted descending.

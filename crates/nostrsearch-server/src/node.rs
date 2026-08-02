@@ -142,6 +142,10 @@ pub enum WriterCmd {
     Status {
         reply: tokio::sync::oneshot::Sender<Vec<nostrsearch_stats::AnalysisStatus>>,
     },
+    /// Relay targets for the scraper, ranked by advertiser count.
+    RelayTargets {
+        reply: tokio::sync::oneshot::Sender<Vec<(String, u64)>>,
+    },
 }
 
 /// Control handle for the writer task. Cloneable and cheap.
@@ -184,6 +188,23 @@ impl WriterCtl {
         {
             let _ = rx.blocking_recv();
         }
+    }
+
+    /// Relay targets from the `relays` report, ranked by advertiser count.
+    ///
+    /// Empty when nothing has folded a relay list yet, which is the caller's
+    /// cue to fall back to scanning the index.
+    pub async fn relay_targets(&self) -> Vec<(String, u64)> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .0
+            .send(WriterCmd::RelayTargets { reply: tx })
+            .await
+            .is_err()
+        {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
     }
 
     /// Analyses with a rebuild still in progress.
@@ -341,6 +362,9 @@ pub fn spawn_writer_with_reports(
                     }
                     WriterCmd::Rebuilding { reply } => {
                         let _ = reply.send(pipeline.rebuilding());
+                    }
+                    WriterCmd::RelayTargets { reply } => {
+                        let _ = reply.send(pipeline.relay_targets());
                     }
                     WriterCmd::ResetAnalysis { name, reply } => {
                         let ok = pipeline.reset_analysis(&name);
