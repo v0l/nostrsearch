@@ -204,6 +204,43 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     haystack.windows(needle.len()).any(|w| w == needle)
 }
 
+/// Batches events toward the writer, flushing on drop.
+///
+/// The flush lives in `Drop` so it is structural, not remembered. The first
+/// version of batching kept a bare `Vec` in the read loop, which meant every
+/// exit path -- EOF, read error, cancel -- had to separately remember to flush
+/// it, and the boundary commands' queue drains can only see what was actually
+/// submitted: a forgotten tail would be silently missing from the reports.
+/// Three hand-maintained flush sites is three future bugs; this is none.
+pub struct Submitter<'a> {
+    sink: &'a crate::node::ReplaySink,
+    pending: Vec<crate::node::Replayed>,
+}
+
+impl<'a> Submitter<'a> {
+    fn new(sink: &'a crate::node::ReplaySink) -> Self {
+        Self {
+            sink,
+            pending: Vec::with_capacity(BATCH),
+        }
+    }
+
+    fn push(&mut self, r: crate::node::Replayed) {
+        self.pending.push(r);
+        if self.pending.len() >= BATCH {
+            self.sink
+                .blocking_submit_batch(std::mem::take(&mut self.pending));
+        }
+    }
+}
+
+impl Drop for Submitter<'_> {
+    fn drop(&mut self) {
+        self.sink
+            .blocking_submit_batch(std::mem::take(&mut self.pending));
+    }
+}
+
 fn is_dump(name: &str) -> bool {
     let l = name.to_ascii_lowercase();
     [".jsonl", ".json", ".jsonl.zst", ".jsonl.zstd", ".json.zst"]
@@ -318,17 +355,23 @@ pub fn spawn(
                 };
 
                 match open_dump(&path) {
-                    Ok((reader, counter)) => replay_file(
-                        &state,
-                        reader,
-                        counter,
-                        &mut fp,
-                        dedupe.as_deref(),
-                        &submit,
-                        rebuild,
-                        Arc::from(name.as_str()),
-                        resume_after.as_deref(),
-                    ),
+                    Ok((reader, counter)) => {
+                        // Scoped so its Drop flush lands before the completion
+                        // command below: the writer's drain can only fold what
+                        // was actually submitted.
+                        let mut submitter = Submitter::new(&submit);
+                        replay_file(
+                            &state,
+                            reader,
+                            counter,
+                            &mut fp,
+                            dedupe.as_deref(),
+                            &mut submitter,
+                            rebuild,
+                            Arc::from(name.as_str()),
+                            resume_after.as_deref(),
+                        );
+                    }
                     Err(e) => fp.error = Some(format!("open failed: {e}")),
                 }
 
@@ -411,13 +454,12 @@ fn replay_file(
     counter: Arc<std::sync::atomic::AtomicU64>,
     fp: &mut FileProgress,
     dedupe: Option<&IdStore>,
-    submit: &crate::node::ReplaySink,
+    submit: &mut Submitter<'_>,
     rebuild: bool,
     name: Arc<str>,
     resume_after: Option<&str>,
 ) {
     let mut line = Vec::with_capacity(4096);
-    let mut batch = 0usize;
     let mut last_publish = std::time::Instant::now();
     // Skip forward to just past the last event the previous run folded. The id
     // is matched against the raw line, so skipping costs a substring search
@@ -469,26 +511,35 @@ fn replay_file(
                 match serde_json::from_slice::<NostrEvent>(trimmed) {
                     Ok(ev) => {
                         fp.events += 1;
-                        let known = hex32(&ev.id)
-                            .and_then(|id| dedupe.map(|d| d.contains(&id)))
-                            .unwrap_or(false);
-                        if !known {
+                        let fold = if rebuild {
+                            // No id-store lookup on the rebuild path -- this is
+                            // the difference between 13k and parse-speed
+                            // events/s. Its only effect is choosing whether to
+                            // *index* the event, and a rebuild is for the
+                            // reports: the corpus already holds these events,
+                            // which is exactly why every lookup was a hit, and
+                            // a hit is the case a bloom filter cannot make
+                            // cheap -- a full point read against a ~200M-key
+                            // store, per line. Index repair stays the ingest's
+                            // job.
+                            Fold::Only
+                        } else {
+                            let known = hex32(&ev.id)
+                                .and_then(|id| dedupe.map(|d| d.contains(&id)))
+                                .unwrap_or(false);
+                            // Ingest: an event already in the corpus is
+                            // skipped outright, there is nothing to add.
+                            if known {
+                                continue;
+                            }
                             fp.new += 1;
-                        }
-                        // Ingest: an event already in the corpus is skipped
-                        // outright, there is nothing to add.
-                        if known && !rebuild {
-                            continue;
-                        }
-                        // Rebuild: fold everything, index only what is missing.
-                        let fold = if known { Fold::Only } else { Fold::AndIndex };
-                        submit.blocking_submit(ev, fold, rebuild.then(|| name.clone()));
-                        batch += 1;
-                        if batch >= BATCH {
-                            batch = 0;
-                            // Let the writer drain live traffic.
-                            std::thread::yield_now();
-                        }
+                            Fold::AndIndex
+                        };
+                        submit.push(crate::node::Replayed {
+                            ev,
+                            fold,
+                            file: rebuild.then(|| name.clone()),
+                        });
                     }
                     // A bad line is skipped, never fatal: the whole point is
                     // that one corrupt record must not cost the rest of the

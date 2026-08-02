@@ -102,16 +102,24 @@ pub struct Replayed {
 
 /// Submits replayed archive events to the writer at lower priority than live
 /// traffic. Cloneable and cheap.
+///
+/// The channel carries *batches*: at parse-bound rates a per-event send is
+/// measurable overhead, and the writer folding a batch per wakeup amortizes
+/// the channel to noise. Producers should not call this directly -- a
+/// [`crate::replay::Submitter`] wraps it so a partially filled batch cannot
+/// be forgotten on an early return.
 #[derive(Clone)]
-pub struct ReplaySink(mpsc::Sender<Replayed>);
+pub struct ReplaySink(mpsc::Sender<Vec<Replayed>>);
 
 impl ReplaySink {
-    /// Submit from a blocking thread, waiting for capacity.
+    /// Submit a batch from a blocking thread, waiting for capacity.
     ///
     /// Blocking on a full queue is the point: it is what stops a replay of a
     /// 200 GB dump outrunning the writer and pushing live events out.
-    pub fn blocking_submit(&self, ev: NostrEvent, fold: Fold, file: Option<std::sync::Arc<str>>) {
-        let _ = self.0.blocking_send(Replayed { ev, fold, file });
+    pub fn blocking_submit_batch(&self, batch: Vec<Replayed>) {
+        if !batch.is_empty() {
+            let _ = self.0.blocking_send(batch);
+        }
     }
 }
 
@@ -369,7 +377,16 @@ pub fn spawn_writer_with_reports(
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriterCmd>(16);
     // Replay queue, deliberately shallow: a deep buffer would let a replay
     // build a long backlog that delays live events behind it.
-    let (replay_tx, mut replay_rx) = mpsc::channel::<Replayed>(2_048);
+    // 8 batches of up to 512: the same ~4k-event ceiling the per-event queue
+    // had, in far fewer channel operations.
+    let (replay_tx, mut replay_rx) = mpsc::channel::<Vec<Replayed>>(8);
+
+    /// Fold one replayed batch into the pipeline.
+    fn fold_batch(pipeline: &mut Pipeline, batch: Vec<Replayed>) {
+        for r in batch {
+            pipeline.process_replayed(&r.ev, r.fold == Fold::AndIndex, r.file.as_deref());
+        }
+    }
 
     let join = tokio::spawn(async move {
         let mut tick = tokio::time::interval(commit_every);
@@ -429,12 +446,8 @@ pub fn spawn_writer_with_reports(
                         // Same drain as FinishRebuildFile: clearing positions
                         // with events still queued would fold that tail into
                         // analyses that already counted it.
-                        while let Ok(r) = replay_rx.try_recv() {
-                            pipeline.process_replayed(
-                                &r.ev,
-                                r.fold == Fold::AndIndex,
-                                r.file.as_deref(),
-                            );
+                        while let Ok(batch) = replay_rx.try_recv() {
+                            fold_batch(&mut pipeline, batch);
                         }
                         pipeline.finish_rebuild_run();
                         publish_reports(&pipeline, reports.as_ref());
@@ -445,8 +458,8 @@ pub fn spawn_writer_with_reports(
                         // folding the queued tail would re-advance the very
                         // positions this exists to clear.
                         let mut dropped = 0u64;
-                        while replay_rx.try_recv().is_ok() {
-                            dropped += 1;
+                        while let Ok(batch) = replay_rx.try_recv() {
+                            dropped += batch.len() as u64;
                         }
                         if dropped > 0 {
                             tracing::info!(dropped, "discarded queued replay events on cancel");
@@ -461,12 +474,8 @@ pub fn spawn_writer_with_reports(
                         // and without it, up to a full queue of the file's
                         // tail is skipped as "already folded" the moment the
                         // completion lands.
-                        while let Ok(r) = replay_rx.try_recv() {
-                            pipeline.process_replayed(
-                                &r.ev,
-                                r.fold == Fold::AndIndex,
-                                r.file.as_deref(),
-                            );
+                        while let Ok(batch) = replay_rx.try_recv() {
+                            fold_batch(&mut pipeline, batch);
                         }
                         pipeline.finish_rebuild_file(&file);
                         dirty = true;
@@ -494,12 +503,8 @@ pub fn spawn_writer_with_reports(
                         let _ = reply.send(pipeline.analyses_status());
                     }
                 },
-                Some(r) = replay_rx.recv() => {
-                    pipeline.process_replayed(
-                        &r.ev,
-                        r.fold == Fold::AndIndex,
-                        r.file.as_deref(),
-                    );
+                Some(batch) = replay_rx.recv() => {
+                    fold_batch(&mut pipeline, batch);
                     dirty = true;
                 }
                 _ = sd_rx.changed() => {
