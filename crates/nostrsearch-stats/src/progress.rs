@@ -10,6 +10,17 @@ use crate::types::EventId;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
+/// How far below the watermark an event may arrive and still be folded.
+///
+/// Covers ordinary relay jitter and the gap scraper handing back events from
+/// earlier in the day. Anything older than this is presumed already consumed on
+/// a previous pass.
+pub const LIVE_LAG_SECS: u64 = 6 * 3600;
+
+/// Cap on the count-once id set, which now spans [`LIVE_LAG_SECS`] rather than
+/// a single second.
+const MAX_BOUNDARY: usize = 200_000;
+
 /// How far a single analysis has consumed the corpus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Progress {
@@ -81,10 +92,20 @@ impl Progress {
     /// Should this event be folded? Enforces monotonic, count-once semantics
     /// given an ascending event stream.
     pub fn should_consume(&self, created_at: u64, id: &EventId) -> bool {
-        if created_at < self.watermark {
+        // Out-of-order delivery is normal, not exceptional. A relay can hand us
+        // a thirty-second-old event straight after a fresh one, and the gap
+        // scraper deliberately walks *backwards* through history. A strict
+        // `created_at < watermark` test rejects both: the watermark ratchets to
+        // the highest timestamp ever seen and only successive record-highs get
+        // through. In production that meant 70 events counted against an index
+        // taking hundreds of thousands a day.
+        //
+        // Allow anything within the lag window and rely on the id set for
+        // count-once, which is what actually guarantees correctness here.
+        if created_at + LIVE_LAG_SECS < self.watermark {
             return false;
         }
-        if created_at == self.watermark && self.boundary.contains(id) {
+        if self.boundary.contains(id) {
             return false;
         }
         true
@@ -94,11 +115,16 @@ impl Progress {
     pub fn advance(&mut self, created_at: u64, id: EventId) {
         if created_at > self.watermark {
             self.watermark = created_at;
+        }
+        // The id set now spans the whole lag window rather than a single
+        // second, so it needs its own bound. Clearing wholesale is crude but
+        // safe: the archive database and the dedupe store both reject repeats
+        // before an event ever reaches an analysis, so this set is a second
+        // line of defence rather than the only one.
+        if self.boundary.len() >= MAX_BOUNDARY {
             self.boundary.clear();
         }
-        if created_at == self.watermark {
-            self.boundary.insert(id);
-        }
+        self.boundary.insert(id);
         self.events += 1;
     }
 }

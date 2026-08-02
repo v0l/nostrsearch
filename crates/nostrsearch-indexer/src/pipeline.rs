@@ -381,13 +381,13 @@ impl Pipeline {
         // node (the server) never replays the corpus, so claiming otherwise
         // leaves a newly added report looking like "barely any activity"
         // instead of "not computed yet".
-        let outstanding = self.registry.mark_backfilled_where_observed();
+        let outstanding = self.registry.outstanding_backfills();
         if !outstanding.is_empty() {
             tracing::warn!(
                 analyses = ?outstanding,
-                "these analyses have never seen the corpus; their reports cover only \
-                 events observed from now on. Run `ingest --input-dir <archive>` against \
-                 the same --state-dir to backfill them"
+                "these analyses have not backfilled the corpus; they will fold every event \
+                 they are handed (including the gap scraper's history) until a full replay \
+                 marks them complete. Run POST /admin/ingest, or `ingest --input-dir`"
             );
         }
         self.refresh_inner(true);

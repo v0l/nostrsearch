@@ -538,32 +538,22 @@ impl Registry {
         true
     }
 
-    /// Mark backfilled only those analyses that have actually consumed events,
-    /// returning the names of the ones left outstanding.
+    /// Names of analyses that have not completed a backfill over the corpus.
     ///
-    /// A live-only node never replays the corpus, so blanket-marking everything
-    /// backfilled makes a freshly registered analysis *claim* to be complete
-    /// while holding nothing. The report then reads as "almost no activity"
-    /// rather than "not computed yet", which is the worse of the two failure
-    /// modes: silently wrong instead of visibly missing.
-    pub fn mark_backfilled_where_observed(&mut self) -> Vec<&'static str> {
-        let mut outstanding = Vec::new();
-        for e in &mut self.entries {
-            if e.progress.backfilled {
-                continue;
-            }
-            if e.progress.events > 0 {
-                e.progress.backfilled = true;
-                if let Some(obs) = &self.observer {
-                    obs.emit(&MetricsEvent::BackfillComplete {
-                        name: e.analysis.name(),
-                    });
-                }
-            } else {
-                outstanding.push(e.analysis.name());
-            }
-        }
-        outstanding
+    /// Purely a report: `backfilled` is only ever set by something that
+    /// actually replayed the corpus (the staged ingest passes, or a completed
+    /// admin replay). An earlier version inferred it from "has consumed at
+    /// least one event", which marked an analysis complete after two live
+    /// events against a 470M-document index -- and being marked complete is
+    /// what puts it on the watermark path, where the gap scraper's historical
+    /// events are then rejected as "already consumed". The two bugs together
+    /// left the reports permanently empty.
+    pub fn outstanding_backfills(&self) -> Vec<&'static str> {
+        self.entries
+            .iter()
+            .filter(|e| !e.progress.backfilled)
+            .map(|e| e.analysis.name())
+            .collect()
     }
 
     pub fn mark_backfilled(&mut self, stage: &[usize]) {

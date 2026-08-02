@@ -87,10 +87,19 @@ fn events_within_clock_skew_still_advance_normally() {
     // A publisher a minute fast is ordinary drift, not poison; it should
     // advance the watermark as usual.
     reg.observe(&ev(1, NOW + 60), NOW, &world);
-    // An event a second older than that is then legitimately behind the
-    // watermark and skipped -- the count-once guarantee still holds.
+
+    // A *different* event a second older is ordinary out-of-order delivery and
+    // must still be folded. This assertion previously expected it to be
+    // dropped, which encoded the very bug that left the production reports
+    // holding 70 events: count-once is guaranteed by the id set, not by
+    // insisting the stream arrive in timestamp order.
     reg.observe(&ev(2, NOW + 59), NOW, &world);
-    assert_eq!(counted(&reg), 1);
+    assert_eq!(counted(&reg), 2, "out-of-order delivery must not be dropped");
+
+    // Re-delivering one of them is what must not double count.
+    reg.observe(&ev(1, NOW + 60), NOW, &world);
+    reg.observe(&ev(2, NOW + 59), NOW, &world);
+    assert_eq!(counted(&reg), 2, "repeats must still count once");
 }
 
 #[test]
