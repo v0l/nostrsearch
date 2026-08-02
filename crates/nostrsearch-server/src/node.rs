@@ -138,6 +138,12 @@ pub enum WriterCmd {
     FinishRebuildRun {
         reply: tokio::sync::oneshot::Sender<()>,
     },
+    /// Abandon the rebuild run after an operator cancel: clear positions and
+    /// persist, so a restart does not resume a run that was stopped on
+    /// purpose.
+    AbortRebuildRun {
+        reply: tokio::sync::oneshot::Sender<()>,
+    },
     /// Mark a dump fully folded for every analysis rebuilding it.
     FinishRebuildFile {
         file: String,
@@ -172,6 +178,18 @@ impl WriterCtl {
         if self
             .0
             .blocking_send(WriterCmd::SetRebuildFiles { files, reply: tx })
+            .is_ok()
+        {
+            let _ = rx.blocking_recv();
+        }
+    }
+
+    /// Abandon the rebuild run after a cancel. Blocking, for the reader.
+    pub fn abort_rebuild_run_blocking(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .0
+            .blocking_send(WriterCmd::AbortRebuildRun { reply: tx })
             .is_ok()
         {
             let _ = rx.blocking_recv();
@@ -408,12 +426,50 @@ pub fn spawn_writer_with_reports(
                         let _ = reply.send(pipeline.begin_rebuild(&file));
                     }
                     WriterCmd::FinishRebuildRun { reply } => {
+                        // Same drain as FinishRebuildFile: clearing positions
+                        // with events still queued would fold that tail into
+                        // analyses that already counted it.
+                        while let Ok(r) = replay_rx.try_recv() {
+                            pipeline.process_replayed(
+                                &r.ev,
+                                r.fold == Fold::AndIndex,
+                                r.file.as_deref(),
+                            );
+                        }
                         pipeline.finish_rebuild_run();
                         publish_reports(&pipeline, reports.as_ref());
                         let _ = reply.send(());
                     }
+                    WriterCmd::AbortRebuildRun { reply } => {
+                        // Discarded, not folded: the operator cancelled, and
+                        // folding the queued tail would re-advance the very
+                        // positions this exists to clear.
+                        let mut dropped = 0u64;
+                        while replay_rx.try_recv().is_ok() {
+                            dropped += 1;
+                        }
+                        if dropped > 0 {
+                            tracing::info!(dropped, "discarded queued replay events on cancel");
+                        }
+                        pipeline.abort_rebuild_run();
+                        let _ = reply.send(());
+                    }
                     WriterCmd::FinishRebuildFile { file, reply } => {
+                        // Fold whatever of this file is still queued before
+                        // marking it complete. The reader is blocked on the
+                        // reply, so the drain sees everything it submitted --
+                        // and without it, up to a full queue of the file's
+                        // tail is skipped as "already folded" the moment the
+                        // completion lands.
+                        while let Ok(r) = replay_rx.try_recv() {
+                            pipeline.process_replayed(
+                                &r.ev,
+                                r.fold == Fold::AndIndex,
+                                r.file.as_deref(),
+                            );
+                        }
                         pipeline.finish_rebuild_file(&file);
+                        dirty = true;
                         let _ = reply.send(());
                     }
                     WriterCmd::Rebuilding { reply } => {

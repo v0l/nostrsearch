@@ -379,6 +379,19 @@ pub fn spawn(
             // Another pass: the next stage folds the same files.
         } // 'run
 
+        // An explicit stop is not an interruption. The per-analysis positions
+        // exist so a deploy or crash resumes without losing hours of work --
+        // but leaving them behind after an operator cancels means the next
+        // pod start quietly resumes the very run they stopped. Cancel clears
+        // them; only an *involuntary* end (process death) leaves them to be
+        // picked up.
+        if rebuild
+            && state.cancel.load(Ordering::Relaxed)
+            && let Some(ctl) = &ctl
+        {
+            ctl.abort_rebuild_run_blocking();
+        }
+
         state.update(|s| {
             s.running = false;
             s.current = None;

@@ -263,3 +263,39 @@ fn dependents_wait_for_their_own_pass() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// A cancelled run must stay cancelled across a restart.
+///
+/// The per-analysis positions exist so a deploy or crash resumes without
+/// losing hours of work. An operator cancel left them in place too, so the
+/// next pod start looked exactly like recovering from a crash and quietly
+/// resumed the run that had just been stopped on purpose. Cancel now ends the
+/// run and clears the positions; only involuntary death leaves them behind.
+#[test]
+fn a_cancelled_run_does_not_resume_after_restart() {
+    let dir = tempdir("cancel");
+    let store = StatStore::new(&dir).unwrap();
+    let events: Vec<NostrEvent> = (0..10).map(|n| note(n, &pk(1))).collect();
+
+    let mut reg = registry(&store);
+    reg.set_rebuild_files(vec![DUMP.into()]).unwrap();
+    reg.begin_rebuild(DUMP);
+    fold(&mut reg, &events, 6);
+
+    // Mid-run state persisted (as the periodic persist does), then the
+    // operator cancels: the run ends and the cleared positions are persisted.
+    reg.persist(&store).unwrap();
+    reg.finish_rebuild_run();
+    reg.persist(&store).unwrap();
+    drop(reg);
+
+    // The pod restarts. Nothing may look resumable.
+    let reloaded = registry(&store);
+    assert!(
+        reloaded.rebuilding().is_empty(),
+        "a deliberate stop must not present itself as an interrupted rebuild: {:?}",
+        reloaded.rebuilding()
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}

@@ -217,6 +217,24 @@ impl Pipeline {
         tracing::info!("rebuild complete");
     }
 
+    /// Abandon the rebuild run: clear positions and persist them cleared.
+    ///
+    /// For an operator cancel, which must stay stopped. The positions exist so
+    /// an *involuntary* end -- deploy, crash -- resumes on the next start;
+    /// after a deliberate stop that same mechanism would quietly restart the
+    /// run the operator just killed. The analyses keep whatever they folded so
+    /// far and remain on the fold-everything path.
+    pub fn abort_rebuild_run(&mut self) {
+        self.registry.finish_rebuild_run();
+        self.rebuild_stage_seen = None;
+        if let Some(store) = &self.store
+            && let Err(e) = self.registry.persist(store)
+        {
+            tracing::warn!(error = %e, "persisting the aborted rebuild failed");
+        }
+        tracing::info!("rebuild cancelled; positions cleared, it will not resume");
+    }
+
     /// Mark `file` fully folded for every analysis rebuilding it, and persist
     /// straight away: a file boundary is the cheapest point at which a restart
     /// can avoid re-reading it.
