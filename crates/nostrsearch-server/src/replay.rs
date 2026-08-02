@@ -147,10 +147,7 @@ impl<R: std::io::Read> std::io::Read for Counting<R> {
 /// stream.
 fn open_dump(
     path: &Path,
-) -> std::io::Result<(
-    Box<dyn BufRead + Send>,
-    Arc<std::sync::atomic::AtomicU64>,
-)> {
+) -> std::io::Result<(Box<dyn BufRead + Send>, Arc<std::sync::atomic::AtomicU64>)> {
     let file = std::fs::File::open(path)?;
     let name = path.to_string_lossy().to_ascii_lowercase();
     let count = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -336,13 +333,20 @@ fn replay_file(
                             .unwrap_or(false);
                         if !known {
                             fp.new += 1;
-                            submit.blocking_submit(ev);
-                            batch += 1;
-                            if batch >= BATCH {
-                                batch = 0;
-                                // Let the writer drain live traffic.
-                                std::thread::yield_now();
-                            }
+                        }
+                        // Submit regardless of whether it is already indexed.
+                        // The analyses need every event: a replay run after
+                        // resetting reports exists to rebuild analysis state
+                        // from events that are, by definition, already in the
+                        // index. Submitting only the new ones made the whole
+                        // replay a no-op for reports -- 122 GiB of reading to
+                        // fold nothing.
+                        submit.blocking_submit(ev, !known);
+                        batch += 1;
+                        if batch >= BATCH {
+                            batch = 0;
+                            // Let the writer drain live traffic.
+                            std::thread::yield_now();
                         }
                     }
                     // A bad line is skipped, never fatal: the whole point is

@@ -9,7 +9,7 @@
 
 use nostrsearch_core::event::NostrEvent;
 use nostrsearch_stats::analyses::Clients;
-use nostrsearch_stats::{Analysis, Progress, Registry, World};
+use nostrsearch_stats::{Progress, Registry, World};
 
 const DAY: u64 = 86_400;
 const NOW: u64 = 1_785_676_000;

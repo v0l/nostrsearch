@@ -13,7 +13,7 @@
 
 use nostrsearch_core::event::NostrEvent;
 use nostrsearch_stats::analyses::Clients;
-use nostrsearch_stats::{Analysis, Registry, World};
+use nostrsearch_stats::{Registry, World};
 
 const NOW: u64 = 1_785_680_000;
 

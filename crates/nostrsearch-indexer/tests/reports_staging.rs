@@ -256,3 +256,51 @@ fn later_passes_do_not_reindex() {
         "each event should be indexed once, not once per pass"
     );
 }
+
+/// A replay of already-indexed events must still feed the analyses.
+///
+/// The archive replay skips indexing for events it finds in the id-store, which
+/// is correct -- they are already searchable. But an operator replays a dump
+/// *after* resetting reports precisely to rebuild analysis state, and at that
+/// point every event in the dump is already indexed. Treating "already indexed"
+/// as "nothing to do" made the replay a no-op for reports: on the live node it
+/// read 122 GiB and folded nothing.
+#[test]
+fn replaying_already_indexed_events_still_folds_reports() {
+    let dir = tempfile::tempdir().unwrap();
+    let day0 = 1_700_000_000 - (1_700_000_000 % DAY);
+    let events = corpus(day0);
+
+    let mut p = Pipeline::new(config(dir.path())).unwrap();
+    run_all_passes(&mut p, &events);
+    let expected = report(&p, "activity");
+    assert_eq!(
+        expected[day0.to_string()]["kinds"]["1"]["trusted"],
+        2,
+        "fixture should produce a non-empty report"
+    );
+
+    // A live node already has its follow graph on disk and its world
+    // materialized, so build that first, then replay the rest as
+    // already-indexed events.
+    let dir2 = tempfile::tempdir().unwrap();
+    let mut q = Pipeline::new(config(dir2.path())).unwrap();
+    let contacts: Vec<NostrEvent> = events.iter().filter(|e| e.kind == 3).cloned().collect();
+    run_all_passes(&mut q, &contacts);
+
+    for e in events.iter().filter(|e| e.kind != 3) {
+        q.process_replayed(e, false);
+    }
+
+    let got = report(&q, "activity");
+    assert_eq!(
+        got[day0.to_string()]["kinds"]["1"],
+        expected[day0.to_string()]["kinds"]["1"],
+        "a replay of already-indexed events must fold them, with the right trust split"
+    );
+    assert_eq!(
+        got[day0.to_string()]["zaps_sent_sats"],
+        expected[day0.to_string()]["zaps_sent_sats"],
+        "zap attribution must survive the replay path too"
+    );
+}

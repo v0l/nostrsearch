@@ -78,18 +78,29 @@ impl EventSink {
     }
 }
 
+/// A replayed event, and whether it still needs indexing.
+///
+/// An event already present in the index must still be folded into the
+/// analyses: the two are independent, and a replay run after resetting reports
+/// exists precisely to rebuild analysis state from events that are already
+/// indexed.
+pub struct Replayed {
+    pub ev: NostrEvent,
+    pub index: bool,
+}
+
 /// Submits replayed archive events to the writer at lower priority than live
 /// traffic. Cloneable and cheap.
 #[derive(Clone)]
-pub struct ReplaySink(mpsc::Sender<NostrEvent>);
+pub struct ReplaySink(mpsc::Sender<Replayed>);
 
 impl ReplaySink {
     /// Submit from a blocking thread, waiting for capacity.
     ///
     /// Blocking on a full queue is the point: it is what stops a replay of a
     /// 200 GB dump outrunning the writer and pushing live events out.
-    pub fn blocking_submit(&self, ev: NostrEvent) {
-        let _ = self.0.blocking_send(ev);
+    pub fn blocking_submit(&self, ev: NostrEvent, index: bool) {
+        let _ = self.0.blocking_send(Replayed { ev, index });
     }
 }
 
@@ -190,7 +201,7 @@ pub fn spawn_writer_with_reports(
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriterCmd>(16);
     // Replay queue, deliberately shallow: a deep buffer would let a replay
     // build a long backlog that delays live events behind it.
-    let (replay_tx, mut replay_rx) = mpsc::channel::<NostrEvent>(2_048);
+    let (replay_tx, mut replay_rx) = mpsc::channel::<Replayed>(2_048);
 
     let join = tokio::spawn(async move {
         let mut tick = tokio::time::interval(commit_every);
@@ -250,10 +261,12 @@ pub fn spawn_writer_with_reports(
                         let _ = reply.send(pipeline.analyses_status());
                     }
                 },
-                Some(ev) = replay_rx.recv() => {
-                    // Same path as a live event: indexed, folded into stats,
-                    // and deduped upstream by the replay's id-store check.
-                    pipeline.process(&ev);
+                Some(r) = replay_rx.recv() => {
+                    // Always folded into the analyses; indexed only if the
+                    // replay found it missing from the index. Skipping the
+                    // fold for already-indexed events would make a replay after
+                    // a report reset a very expensive no-op.
+                    pipeline.process_replayed(&r.ev, r.index);
                     dirty = true;
                 }
                 _ = sd_rx.changed() => {

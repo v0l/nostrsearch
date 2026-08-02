@@ -203,6 +203,29 @@ impl Pipeline {
 
     /// Process one event: fold into stats, then index it with the current WoT
     /// tier. Triggers a WoT refresh every `wot_refresh_every` events.
+    /// Process a replayed archive event.
+    ///
+    /// `index` is false when the replay already found the event in the index.
+    /// The analyses still see it: index state and analysis state are
+    /// independent, and a replay run after resetting reports exists precisely
+    /// to rebuild analysis state from events that are already indexed. Folding
+    /// only the missing ones would make that replay a no-op.
+    pub fn process_replayed(&mut self, ev: &NostrEvent, index: bool) {
+        let now = Self::now();
+        let t0 = Instant::now();
+        self.registry.observe_backfill(ev, now, &self.world);
+        let t1 = Instant::now();
+        if index && let Err(e) = self.manager.index_event(ev) {
+            tracing::warn!(error = %e, "index_event failed");
+        }
+        self.stats_ns += (t1 - t0).as_nanos() as u64;
+        self.index_ns += t1.elapsed().as_nanos() as u64;
+        self.since_refresh += 1;
+        if self.live && self.since_refresh >= self.cfg.wot_refresh_every {
+            self.maybe_refresh_wot();
+        }
+    }
+
     pub fn process(&mut self, ev: &NostrEvent) {
         let now = Self::now();
         let t0 = Instant::now();
