@@ -10,7 +10,7 @@
 
 use nostrsearch_core::event::NostrEvent;
 use nostrsearch_stats::analyses::FollowGraph;
-use nostrsearch_stats::{Analysis, Registry, StatStore, World};
+use nostrsearch_stats::{Registry, StatStore, World};
 
 fn tempdir(tag: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
@@ -59,7 +59,7 @@ fn resetting_follow_graph_keeps_the_web_of_trust() {
     // Twenty pubkeys follow `star`.
     for i in 0..20u8 {
         reg.observe(
-            &contacts(&pk(i), &[star.clone()], 1000 + i as u64),
+            &contacts(&pk(i), std::slice::from_ref(&star), 1000 + i as u64),
             2000,
             &world,
         );
@@ -72,7 +72,7 @@ fn resetting_follow_graph_keeps_the_web_of_trust() {
     assert!(before.wot_tier(&star_key) >= 1, "should be trusted");
 
     // Operator resets the analysis, then it is re-attached as on restart.
-    assert!(reg.reset("follow_graph"));
+    assert!(reg.reset("follow_graph").is_some());
     reg.attach_all(store.dir()).unwrap();
 
     let mut after = World::new();
@@ -88,6 +88,56 @@ fn resetting_follow_graph_keeps_the_web_of_trust() {
         before.wot_tier(&star_key),
         "resetting an analysis must not silently drop the web of trust"
     );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Resetting a dependency must reset everything built on top of it.
+///
+/// `activity` and `active_users` label each event trusted or untrusted using
+/// the world `follow_graph` builds, and fold that judgement into stored totals
+/// as they go. Reset `follow_graph` alone and those reports keep counts derived
+/// from a graph that no longer exists -- nothing recomputes them on read, so
+/// the stale split survives any amount of re-ingesting.
+#[test]
+fn resetting_a_dependency_cascades_to_its_dependents() {
+    use nostrsearch_stats::analyses::{ActiveUsers, Activity};
+
+    let dir = tempdir("cascade");
+    let store = StatStore::new(&dir).unwrap();
+    let world = World::new();
+
+    let mut reg = Registry::new();
+    reg.register(FollowGraph::default());
+    reg.register(Activity::default());
+    reg.register(ActiveUsers::default());
+    reg.load(&store).unwrap();
+
+    let star = pk(200);
+    for i in 0..20u8 {
+        reg.observe(
+            &contacts(&pk(i), std::slice::from_ref(&star), 1000 + i as u64),
+            2000,
+            &world,
+        );
+    }
+
+    let reset = reg.reset("follow_graph").expect("follow_graph exists");
+    assert!(
+        reset.contains(&"activity") && reset.contains(&"active_users"),
+        "resetting follow_graph must cascade to its dependents, got {reset:?}"
+    );
+    assert!(reset.contains(&"follow_graph"), "and include itself");
+
+    // Resetting a leaf must not drag anything else down with it.
+    let leaf = reg.reset("activity").expect("activity exists");
+    assert_eq!(
+        leaf,
+        vec!["activity"],
+        "a leaf reset must not touch unrelated analyses"
+    );
+
+    assert!(reg.reset("nope").is_none(), "unknown names are reported");
 
     std::fs::remove_dir_all(&dir).ok();
 }

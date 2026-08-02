@@ -169,22 +169,24 @@ impl Pipeline {
         self.registry.status()
     }
 
-    /// Discard one analysis's state so it re-derives from the corpus, and
-    /// persist that immediately so a restart cannot resurrect the old state.
-    pub fn reset_analysis(&mut self, name: &str) -> bool {
-        if !self.registry.reset(name) {
-            return false;
-        }
+    /// Discard one analysis's state, and every analysis that depends on it, so
+    /// they re-derive from the corpus. Persists immediately so a restart cannot
+    /// resurrect the old state.
+    ///
+    /// Returns the names that were reset, or `None` if the name is unknown.
+    pub fn reset_analysis(&mut self, name: &str) -> Option<Vec<&'static str>> {
+        let reset = self.registry.reset(name)?;
         if let Some(store) = &self.store
             && let Err(e) = self.registry.persist(store)
         {
             tracing::warn!(error = %e, analysis = name, "persisting reset failed");
         }
         tracing::info!(
-            analysis = name,
-            "analysis reset; will re-derive from events"
+            requested = name,
+            reset = ?reset,
+            "analyses reset; they will re-derive from the corpus"
         );
-        true
+        Some(reset)
     }
 
     /// Drain each analysis's partial changes since the last call, for streaming

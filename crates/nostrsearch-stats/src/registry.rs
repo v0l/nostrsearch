@@ -523,19 +523,52 @@ impl Registry {
     }
 
     /// Discard an analysis's accumulated state and progress so it re-derives
-    /// from scratch. Returns false if no analysis has that name.
+    /// from scratch, along with everything that depends on it.
     ///
-    /// Clearing `backfilled` is the part that matters: an analysis in that
-    /// state folds every event it is handed regardless of watermark, so
-    /// out-of-order history (from the scraper walking backwards, or an archive
-    /// replay) is picked up instead of being rejected as "already past".
-    pub fn reset(&mut self, name: &str) -> bool {
-        let Some(e) = self.entries.iter_mut().find(|e| e.analysis.name() == name) else {
-            return false;
-        };
-        e.analysis.reset_to_default();
-        e.progress = Progress::fresh(e.analysis.epoch());
-        true
+    /// Returns every name that was reset, or `None` if no analysis has that
+    /// name.
+    ///
+    /// The cascade is not a convenience. A dependent analysis reads its
+    /// dependency's output as it folds -- `activity` and `active_users` label
+    /// each event trusted or untrusted from the world `follow_graph` built --
+    /// so its stored numbers are a function of both. Resetting `follow_graph`
+    /// alone leaves those reports holding counts derived from a graph that no
+    /// longer exists, and no amount of re-ingesting fixes them, because they
+    /// are already-folded totals rather than something recomputed on read.
+    ///
+    /// Clearing `backfilled` is the part that makes the rebuild possible: an
+    /// analysis in that state folds every event it is handed regardless of
+    /// watermark, so out-of-order history (the scraper walking backwards, or
+    /// an archive rebuild) is picked up instead of rejected as "already past".
+    pub fn reset(&mut self, name: &str) -> Option<Vec<&'static str>> {
+        if !self.entries.iter().any(|e| e.analysis.name() == name) {
+            return None;
+        }
+
+        // Transitive closure over reverse dependencies.
+        let mut doomed: Vec<&'static str> = Vec::new();
+        let mut queue = vec![name.to_string()];
+        while let Some(cur) = queue.pop() {
+            for e in &self.entries {
+                let n = e.analysis.name();
+                if n == cur && !doomed.contains(&n) {
+                    doomed.push(n);
+                }
+                if e.analysis.deps().contains(&cur.as_str()) && !doomed.contains(&n) {
+                    doomed.push(n);
+                    queue.push(n.to_string());
+                }
+            }
+        }
+
+        for e in self.entries.iter_mut() {
+            if doomed.contains(&e.analysis.name()) {
+                e.analysis.reset_to_default();
+                e.progress = Progress::fresh(e.analysis.epoch());
+            }
+        }
+        doomed.sort_unstable();
+        Some(doomed)
     }
 
     /// Names of analyses that have not completed a backfill over the corpus.

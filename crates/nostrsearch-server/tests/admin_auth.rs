@@ -275,7 +275,13 @@ async fn resetting_an_analysis_requires_auth_and_reports_unknown_names() -> anyh
         .await?;
     assert_eq!(r.status(), 200, "admin reset should succeed");
     let body: serde_json::Value = r.json().await?;
-    assert_eq!(body["reset"], true);
+    // The response names every analysis that was reset, including the
+    // dependents dragged in with it, so the caller can see the blast radius.
+    let reset = body["reset"].as_array().expect("reset is a list of names");
+    assert!(
+        reset.iter().any(|n| n == "activity"),
+        "the requested analysis must be in the reset set: {reset:?}"
+    );
 
     // An unknown analysis is a 404, not a silent success.
     let url = format!("{base}/admin/analyses/nonexistent/reset");

@@ -17,6 +17,7 @@
 //!    read visible instead of something you infer from a document count much
 //!    later.
 
+use crate::node::Fold;
 use nostrsearch_core::event::NostrEvent;
 use nostrsearch_indexer::id_store::IdStore;
 use serde::Serialize;
@@ -178,6 +179,14 @@ fn open_dump(
 pub struct ReplaySelection {
     /// Explicit file names; empty selects every dump in the directory.
     pub files: Vec<String>,
+    /// Rebuild analysis state rather than ingest new events.
+    ///
+    /// An ingest skips anything already in the corpus -- there is nothing to
+    /// add. A rebuild must do the opposite and fold *every* event, because it
+    /// runs after a reset, when the analyses are empty and the corpus already
+    /// holds the events they need to re-derive from. It still indexes anything
+    /// it finds missing, so a rebuild doubles as a repair.
+    pub rebuild: bool,
 }
 
 fn is_dump(name: &str) -> bool {
@@ -218,6 +227,7 @@ pub fn spawn(
     if names.is_empty() {
         return Err("no dump files matched".into());
     }
+    let rebuild = selection.rebuild;
 
     state.cancel.store(false, Ordering::Relaxed);
     state.update(|s| {
@@ -245,9 +255,15 @@ pub fn spawn(
             };
 
             match open_dump(&path) {
-                Ok((reader, counter)) => {
-                    replay_file(&state, reader, counter, &mut fp, dedupe.as_deref(), &submit)
-                }
+                Ok((reader, counter)) => replay_file(
+                    &state,
+                    reader,
+                    counter,
+                    &mut fp,
+                    dedupe.as_deref(),
+                    &submit,
+                    rebuild,
+                ),
                 Err(e) => fp.error = Some(format!("open failed: {e}")),
             }
 
@@ -288,6 +304,7 @@ pub fn spawn(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn replay_file(
     state: &ReplayState,
     mut reader: Box<dyn BufRead + Send>,
@@ -295,6 +312,7 @@ fn replay_file(
     fp: &mut FileProgress,
     dedupe: Option<&IdStore>,
     submit: &crate::node::ReplaySink,
+    rebuild: bool,
 ) {
     let mut line = Vec::with_capacity(4096);
     let mut batch = 0usize;
@@ -334,14 +352,14 @@ fn replay_file(
                         if !known {
                             fp.new += 1;
                         }
-                        // Submit regardless of whether it is already indexed.
-                        // The analyses need every event: a replay run after
-                        // resetting reports exists to rebuild analysis state
-                        // from events that are, by definition, already in the
-                        // index. Submitting only the new ones made the whole
-                        // replay a no-op for reports -- 122 GiB of reading to
-                        // fold nothing.
-                        submit.blocking_submit(ev, !known);
+                        // Ingest: an event already in the corpus is skipped
+                        // outright, there is nothing to add.
+                        if known && !rebuild {
+                            continue;
+                        }
+                        // Rebuild: fold everything, index only what is missing.
+                        let fold = if known { Fold::Only } else { Fold::AndIndex };
+                        submit.blocking_submit(ev, fold);
                         batch += 1;
                         if batch >= BATCH {
                             batch = 0;

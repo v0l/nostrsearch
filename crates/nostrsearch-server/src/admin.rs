@@ -292,28 +292,77 @@ async fn analyses(State(st): State<AdminState>) -> Response {
 
 #[derive(Serialize)]
 struct ResetResult {
-    reset: bool,
+    reset: Vec<&'static str>,
+    rebuild: bool,
     detail: String,
 }
 
+/// `POST /admin/analyses/{name}/reset`
+///
+/// Resets the named analysis *and everything that depends on it*, then starts a
+/// rebuild over the archive so the reset state is refilled from the whole
+/// corpus rather than from whatever happens to arrive next.
+///
+/// The cascade is required for the result to mean anything: dependents fold
+/// their dependency's output into stored totals as they go, so a dependency
+/// reset on its own leaves them holding numbers derived from state that no
+/// longer exists.
 async fn reset_analysis(State(st): State<AdminState>, Path(name): Path<String>) -> Response {
-    match st.ctl.reset_analysis(&name).await {
-        Ok(true) => Json(ResetResult {
-            reset: true,
-            detail: format!("{name} will re-derive from incoming events"),
-        })
-        .into_response(),
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            Json(serde_json::json!({ "error": format!("no analysis named {name}") })),
+    let reset = match st.ctl.reset_analysis(&name).await {
+        Ok(Some(names)) => names,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({ "error": format!("no analysis named {name}") })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response();
+        }
+    };
+
+    // Refill from the corpus. A reset analysis is empty, and the live firehose
+    // alone would take as long as the corpus took to collect to refill it, so
+    // a reset without this is only half an operation.
+    let rebuild = match st.replay.clone() {
+        Some(rp) => crate::replay::spawn(
+            rp.state.clone(),
+            rp.dir,
+            crate::replay::ReplaySelection {
+                files: Vec::new(), // every dump
+                rebuild: true,
+            },
+            rp.dedupe,
+            rp.sink,
         )
-            .into_response(),
-        Err(e) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({ "error": e })),
+        .is_ok(),
+        None => false,
+    };
+
+    let detail = if rebuild {
+        format!(
+            "reset {}; rebuilding from the archive, poll GET /admin/ingest",
+            reset.join(", ")
         )
-            .into_response(),
-    }
+    } else {
+        format!(
+            "reset {}; no rebuild started (no archive, or one already running) -- \
+             they will refill from live traffic only",
+            reset.join(", ")
+        )
+    };
+
+    Json(ResetResult {
+        reset,
+        rebuild,
+        detail,
+    })
+    .into_response()
 }
 
 /// `POST /admin/scrape/reset?relay=&from=YYYY-MM-DD&to=YYYY-MM-DD`
@@ -372,6 +421,7 @@ async fn start_ingest(
 
     let selection = crate::replay::ReplaySelection {
         files: files.clone(),
+        rebuild: false,
     };
     match crate::replay::spawn(rp.state.clone(), rp.dir, selection, rp.dedupe, rp.sink) {
         Ok(()) => Json(serde_json::json!({

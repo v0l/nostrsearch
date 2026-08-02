@@ -78,15 +78,21 @@ impl EventSink {
     }
 }
 
-/// A replayed event, and whether it still needs indexing.
-///
-/// An event already present in the index must still be folded into the
-/// analyses: the two are independent, and a replay run after resetting reports
-/// exists precisely to rebuild analysis state from events that are already
-/// indexed.
+/// What the writer should do with a replayed event.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Fold {
+    /// Ingest: the event is missing from the corpus, so index it as well as
+    /// folding it into the analyses.
+    AndIndex,
+    /// Rebuild: the event is already in the corpus and only the analyses need
+    /// it, so skip the index write entirely.
+    Only,
+}
+
+/// A replayed event and what to do with it.
 pub struct Replayed {
     pub ev: NostrEvent,
-    pub index: bool,
+    pub fold: Fold,
 }
 
 /// Submits replayed archive events to the writer at lower priority than live
@@ -99,8 +105,8 @@ impl ReplaySink {
     ///
     /// Blocking on a full queue is the point: it is what stops a replay of a
     /// 200 GB dump outrunning the writer and pushing live events out.
-    pub fn blocking_submit(&self, ev: NostrEvent, index: bool) {
-        let _ = self.0.blocking_send(Replayed { ev, index });
+    pub fn blocking_submit(&self, ev: NostrEvent, fold: Fold) {
+        let _ = self.0.blocking_send(Replayed { ev, fold });
     }
 }
 
@@ -110,7 +116,7 @@ pub enum WriterCmd {
     /// Discard an analysis's state so it re-derives from incoming events.
     ResetAnalysis {
         name: String,
-        reply: tokio::sync::oneshot::Sender<bool>,
+        reply: tokio::sync::oneshot::Sender<Option<Vec<&'static str>>>,
     },
     /// Per-analysis progress.
     Status {
@@ -123,8 +129,13 @@ pub enum WriterCmd {
 pub struct WriterCtl(mpsc::Sender<WriterCmd>);
 
 impl WriterCtl {
-    /// Reset one analysis. `Ok(false)` = no analysis by that name.
-    pub async fn reset_analysis(&self, name: &str) -> Result<bool, &'static str> {
+    /// Reset an analysis and everything that depends on it.
+    ///
+    /// `Ok(None)` = no analysis by that name.
+    pub async fn reset_analysis(
+        &self,
+        name: &str,
+    ) -> Result<Option<Vec<&'static str>>, &'static str> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.0
             .send(WriterCmd::ResetAnalysis {
@@ -262,11 +273,7 @@ pub fn spawn_writer_with_reports(
                     }
                 },
                 Some(r) = replay_rx.recv() => {
-                    // Always folded into the analyses; indexed only if the
-                    // replay found it missing from the index. Skipping the
-                    // fold for already-indexed events would make a replay after
-                    // a report reset a very expensive no-op.
-                    pipeline.process_replayed(&r.ev, r.index);
+                    pipeline.process_replayed(&r.ev, r.fold == Fold::AndIndex);
                     dirty = true;
                 }
                 _ = sd_rx.changed() => {

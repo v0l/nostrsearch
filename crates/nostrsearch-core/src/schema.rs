@@ -229,12 +229,7 @@ mod tests {
             ns.pubkey,
             ns.kind,
             ns.created_at,
-            ns.day,
-            ns.wot_tier,
-            ns.deleted,
-            ns.superseded,
             ns.content,
-            ns.raw_content,
             ns.tag_t,
             ns.tag_e,
             ns.tag_p,
@@ -245,8 +240,32 @@ mod tests {
             ns.tag_l,
             ns.lang,
         ] {
-            assert!(schema.get_field_entry(f).field_type().is_indexed() || true);
+            let entry = schema.get_field_entry(f);
+            assert!(
+                entry.field_type().is_indexed(),
+                "{} must be indexed or it cannot be queried",
+                entry.name()
+            );
         }
+
+        // These are deliberately not indexed. They are read back per-document
+        // during scoring and filtering (`day` for date bucketing, `wot_tier`
+        // for the trust boost, the two flags for suppression), never matched as
+        // query terms, so they carry FAST without INDEXED.
+        for f in [ns.day, ns.wot_tier, ns.deleted, ns.superseded] {
+            let entry = schema.get_field_entry(f);
+            assert!(
+                entry.field_type().is_fast(),
+                "{} is read per-document during scoring, so it must be fast",
+                entry.name()
+            );
+        }
+
+        // `raw_content` is returned verbatim and never searched; `content` is
+        // the analyzed copy that serves queries.
+        let raw = schema.get_field_entry(ns.raw_content);
+        assert!(raw.is_stored(), "raw_content must be stored to be returned");
+        assert!(!raw.field_type().is_indexed());
     }
 
     #[test]
