@@ -18,6 +18,7 @@ use nostrsearch_core::event::NostrEvent;
 use nostrsearch_stats::analyses::{ActiveUsers, Activity, Clients, FollowGraph, Pagerank, Relays};
 use nostrsearch_stats::{Registry, SharedWot, StatStore, World, WotIndex};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Configuration for the unified pipeline.
@@ -58,7 +59,8 @@ impl Default for PipelineConfig {
 
 /// One pipeline instance = one index + one stats engine + one shared WoT.
 pub struct Pipeline {
-    manager: ShardManager,
+    /// Shared so a bulk ingest can index without holding the pipeline lock.
+    manager: Arc<ShardManager>,
     registry: Registry,
     world: World,
     wot: SharedWot,
@@ -87,8 +89,9 @@ impl Pipeline {
     /// registered. Resumes analysis state from `state_dir` if present.
     pub fn new(cfg: PipelineConfig) -> Result<Self> {
         let wot = SharedWot::empty();
-        let manager =
-            ShardManager::new(&cfg.index_root, cfg.shard.clone()).with_wot_lookup(wot.lookup());
+        let manager = Arc::new(
+            ShardManager::new(&cfg.index_root, cfg.shard.clone()).with_wot_lookup(wot.lookup()),
+        );
 
         let mut registry = Registry::new();
         registry
@@ -247,6 +250,44 @@ impl Pipeline {
             .map(|d| d.as_secs())
             .unwrap_or(0)
     }
+    /// Fold one event into the analyses only, without indexing it.
+    ///
+    /// Paired with [`index_only`](Pipeline::index_only) so a bulk ingest can
+    /// hold the pipeline lock for the cheap half and index outside it. Folding
+    /// mutates per-analysis state and has to be serial; indexing does not, and
+    /// holding one lock across both pinned the entire ingest to a single core
+    /// while every reader thread queued behind it.
+    pub fn fold_only(&mut self, ev: &NostrEvent) {
+        let now = Self::now();
+        let t0 = Instant::now();
+        if self.live {
+            self.registry.observe_backfill(ev, now, &self.world);
+        } else {
+            let stage = std::mem::take(&mut self.stages[self.pass]);
+            self.registry
+                .observe_backfill_stage(&stage, ev, now, &self.world);
+            self.stages[self.pass] = stage;
+        }
+        self.stats_ns += t0.elapsed().as_nanos() as u64;
+        self.since_refresh += 1;
+        if self.live && self.since_refresh >= self.cfg.wot_refresh_every {
+            self.maybe_refresh_wot();
+        }
+    }
+
+    /// Whether this pass writes to the index.
+    ///
+    /// Only pass 0 does; later passes re-read the archive purely to feed the
+    /// analyses that depend on earlier ones.
+    pub fn indexes_this_pass(&self) -> bool {
+        self.live || self.pass == 0
+    }
+
+    /// A handle for indexing without the pipeline lock.
+    pub fn indexer(&self) -> Arc<ShardManager> {
+        self.manager.clone()
+    }
+
     pub fn process(&mut self, ev: &NostrEvent) {
         let now = Self::now();
         let t0 = Instant::now();

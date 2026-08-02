@@ -15,6 +15,8 @@ use nostrsearch_core::schema::NostrSchema;
 use nostrsearch_core::shard::ShardId;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tantivy::{Index, IndexWriter, TantivyDocument};
 use thiserror::Error;
@@ -106,15 +108,27 @@ impl Default for ShardWriterConfig {
 }
 
 /// A single open shard: index + writer + commit bookkeeping.
+///
+/// Everything here is shared rather than owned exclusively, so several threads
+/// can index into the same shard at once. Tantivy's `add_document` takes
+/// `&self` and hands the document to the writer's own threads, so the only
+/// thing needing exclusivity is `commit`.
+///
+/// This matters because the alternative -- one lock around the whole pipeline
+/// -- serialized every event in the corpus onto a single core while dozens of
+/// reader threads sat blocked on it, and the disk went idle.
 struct OpenShard {
     /// Value of `ShardManager::tick` when this shard was last written to.
-    last_used: u64,
+    last_used: AtomicU64,
+    #[allow(dead_code)]
     index: Index,
-    writer: IndexWriter,
+    /// Read to add, write to commit.
+    writer: RwLock<IndexWriter>,
     schema: NostrSchema,
-    docs_since_commit: u64,
-    last_commit: Instant,
-    total_docs: u64,
+    docs_since_commit: AtomicU64,
+    /// Millis since the manager's epoch, so the commit deadline needs no lock.
+    last_commit_ms: AtomicU64,
+    total_docs: AtomicU64,
 }
 
 impl OpenShard {
@@ -125,48 +139,72 @@ impl OpenShard {
         NostrSchema::register_tokenizers(&index);
         let writer = index.writer_with_num_threads(cfg.writer_threads, cfg.heap_bytes)?;
         Ok(Self {
-            last_used: 0,
+            last_used: AtomicU64::new(0),
             index,
-            writer,
+            writer: RwLock::new(writer),
             schema: ns,
-            docs_since_commit: 0,
-            last_commit: Instant::now(),
-            total_docs: 0,
+            docs_since_commit: AtomicU64::new(0),
+            last_commit_ms: AtomicU64::new(now_ms()),
+            total_docs: AtomicU64::new(0),
         })
     }
 
-    fn add(&mut self, doc: TantivyDocument) -> Result<(), ShardError> {
-        self.writer.add_document(doc)?;
-        self.docs_since_commit += 1;
-        self.total_docs += 1;
+    /// Queue a document. Concurrent with other adds to the same shard.
+    fn add(&self, doc: TantivyDocument) -> Result<(), ShardError> {
+        // A read guard: `add_document` only needs `&self`, and Tantivy's own
+        // writer threads do the indexing. Taking a write guard here would
+        // reintroduce the serialization this exists to remove.
+        self.writer.read().unwrap().add_document(doc)?;
+        self.docs_since_commit.fetch_add(1, Ordering::Relaxed);
+        self.total_docs.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     fn should_commit(&self, cfg: &ShardWriterConfig) -> bool {
-        self.docs_since_commit >= cfg.commit_every_docs
-            || (self.docs_since_commit > 0 && self.last_commit.elapsed() >= cfg.commit_every)
+        let n = self.docs_since_commit.load(Ordering::Relaxed);
+        n >= cfg.commit_every_docs
+            || (n > 0
+                && now_ms().saturating_sub(self.last_commit_ms.load(Ordering::Relaxed))
+                    >= cfg.commit_every.as_millis() as u64)
     }
 
-    fn commit(&mut self) -> Result<(), ShardError> {
-        if self.docs_since_commit == 0 {
+    /// Commit. Exclusive: Tantivy's `commit` needs `&mut`, and adds must not
+    /// interleave with it.
+    fn commit(&self) -> Result<(), ShardError> {
+        let mut w = self.writer.write().unwrap();
+        // Re-check under the guard: another thread may have committed while
+        // this one waited, and an empty commit still costs an fsync.
+        if self.docs_since_commit.load(Ordering::Relaxed) == 0 {
             return Ok(());
         }
-        self.writer.commit()?;
-        self.docs_since_commit = 0;
-        self.last_commit = Instant::now();
+        w.commit()?;
+        self.docs_since_commit.store(0, Ordering::Relaxed);
+        self.last_commit_ms.store(now_ms(), Ordering::Relaxed);
         Ok(())
     }
+}
+
+/// Milliseconds since process start, for lock-free commit deadlines.
+fn now_ms() -> u64 {
+    use std::sync::OnceLock;
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64
 }
 
 /// Routes events to per-month shards and manages their lifecycle.
 pub struct ShardManager {
     root: PathBuf,
     cfg: ShardWriterConfig,
-    shards: HashMap<ShardId, OpenShard>,
+    /// Open shards, each independently writable.
+    ///
+    /// The map lock is held only to find or open a shard -- never across the
+    /// indexing itself, which is the expensive part and now runs concurrently
+    /// across threads and shards.
+    shards: Mutex<HashMap<ShardId, Arc<OpenShard>>>,
     /// Monotonic counter used to pick the least-recently-written shard.
-    tick: u64,
+    tick: AtomicU64,
     /// Total evictions, used to detect thrashing.
-    evictions: u64,
+    evictions: AtomicU64,
     /// WoT tier lookup hook — maps pubkey hex → tier. Pluggable so the WoT
     /// graph can be injected without the indexer depending on it.
     wot_lookup: Option<Box<dyn Fn(&str) -> u8 + Send + Sync>>,
@@ -177,9 +215,9 @@ impl ShardManager {
         Self {
             root: root.into(),
             cfg,
-            shards: HashMap::new(),
-            tick: 0,
-            evictions: 0,
+            shards: Mutex::new(HashMap::new()),
+            tick: AtomicU64::new(0),
+            evictions: AtomicU64::new(0),
             wot_lookup: None,
         }
     }
@@ -194,87 +232,102 @@ impl ShardManager {
         self.root.join(id.name())
     }
 
-    /// Open (or return) the shard for an event timestamp.
-    fn shard_for(&mut self, ts: u64) -> Result<&mut OpenShard, ShardError> {
+    /// Find or open the shard for `ts`, returning a handle usable without the
+    /// map lock.
+    fn shard_for(&self, ts: u64) -> Result<Arc<OpenShard>, ShardError> {
         let id = ShardId::from_timestamp(ts);
-        if !self.shards.contains_key(&id) {
-            // Bound writer-heap usage before opening another one.
-            self.evict_if_needed()?;
-            let dir = self.shard_dir(id);
-            tracing::info!(shard = %id, path = %dir.display(), "opening shard");
-            let shard = OpenShard::open(&dir, &self.cfg)?;
-            self.shards.insert(id, shard);
+        let tick = self.tick.fetch_add(1, Ordering::Relaxed) + 1;
+        {
+            let map = self.shards.lock().unwrap();
+            if let Some(s) = map.get(&id) {
+                s.last_used.store(tick, Ordering::Relaxed);
+                return Ok(s.clone());
+            }
         }
-        self.tick += 1;
-        let tick = self.tick;
-        let shard = self.shards.get_mut(&id).unwrap();
-        shard.last_used = tick;
+        // Not open. Evict outside the map lock where possible, then insert;
+        // another thread may have won the race, in which case take theirs.
+        self.evict_if_needed()?;
+        let dir = self.shard_dir(id);
+        let mut map = self.shards.lock().unwrap();
+        if let Some(s) = map.get(&id) {
+            s.last_used.store(tick, Ordering::Relaxed);
+            return Ok(s.clone());
+        }
+        tracing::info!(shard = %id, path = %dir.display(), "opening shard");
+        let shard = Arc::new(OpenShard::open(&dir, &self.cfg)?);
+        shard.last_used.store(tick, Ordering::Relaxed);
+        map.insert(id, shard.clone());
         Ok(shard)
     }
 
     /// Commit and close the least-recently-written shard while over the cap.
-    fn evict_if_needed(&mut self) -> Result<(), ShardError> {
+    fn evict_if_needed(&self) -> Result<(), ShardError> {
         let cap = self.cfg.max_open_shards.max(1);
-        while self.shards.len() >= cap {
-            let victim = self
-                .shards
-                .iter()
-                .min_by_key(|(_, s)| s.last_used)
-                .map(|(id, _)| *id);
-            match victim {
-                Some(id) => {
-                    self.evictions += 1;
-                    // Sustained eviction means the cap is below the corpus span
-                    // and every eviction is paying a commit for nothing.
-                    if self.evictions == 100 {
-                        tracing::warn!(
-                            max_open_shards = cap,
-                            "evicting shard writers repeatedly — the archive spans more months \
-                             than the open-shard cap, so each eviction pays a commit and is \
-                             immediately reopened; raise --max-open-shards to the number of \
-                             months in the corpus"
-                        );
-                    }
-                    tracing::debug!(shard = %id, open = self.shards.len(), "evicting shard writer");
-                    self.close_shard(id)?;
+        loop {
+            // Pick a victim under the map lock, then release it: closing a
+            // shard commits and fsyncs, which must not block every other
+            // thread's shard lookup.
+            let victim = {
+                let map = self.shards.lock().unwrap();
+                if map.len() < cap {
+                    return Ok(());
                 }
-                None => break,
+                map.iter()
+                    .min_by_key(|(_, s)| s.last_used.load(Ordering::Relaxed))
+                    .map(|(id, _)| *id)
+            };
+            let Some(id) = victim else { return Ok(()) };
+
+            let n = self.evictions.fetch_add(1, Ordering::Relaxed) + 1;
+            // Sustained eviction means the cap is below the corpus span and
+            // every eviction is paying a commit for nothing.
+            if n == 100 {
+                tracing::warn!(
+                    max_open_shards = cap,
+                    "evicting shard writers repeatedly — the archive spans more months \
+                     than the open-shard cap, so each eviction pays a commit and is \
+                     immediately reopened; raise --max-open-shards to the number of \
+                     months in the corpus"
+                );
             }
+            tracing::debug!(shard = %id, "evicting shard writer");
+            self.close_shard(id)?;
         }
-        Ok(())
     }
 
     /// Index one event. `deleted`/`superseded` are computed by the caller's
     /// mutability policy (default: both false — "index everything").
-    pub fn index_event(&mut self, ev: &NostrEvent) -> Result<ShardId, ShardError> {
+    pub fn index_event(&self, ev: &NostrEvent) -> Result<ShardId, ShardError> {
         self.index_event_with_flags(ev, false, false)
     }
 
     /// Index one event with explicit mutability flags.
     pub fn index_event_with_flags(
-        &mut self,
+        &self,
         ev: &NostrEvent,
         deleted: bool,
         superseded: bool,
     ) -> Result<ShardId, ShardError> {
         let wot = self.wot_lookup.as_ref().map(|f| f(&ev.pubkey)).unwrap_or(0);
 
-        // route by timestamp first (borrows self mutably)
         let id = ShardId::from_timestamp(ev.created_at);
-        let cfg = self.cfg.clone();
         let shard = self.shard_for(ev.created_at)?;
         let doc = shard.schema.to_document(ev, wot, deleted, superseded, None);
+        // Outside every map lock: this is the expensive part, and holding a
+        // lock across it is what pinned the whole ingest to one core.
         shard.add(doc)?;
 
-        if shard.should_commit(&cfg) {
+        if shard.should_commit(&self.cfg) {
             shard.commit()?;
         }
         Ok(id)
     }
 
     /// Flush any shard whose time-based commit deadline has passed.
-    pub fn tick(&mut self) -> Result<(), ShardError> {
-        for shard in self.shards.values_mut() {
+    pub fn tick(&self) -> Result<(), ShardError> {
+        // Snapshot the handles, then commit without the map lock.
+        let shards: Vec<Arc<OpenShard>> = self.shards.lock().unwrap().values().cloned().collect();
+        for shard in shards {
             if shard.should_commit(&self.cfg) {
                 shard.commit()?;
             }
@@ -283,22 +336,30 @@ impl ShardManager {
     }
 
     /// Commit all open shards (call before shutdown or offload).
-    pub fn commit_all(&mut self) -> Result<(), ShardError> {
+    pub fn commit_all(&self) -> Result<(), ShardError> {
         // Commit shards in parallel: each holds an independent writer and the
         // cost is dominated by per-shard serialization + fsync. Committing ~90
         // shards sequentially stalled the whole pipeline for 15-20s at every
         // checkpoint (the caller holds the pipeline lock); in parallel the
         // stall is the slowest single shard.
+        let shards: Vec<(ShardId, Arc<OpenShard>)> = self
+            .shards
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, s)| (*id, s.clone()))
+            .collect();
         let results: Vec<(ShardId, u64, Result<(), ShardError>)> = std::thread::scope(|scope| {
-            let handles: Vec<_> = self
-                .shards
-                .iter_mut()
+            let handles: Vec<_> = shards
+                .iter()
                 .map(|(id, shard)| {
                     let id = *id;
+                    let shard = shard.clone();
                     scope.spawn(move || {
-                        let dirty = shard.docs_since_commit > 0;
+                        let dirty = shard.docs_since_commit.load(Ordering::Relaxed) > 0;
                         let res = shard.commit();
-                        (id, if dirty { shard.total_docs } else { 0 }, res)
+                        let total = shard.total_docs.load(Ordering::Relaxed);
+                        (id, if dirty { total } else { 0 }, res)
                     })
                 })
                 .collect();
@@ -315,8 +376,11 @@ impl ShardManager {
 
     /// Close and drop the writer for a shard, freeing its heap. The on-disk
     /// index remains searchable. Use to bound memory when many shards are open.
-    pub fn close_shard(&mut self, id: ShardId) -> Result<(), ShardError> {
-        if let Some(mut shard) = self.shards.remove(&id) {
+    pub fn close_shard(&self, id: ShardId) -> Result<(), ShardError> {
+        let shard = self.shards.lock().unwrap().remove(&id);
+        if let Some(shard) = shard {
+            // Committed after removal from the map, so the fsync does not hold
+            // up lookups for other shards.
             shard.commit()?;
             tracing::info!(shard = %id, "closed shard writer");
         }
@@ -325,12 +389,17 @@ impl ShardManager {
 
     /// Total docs indexed across all open shards.
     pub fn total_docs(&self) -> u64 {
-        self.shards.values().map(|s| s.total_docs).sum()
+        self.shards
+            .lock()
+            .unwrap()
+            .values()
+            .map(|s| s.total_docs.load(Ordering::Relaxed))
+            .sum()
     }
 
     /// Number of currently-open shards.
     pub fn open_shard_count(&self) -> usize {
-        self.shards.len()
+        self.shards.lock().unwrap().len()
     }
 }
 

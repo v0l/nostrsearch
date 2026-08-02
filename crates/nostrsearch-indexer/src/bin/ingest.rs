@@ -263,6 +263,11 @@ fn main() -> anyhow::Result<()> {
 
 async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
     let total = Arc::new(AtomicU64::new(0));
+    // The engine's live counters, shared with the progress reporter below.
+    // Reporting off `total` alone would print nothing until the run ended,
+    // which on a multi-hour archive pass is no reporting at all.
+    let progress =
+        std::sync::Arc::new(nostrsearch_indexer::archive_ingest::IngestProgress::default());
     let started = Instant::now();
 
     // Persistent event-id dedupe, so a restarted backfill resumes instead of
@@ -327,6 +332,7 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
     // progress reporter
     {
         let total_prog = total.clone();
+        let live = progress.clone();
         let limit_mb = nostrsearch_indexer::mem::cgroup_limit_mb();
         if let Some(l) = limit_mb {
             tracing::info!(limit_mb = l, "cgroup memory limit");
@@ -347,7 +353,14 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(5));
-                let done = total_prog.load(Ordering::Relaxed);
+                // Prefer the engine's live count; fall back to the final
+                // total once the run has handed it over.
+                let live_n = live.indexed.load(Ordering::Relaxed);
+                let done = if live_n > 0 {
+                    live_n
+                } else {
+                    total_prog.load(Ordering::Relaxed)
+                };
                 let stages = stage_pipe
                     .try_lock()
                     .map(|p| {
@@ -443,8 +456,6 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
         // The engine is shared with the server's admin ingest: one reader,
         // one staging scheme, one set of id-store rules. They used to be two
         // implementations with two sets of bugs.
-        let progress =
-            std::sync::Arc::new(nostrsearch_indexer::archive_ingest::IngestProgress::default());
         let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         nostrsearch_indexer::archive_ingest::ingest(
             pipeline.clone(),

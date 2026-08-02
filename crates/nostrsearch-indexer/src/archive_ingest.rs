@@ -199,6 +199,8 @@ pub async fn ingest(
         let ck_pending = pending_ids.clone();
         let prog = progress.clone();
         let cancel_cb = cancel.clone();
+        // Indexing handle, taken once: it is shared and needs no pipeline lock.
+        let indexer = pipeline.lock().unwrap().indexer();
 
         tokio::task::spawn_blocking(move || {
             let cursor = NostrCursor::new(input_dir).with_parallelism(parallelism);
@@ -213,34 +215,52 @@ pub async fn ingest(
                     }
                     prog.seen.fetch_add(batch.len() as u64, Ordering::Relaxed);
 
-                    let mut p = pipe.lock().unwrap();
-                    match &ck_store {
-                        Some(store) => {
-                            let mut pending = ck_pending.lock().unwrap();
-                            let mut n = 0u64;
-                            let mut skipped = 0u64;
-                            for ev in &batch {
-                                let Some(id) = hex32(&ev.id) else { continue };
-                                if store.contains(&id) {
-                                    skipped += 1;
-                                    continue;
-                                }
-                                p.process(ev);
-                                pending.push(id);
-                                n += 1;
-                            }
-                            prog.indexed.fetch_add(n, Ordering::Relaxed);
-                            prog.skipped.fetch_add(skipped, Ordering::Relaxed);
-                        }
-                        None => {
-                            for ev in &batch {
-                                p.process(ev);
-                            }
-                            if indexing_pass {
-                                prog.indexed
-                                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                    // Drop anything the store already has, before taking any
+                    // lock: membership is a read-only lookup.
+                    let mut skipped = 0u64;
+                    if let Some(store) = &ck_store {
+                        let ids: Vec<[u8; 32]> = batch
+                            .iter()
+                            .map(|e| hex32(&e.id).unwrap_or([0u8; 32]))
+                            .collect();
+                        let known = store.contains_batch(&ids);
+                        let mut keep = Vec::with_capacity(batch.len());
+                        let mut new_ids = Vec::with_capacity(batch.len());
+                        for ((ev, id), known) in batch.into_iter().zip(ids).zip(known) {
+                            if known {
+                                skipped += 1;
+                            } else {
+                                keep.push(ev);
+                                new_ids.push(id);
                             }
                         }
+                        batch = keep;
+                        ck_pending.lock().unwrap().extend(new_ids);
+                        prog.skipped.fetch_add(skipped, Ordering::Relaxed);
+                    }
+
+                    // Fold under the pipeline lock. This mutates per-analysis
+                    // state so it must be serial, but it is only hashmap work.
+                    {
+                        let mut p = pipe.lock().unwrap();
+                        for ev in &batch {
+                            p.fold_only(ev);
+                        }
+                    }
+
+                    // Index outside it. Tokenizing and building postings is
+                    // the expensive half, and every shard has an independent
+                    // writer, so this runs across all reader threads at once.
+                    // Doing it under the pipeline lock held the whole corpus
+                    // to one core while the readers idled.
+                    if indexing_pass {
+                        for ev in &batch {
+                            if let Err(e) = indexer.index_event(ev) {
+                                tracing::warn!(error = %e, "index_event failed");
+                            }
+                        }
+                        prog.indexed
+                            .fetch_add(batch.len() as u64, Ordering::Relaxed);
                     }
                 },
                 chunk_size,
