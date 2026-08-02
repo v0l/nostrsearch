@@ -53,10 +53,17 @@ pub struct ReplayStatus {
     pub finished_at: u64,
     pub files_total: usize,
     pub files_done: usize,
+    /// Totals across *completed* files.
     pub events: u64,
     pub new: u64,
     pub malformed: u64,
     pub current: Option<String>,
+    /// Live progress for the file being read.
+    ///
+    /// Without this the counters above only move when a file finishes, so a
+    /// 122 GiB dump reports nothing at all for hours and is indistinguishable
+    /// from a stall.
+    pub current_progress: Option<FileProgress>,
     pub files: Vec<FileProgress>,
 }
 
@@ -114,26 +121,58 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Counts bytes pulled from the underlying file.
+///
+/// Sits *below* any decompressor so progress is measured against the file on
+/// disk. Counting decompressed bytes instead would report a `bytes_read` that
+/// sails past `bytes_total` on a compressed dump, which is worse than no
+/// number at all.
+struct Counting<R> {
+    inner: R,
+    count: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl<R: std::io::Read> std::io::Read for Counting<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.count.fetch_add(n as u64, Ordering::Relaxed);
+        Ok(n)
+    }
+}
+
 /// Open a dump, transparently decompressing `.zst`/`.zstd`.
 ///
-/// Returns a reader plus a shared counter of compressed bytes consumed, so
+/// Returns the reader plus a counter of *compressed* bytes consumed, so
 /// progress reflects position in the file on disk rather than in the expanded
 /// stream.
-fn open_dump(path: &Path) -> std::io::Result<Box<dyn BufRead + Send>> {
+fn open_dump(
+    path: &Path,
+) -> std::io::Result<(
+    Box<dyn BufRead + Send>,
+    Arc<std::sync::atomic::AtomicU64>,
+)> {
     let file = std::fs::File::open(path)?;
     let name = path.to_string_lossy().to_ascii_lowercase();
+    let count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counted = Counting {
+        inner: file,
+        count: count.clone(),
+    };
     // 8 MiB buffers: these are large sequential reads.
-    let buf = std::io::BufReader::with_capacity(8 << 20, file);
+    let buf = std::io::BufReader::with_capacity(8 << 20, counted);
     if name.ends_with(".zst") || name.ends_with(".zstd") {
         let dec = zstd::stream::read::Decoder::new(buf)?;
-        Ok(Box::new(std::io::BufReader::with_capacity(8 << 20, dec)))
+        Ok((
+            Box::new(std::io::BufReader::with_capacity(8 << 20, dec)),
+            count,
+        ))
     } else if name.ends_with(".gz") {
         Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "gzip dumps are not supported by replay yet",
         ))
     } else {
-        Ok(Box::new(buf))
+        Ok((Box::new(buf), count))
     }
 }
 
@@ -209,7 +248,9 @@ pub fn spawn(
             };
 
             match open_dump(&path) {
-                Ok(reader) => replay_file(&state, reader, &mut fp, dedupe.as_deref(), &submit),
+                Ok((reader, counter)) => {
+                    replay_file(&state, reader, counter, &mut fp, dedupe.as_deref(), &submit)
+                }
                 Err(e) => fp.error = Some(format!("open failed: {e}")),
             }
 
@@ -233,6 +274,7 @@ pub fn spawn(
                 s.events += fp.events;
                 s.new += fp.new;
                 s.malformed += fp.malformed;
+                s.current_progress = None;
                 s.files.push(fp);
             });
         }
@@ -240,6 +282,7 @@ pub fn spawn(
         state.update(|s| {
             s.running = false;
             s.current = None;
+            s.current_progress = None;
             s.finished_at = unix_now();
         });
         tracing::info!("replay finished");
@@ -251,25 +294,36 @@ pub fn spawn(
 fn replay_file(
     state: &ReplayState,
     mut reader: Box<dyn BufRead + Send>,
+    counter: Arc<std::sync::atomic::AtomicU64>,
     fp: &mut FileProgress,
     dedupe: Option<&IdStore>,
     submit: &crate::node::ReplaySink,
 ) {
     let mut line = Vec::with_capacity(4096);
     let mut batch = 0usize;
+    let mut last_publish = std::time::Instant::now();
 
     loop {
         if state.cancel.load(Ordering::Relaxed) {
             return;
         }
+        // Publish in-flight progress on a wall-clock cadence, cheap enough to
+        // be invisible against decompression but frequent enough that a long
+        // file is visibly moving.
+        if last_publish.elapsed() >= std::time::Duration::from_secs(2) {
+            last_publish = std::time::Instant::now();
+            fp.bytes_read = counter.load(Ordering::Relaxed);
+            let snapshot = fp.clone();
+            state.update(|s| s.current_progress = Some(snapshot));
+        }
         line.clear();
         match reader.read_until(b'\n', &mut line) {
             Ok(0) => {
                 fp.complete = true;
+                fp.bytes_read = counter.load(Ordering::Relaxed);
                 return;
             }
-            Ok(n) => {
-                fp.bytes_read += n as u64;
+            Ok(_) => {
                 let trimmed = line.strip_suffix(b"\n").unwrap_or(&line);
                 if trimmed.is_empty() {
                     continue;
@@ -298,6 +352,7 @@ fn replay_file(
                 }
             }
             Err(e) => {
+                fp.bytes_read = counter.load(Ordering::Relaxed);
                 fp.error = Some(format!("read error after {} bytes: {e}", fp.bytes_read));
                 return;
             }
