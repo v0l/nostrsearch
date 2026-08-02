@@ -70,7 +70,8 @@ scale:
 - **`nostrsearch-server`** — `ShardRegistry` (fan-out + merge + hydrate), axum
   REST API, NIP-98 admin endpoints, embedded operator console.
 - **`dashboard/`** — the console itself (Preact + Vite, built to a single HTML
-  file that the server crate compiles in). See [dashboard/README.md](dashboard/README.md).
+  file the server crate compiles in with `include_str!`). Build it before
+  `cargo build`; see [dashboard/README.md](dashboard/README.md).
 
 ## Usage
 
@@ -117,9 +118,10 @@ INDEX_ROOT=./data/index BIND=0.0.0.0:8080 \
 # then open http://localhost:8080/
 ```
 
-Docker images build the console from source on every build. For a local cargo
-build the committed asset is used as-is, so rebuild it after changing
-`dashboard/`:
+The console is compiled into the binary from `dashboard/dist/index.html`, which
+is a build artifact rather than a committed file — so build it once before
+`cargo build`, and again after changing anything under `dashboard/` (requires
+[bun](https://bun.sh)). Docker and CI do this themselves.
 
 ```bash
 ./scripts/build-dashboard.sh

@@ -28,6 +28,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # The server crate compiles the console bundle in with include_str!, so
+      # it has to exist before cargo runs.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Build the operator console
+        run: ./scripts/build-dashboard.sh
+
       - name: Test
         run: cargo test --workspace --locked
 

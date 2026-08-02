@@ -1,10 +1,8 @@
 # syntax=docker/dockerfile:1
 
 # ── Operator console ──────────────────────────────────────────────────────────
-# Built here rather than trusted from the repo, so an image can never ship a
-# console that is older than the API it talks to. The committed asset at
-# crates/nostrsearch-server/assets/dashboard.html only exists so a plain
-# `cargo build` works without bun; this stage always overwrites it.
+# The bundle is a build artifact, never committed, so the image builds it from
+# source and hands it to the Rust stage, which compiles it into the binary.
 FROM oven/bun:1 AS dashboard
 WORKDIR /dash
 COPY dashboard/package.json dashboard/bun.lock ./
@@ -57,8 +55,8 @@ RUN mkdir -p crates/nostrsearch-core/src \
 # ── Application build ─────────────────────────────────────────────────────────
 FROM rust-deps AS rust-build
 COPY crates ./crates
-COPY --from=dashboard /dash/dist/index.html \
-     crates/nostrsearch-server/assets/dashboard.html
+# include_str! target for crates/nostrsearch-server/src/dashboard.rs.
+COPY --from=dashboard /dash/dist/index.html dashboard/dist/index.html
 # Touch entry points so Cargo rebuilds the app crates, not the world.
 RUN touch crates/nostrsearch-core/src/lib.rs \
           crates/nostrsearch-indexer/src/lib.rs \

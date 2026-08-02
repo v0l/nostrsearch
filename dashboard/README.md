@@ -18,12 +18,18 @@ NODE_URL=https://archive.example bun run dev
 bun mock.ts          # http://localhost:5199, built console + fake payloads
 DENY=1 bun mock.ts   # same, but every admin call returns 401
 
-../scripts/build-dashboard.sh   # build and copy into the server crate
+../scripts/build-dashboard.sh   # what cargo needs before it can compile
 ```
 
-The built asset lives at `crates/nostrsearch-server/assets/dashboard.html` and
-is committed, so `cargo build` never needs bun. Rebuild it whenever you change
-anything here.
+The build output at `dashboard/dist/index.html` **is** what ships:
+`crates/nostrsearch-server/src/dashboard.rs` reads it with `include_str!`. It is
+a build artifact, not committed, so run the build script once on a fresh clone
+and again after changing anything here — the server crate's `build.rs` watches
+the file, so a rebuilt bundle relinks the binary on its own, and a missing one
+fails with the command to run rather than a path nobody recognises.
+
+Docker and CI build it from source, so neither can ship a console older than
+the API it talks to.
 
 ## Signing in
 

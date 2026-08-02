@@ -2,13 +2,13 @@
 //!
 //! `dashboard/` is a Preact app built by Vite with `vite-plugin-singlefile`, so
 //! the entire console — markup, styles, script — is one HTML file with no asset
-//! requests. That file is checked in at `assets/dashboard.html` and pulled in
-//! here with `include_str!`, which means deploying the console is deploying the
-//! binary: no static directory to mount, no CDN, no version skew between the
-//! API and the UI talking to it.
+//! requests. That build output is pulled straight in with `include_str!`, which
+//! means deploying the console is deploying the binary: no static directory to
+//! mount, no CDN, no version skew between the API and the UI talking to it.
 //!
-//! Rebuild the asset with `scripts/build-dashboard.sh` after changing anything
-//! under `dashboard/`.
+//! The bundle is a build artifact rather than a checked-in copy, so it has to
+//! exist before the crate compiles — run `scripts/build-dashboard.sh` (needs
+//! bun). `build.rs` watches it and says so plainly when it is missing.
 //!
 //! The page itself is served unauthenticated, because a browser cannot attach a
 //! NIP-98 header to a top-level navigation. Nothing is exposed by that: the
@@ -27,7 +27,7 @@ use axum::{
     routing::get,
 };
 
-const PAGE: &str = include_str!("../assets/dashboard.html");
+const PAGE: &str = include_str!("../../../dashboard/dist/index.html");
 
 pub async fn page() -> Response {
     (
