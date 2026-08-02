@@ -193,8 +193,59 @@ impl ScrapeState {
     /// deleting the whole state database and re-walking the entire network.
     pub fn reset_days(&self, relay: Option<&str>, from: Option<&str>, to: Option<&str>) -> u64 {
         let mut keys: Vec<Vec<u8>> = Vec::new();
+        self.for_each_day(relay, from, to, |key, _, _, _| {
+            keys.push(key.to_vec());
+        });
+        let n = keys.len() as u64;
+        for k in keys {
+            let _ = self.db.delete(k);
+        }
+        n
+    }
+
+    /// Days matching the same filters [`reset_days`](Self::reset_days) uses:
+    /// the total count plus up to `limit` entries.
+    ///
+    /// Shares the matcher with the reset path deliberately — a preview that
+    /// could disagree with what the reset actually deletes would be worse than
+    /// no preview at all.
+    pub fn days_matching(
+        &self,
+        relay: Option<&str>,
+        from: Option<&str>,
+        to: Option<&str>,
+        limit: usize,
+    ) -> (u64, Vec<DayEntry>) {
+        let mut count = 0u64;
+        let mut sample = Vec::new();
+        self.for_each_day(relay, from, to, |_, date, url, done| {
+            count += 1;
+            if sample.len() < limit {
+                sample.push(DayEntry {
+                    date: date.to_string(),
+                    relay: url.to_string(),
+                    seen: done.seen,
+                    new: done.new,
+                    at: done.at,
+                });
+            }
+        });
+        sample.sort_by(|a, b| b.date.cmp(&a.date));
+        (count, sample)
+    }
+
+    /// Walk completed (relay, day) records matching the optional filters.
+    /// `from`/`to` are inclusive `YYYY-MM-DD`, compared lexically — which is
+    /// chronological for that format.
+    fn for_each_day(
+        &self,
+        relay: Option<&str>,
+        from: Option<&str>,
+        to: Option<&str>,
+        mut f: impl FnMut(&[u8], &str, &str, &DayDone),
+    ) {
         for kv in self.db.prefix_iterator(b"d|") {
-            let Ok((k, _)) = kv else { break };
+            let Ok((k, v)) = kv else { break };
             if !k.starts_with(b"d|") {
                 break;
             }
@@ -207,8 +258,8 @@ impl ScrapeState {
             {
                 continue;
             }
-            if let Some(f) = from
-                && date < f
+            if let Some(fr) = from
+                && date < fr
             {
                 continue;
             }
@@ -217,13 +268,11 @@ impl ScrapeState {
             {
                 continue;
             }
-            keys.push(k.to_vec());
+            let Ok(done) = bincode::deserialize::<DayDone>(&v) else {
+                continue;
+            };
+            f(&k, date, url, &done);
         }
-        let n = keys.len() as u64;
-        for k in keys {
-            let _ = self.db.delete(k);
-        }
-        n
     }
 
     /// Clear a relay's *learned* state: the detected data horizon, failure

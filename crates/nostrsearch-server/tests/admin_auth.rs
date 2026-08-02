@@ -206,6 +206,32 @@ async fn stale_replayed_and_mismatched_headers_are_refused() -> anyhow::Result<(
     Ok(())
 }
 
+/// Every admin route must sit behind the gate -- including ones added later.
+#[tokio::test]
+async fn listing_scrape_state_is_authenticated() -> anyhow::Result<()> {
+    let admin = Keys::generate();
+    let base = serve(&admin).await?;
+    let http = reqwest::Client::new();
+    let url = format!("{base}/admin/scrape");
+
+    // Unauthenticated.
+    assert_eq!(http.get(&url).send().await?.status(), 401);
+
+    // Authenticated: this node has no scraper, so 503 rather than 401 -- which
+    // is what proves the request got past the auth layer.
+    let r = http
+        .get(&url)
+        .header("Authorization", nip98(&admin, &url, "GET", None).await?)
+        .send()
+        .await?;
+    assert_eq!(
+        r.status(),
+        503,
+        "expected to pass auth and then report no scraper"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn resetting_an_analysis_requires_auth_and_reports_unknown_names() -> anyhow::Result<()> {
     let admin = Keys::generate();

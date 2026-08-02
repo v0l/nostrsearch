@@ -240,6 +240,7 @@ pub fn router(state: AdminState) -> Router {
     Router::new()
         .route("/analyses", get(analyses))
         .route("/analyses/{name}/reset", post(reset_analysis))
+        .route("/scrape", get(scrape_state))
         .route("/scrape/reset", post(reset_scrape))
         .route("/scrape/relay/reset", post(reset_relay))
         .layer(middleware::from_fn_with_state(state.clone(), auth))
@@ -284,11 +285,73 @@ async fn reset_analysis(State(st): State<AdminState>, Path(name): Path<String>) 
 }
 
 /// `POST /admin/scrape/reset?relay=&from=YYYY-MM-DD&to=YYYY-MM-DD`
+///
+/// The same filters drive `GET /admin/scrape`, so you can preview a reset
+/// before running it.
 #[derive(Debug, Deserialize)]
 pub struct ScrapeResetQuery {
     pub relay: Option<String>,
     pub from: Option<String>,
     pub to: Option<String>,
+}
+
+/// `GET /admin/scrape[?relay=&from=&to=]`
+///
+/// The full scrape state: every relay (not the truncated public `/sync` view)
+/// plus overall progress. With filters it also reports exactly which
+/// (relay, day) records a reset with those same filters would remove.
+async fn scrape_state(State(st): State<AdminState>, Query(q): Query<ScrapeResetQuery>) -> Response {
+    let Some(scrape) = st.scrape.clone() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "scraper is not running on this node" })),
+        )
+            .into_response();
+    };
+
+    let filtered = q.relay.is_some() || q.from.is_some() || q.to.is_some();
+    let out = tokio::task::spawn_blocking(move || {
+        let relays: Vec<_> = scrape
+            .relays()
+            .into_iter()
+            .map(|(url, i)| {
+                serde_json::json!({
+                    "url": url,
+                    "sources": i.sources,
+                    "negentropy": i.negentropy,
+                    "cap": i.cap,
+                    "fails": i.fails,
+                    "last_ok": i.last_ok,
+                    "birthday": i.birthday,
+                })
+            })
+            .collect();
+        let progress = scrape.progress(25);
+        let matching = filtered.then(|| {
+            let (count, sample) =
+                scrape.days_matching(q.relay.as_deref(), q.from.as_deref(), q.to.as_deref(), 100);
+            serde_json::json!({
+                "count": count,
+                "sample": sample,
+                "detail": "a reset with these same filters would clear exactly these records",
+            })
+        });
+        serde_json::json!({
+            "relays": relays,
+            "progress": progress,
+            "matching_days": matching,
+        })
+    })
+    .await;
+
+    match out {
+        Ok(v) => Json(v).into_response(),
+        Err(_) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "scrape state unavailable" })),
+        )
+            .into_response(),
+    }
 }
 
 async fn reset_scrape(State(st): State<AdminState>, Query(q): Query<ScrapeResetQuery>) -> Response {
