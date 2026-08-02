@@ -153,6 +153,15 @@ export const api = {
   // prefix exactly, and 404s on "/sync/".
   sync: () => open<SyncStatus>("/sync"),
   archiveFiles: () => open<ArchiveFileInfo[]>("/archive/files"),
+  /**
+   * Archive totals. `total_events` is the count of distinct ids the archive
+   * holds -- the only available answer to "how much should be in the index",
+   * and what makes an ingest's progress meaningful rather than open-ended.
+   */
+  archiveStats: () =>
+    open<{ files: number; total_size: number; total_events: number | null }>(
+      "/archive/stats",
+    ),
 
   analyses: () => signed<AnalysisStatus[]>("/admin/analyses"),
   /**
@@ -184,13 +193,21 @@ export const api = {
     ),
 
   ingest: () => signed<ReplayStatus>("/admin/ingest"),
-  startIngest: (files: string[]) => {
-    const qs = files.map((f) => `file=${encodeURIComponent(f)}`).join("&");
-    return signed<{ started: boolean; detail: string }>(
-      `/admin/ingest${qs ? `?${qs}` : ""}`,
+  /**
+   * Reads the whole archive directory into this node.
+   *
+   * `dedupe: false` re-indexes everything, ignoring the id store. That is the
+   * repair for a store that has drifted ahead of the index: while it is ahead
+   * it claims events the index never received, so the normal path skips
+   * exactly the events that are missing and the gap can never close.
+   *
+   * There is no file selection -- the reader walks the directory in parallel.
+   */
+  startIngest: (dedupe: boolean) =>
+    signed<{ started: boolean; dedupe: boolean; detail: string }>(
+      `/admin/ingest${dedupe ? "" : "?dedupe=false"}`,
       "POST",
-    );
-  },
+    ),
   cancelIngest: () => signed<{ cancelled: boolean }>("/admin/ingest/cancel", "POST"),
 
   scrape: (q: { relay?: string; from?: string; to?: string } = {}) =>

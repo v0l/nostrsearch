@@ -77,40 +77,32 @@ export interface AnalysisStatus {
   deps: string[];
 }
 
-export interface FileProgress {
-  name: string;
-  bytes_total: number;
-  bytes_read: number;
-  malformed: number;
-  events: number;
-  new: number;
-  /** Lines fast-forwarded past while resuming an interrupted rebuild. */
-  skipped: number;
-  complete: boolean;
-  error: string | null;
-}
-
+/**
+ * Progress of an archive ingest.
+ *
+ * There is no per-file breakdown: the reader walks the whole directory across
+ * several threads at once, so "the current file" is plural and a file-by-file
+ * bar would describe one arbitrary worker. Event counts describe the run.
+ */
 export interface ReplayStatus {
   running: boolean;
   cancelled: boolean;
-  started_at: number;
-  finished_at: number;
-  files_total: number;
-  files_done: number;
   /**
-   * Which pass over the archive this is. A rebuild reads the file list once
-   * per dependency stage -- graph first, then the reports that label events
-   * with it -- so the file counters restart between passes.
+   * Dependency-stage pass, 0-based, and how many this run makes.
+   *
+   * The archive is read once per stage: analyses that label events using the
+   * follow graph cannot fold in the same pass that builds it, or everything
+   * lands untrusted. Only pass 0 writes to the index.
    */
   pass: number;
-  /** Totals across *completed* files only. */
-  events: number;
-  new: number;
-  malformed: number;
-  current: string | null;
-  /** Live progress for the file being read, absent between files. */
-  current_progress: FileProgress | null;
-  files: FileProgress[];
+  passes: number;
+  /** Events handed to the index during the indexing pass. */
+  indexed: number;
+  /** Events read, including those skipped as already known. */
+  seen: number;
+  /** Events skipped because the dedupe store already had them. */
+  skipped: number;
+  finished_at: number;
 }
 
 export interface ArchiveFileInfo {

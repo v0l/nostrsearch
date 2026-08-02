@@ -74,8 +74,32 @@ pub fn router(state: ArchiveState) -> Router {
     Router::new()
         .route("/", get(index))
         .route("/files", get(files_json))
+        .route("/stats", get(stats_json))
         .route("/{file}", get(serve_file))
         .with_state(state)
+}
+
+/// `GET /archive/stats`
+///
+/// The archive's own totals, as JSON. `total_events` is the count of distinct
+/// event ids the archive index holds, which is the only available answer to
+/// "how much should be in the search index" -- comparing it against the index's
+/// document count is what makes an ingest verifiable rather than hopeful.
+async fn stats_json(State(st): State<ArchiveState>) -> Result<Json<ArchiveStats>, Response> {
+    let files = list(&st).await?;
+    Ok(Json(ArchiveStats {
+        files: files.len(),
+        total_size: files.iter().map(|f| f.size).sum(),
+        total_events: st.event_count(),
+    }))
+}
+
+#[derive(serde::Serialize)]
+pub struct ArchiveStats {
+    pub files: usize,
+    pub total_size: u64,
+    /// `None` when this process does not hold the archive index.
+    pub total_events: Option<u64>,
 }
 
 /// JSON listing of archive files, newest first.
