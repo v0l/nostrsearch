@@ -329,6 +329,11 @@ async fn reset_analysis(State(st): State<AdminState>, Path(name): Path<String>) 
     // Refill from the corpus. A reset analysis is empty, and the live firehose
     // alone would take as long as the corpus took to collect to refill it, so
     // a reset without this is only half an operation.
+    // A reset means "start over", so any checkpoint from an interrupted
+    // rebuild is stale: resuming would leave the empty analyses missing
+    // everything the previous run had already folded.
+    st.ctl.clear_rebuild_checkpoint().await;
+
     let rebuild = match st.replay.clone() {
         Some(rp) => crate::replay::spawn(
             rp.state.clone(),
@@ -339,6 +344,7 @@ async fn reset_analysis(State(st): State<AdminState>, Path(name): Path<String>) 
             },
             rp.dedupe,
             rp.sink,
+            None,
         )
         .is_ok(),
         None => false,
@@ -423,7 +429,16 @@ async fn start_ingest(
         files: files.clone(),
         rebuild: false,
     };
-    match crate::replay::spawn(rp.state.clone(), rp.dir, selection, rp.dedupe, rp.sink) {
+    // Ingest never resumes a rebuild checkpoint: they read the archive for
+    // different reasons and a checkpoint describes only rebuild progress.
+    match crate::replay::spawn(
+        rp.state.clone(),
+        rp.dir,
+        selection,
+        rp.dedupe,
+        rp.sink,
+        None,
+    ) {
         Ok(()) => Json(serde_json::json!({
             "started": true,
             "files": files,

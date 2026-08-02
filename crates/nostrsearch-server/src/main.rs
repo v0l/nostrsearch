@@ -248,6 +248,34 @@ async fn main() -> anyhow::Result<()> {
                     sink,
                 });
             }
+            // Resume an interrupted rebuild.
+            //
+            // A rebuild folds the whole archive and takes hours; a deploy in
+            // the middle of one would otherwise discard all of it and leave the
+            // analyses part-filled with no indication anything was lost. The
+            // checkpoint records what was folded, so pick up from there.
+            if let Some(rp) = st.replay.clone()
+                && let Some(cp) = st.ctl.rebuild_checkpoint().await
+            {
+                tracing::info!(
+                    file = %cp.file,
+                    completed = cp.completed.len(),
+                    "resuming interrupted rebuild"
+                );
+                if let Err(e) = nostrsearch_server::replay::spawn(
+                    rp.state.clone(),
+                    rp.dir,
+                    nostrsearch_server::replay::ReplaySelection {
+                        files: Vec::new(),
+                        rebuild: true,
+                    },
+                    rp.dedupe,
+                    rp.sink,
+                    Some(cp),
+                ) {
+                    tracing::warn!(error = %e, "could not resume rebuild");
+                }
+            }
             Some(st)
         }
         (None, Some(_)) => {

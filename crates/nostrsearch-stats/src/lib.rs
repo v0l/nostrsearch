@@ -43,7 +43,7 @@ pub use metrics::{
 pub use progress::Progress;
 pub use registry::{AnalysisStatus, DynAnalysis, Registry};
 pub use run::backfill_in_memory;
-pub use store::StatStore;
+pub use store::{RebuildCheckpoint, StatStore};
 pub use types::{EventId, Hash32, Pubkey};
 pub use wot::{SharedWot, WotIndex};
 

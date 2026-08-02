@@ -93,6 +93,11 @@ pub enum Fold {
 pub struct Replayed {
     pub ev: NostrEvent,
     pub fold: Fold,
+    /// Rebuild position: the file this came from, and decompressed bytes read
+    /// through it. Carried per-event so the checkpoint records what the writer
+    /// *folded*, not what the reader produced -- the reader runs a full queue
+    /// ahead, so its own position describes events that may never be folded.
+    pub mark: Option<(std::sync::Arc<str>, u64)>,
 }
 
 /// Submits replayed archive events to the writer at lower priority than live
@@ -105,8 +110,13 @@ impl ReplaySink {
     ///
     /// Blocking on a full queue is the point: it is what stops a replay of a
     /// 200 GB dump outrunning the writer and pushing live events out.
-    pub fn blocking_submit(&self, ev: NostrEvent, fold: Fold) {
-        let _ = self.0.blocking_send(Replayed { ev, fold });
+    pub fn blocking_submit(
+        &self,
+        ev: NostrEvent,
+        fold: Fold,
+        mark: Option<(std::sync::Arc<str>, u64)>,
+    ) {
+        let _ = self.0.blocking_send(Replayed { ev, fold, mark });
     }
 }
 
@@ -117,6 +127,14 @@ pub enum WriterCmd {
     ResetAnalysis {
         name: String,
         reply: tokio::sync::oneshot::Sender<Option<Vec<&'static str>>>,
+    },
+    /// The rebuild checkpoint to resume from, if one was interrupted.
+    RebuildCheckpoint {
+        reply: tokio::sync::oneshot::Sender<Option<nostrsearch_stats::RebuildCheckpoint>>,
+    },
+    /// Drop the rebuild checkpoint, so the next rebuild starts from the top.
+    ClearRebuildCheckpoint {
+        reply: tokio::sync::oneshot::Sender<()>,
     },
     /// Per-analysis progress.
     Status {
@@ -129,6 +147,29 @@ pub enum WriterCmd {
 pub struct WriterCtl(mpsc::Sender<WriterCmd>);
 
 impl WriterCtl {
+    /// The rebuild checkpoint to resume from, if one was interrupted.
+    pub async fn rebuild_checkpoint(&self) -> Option<nostrsearch_stats::RebuildCheckpoint> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.0
+            .send(WriterCmd::RebuildCheckpoint { reply: tx })
+            .await
+            .ok()?;
+        rx.await.ok().flatten()
+    }
+
+    /// Drop the rebuild checkpoint so the next rebuild starts from the top.
+    pub async fn clear_rebuild_checkpoint(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .0
+            .send(WriterCmd::ClearRebuildCheckpoint { reply: tx })
+            .await
+            .is_ok()
+        {
+            let _ = rx.await;
+        }
+    }
+
     /// Reset an analysis and everything that depends on it.
     ///
     /// `Ok(None)` = no analysis by that name.
@@ -261,6 +302,13 @@ pub fn spawn_writer_with_reports(
                     }
                 }
                 Some(cmd) = cmd_rx.recv() => match cmd {
+                    WriterCmd::RebuildCheckpoint { reply } => {
+                        let _ = reply.send(pipeline.rebuild_checkpoint());
+                    }
+                    WriterCmd::ClearRebuildCheckpoint { reply } => {
+                        pipeline.clear_rebuild_checkpoint();
+                        let _ = reply.send(());
+                    }
                     WriterCmd::ResetAnalysis { name, reply } => {
                         let ok = pipeline.reset_analysis(&name);
                         // Republish immediately so the dashboard reflects the
@@ -274,6 +322,9 @@ pub fn spawn_writer_with_reports(
                 },
                 Some(r) = replay_rx.recv() => {
                     pipeline.process_replayed(&r.ev, r.fold == Fold::AndIndex);
+                    if let Some((file, offset)) = r.mark {
+                        pipeline.note_rebuild(&file, &r.ev.id, offset, false);
+                    }
                     dirty = true;
                 }
                 _ = sd_rx.changed() => {

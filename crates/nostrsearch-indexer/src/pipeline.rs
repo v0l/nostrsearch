@@ -73,6 +73,8 @@ pub struct Pipeline {
     since_refresh: u64,
     last_refresh: Instant,
     last_persist: Instant,
+    /// How far the running rebuild has been *folded* -- see `note_rebuild`.
+    rebuild_mark: Option<nostrsearch_stats::RebuildCheckpoint>,
     refreshed_once: bool,
     /// Cumulative time spent folding events into analyses, in nanoseconds.
     stats_ns: u64,
@@ -128,6 +130,7 @@ impl Pipeline {
             // Allow the first refresh immediately.
             last_refresh: Instant::now() - Duration::from_secs(86_400),
             last_persist: Instant::now(),
+            rebuild_mark: None,
             refreshed_once: false,
             stats_ns: 0,
             index_ns: 0,
@@ -167,6 +170,52 @@ impl Pipeline {
     /// Per-analysis progress (watermark, backfill state, counters).
     pub fn analyses_status(&self) -> Vec<nostrsearch_stats::AnalysisStatus> {
         self.registry.status()
+    }
+
+    /// Record how far the rebuild has been folded.
+    ///
+    /// Called by the writer as it consumes replayed events, not by the reader
+    /// that produces them. The reader runs up to a full queue ahead, so its
+    /// position describes events that may never have been folded; checkpointing
+    /// it would silently drop everything still in flight when a process dies.
+    pub fn note_rebuild(&mut self, file: &str, last_id: &str, offset: u64, finished: bool) {
+        let cp = self.rebuild_mark.get_or_insert_with(Default::default);
+        if cp.file != file && !cp.file.is_empty() {
+            let done = std::mem::take(&mut cp.file);
+            if !cp.completed.contains(&done) {
+                cp.completed.push(done);
+            }
+        }
+        if finished {
+            if !cp.completed.iter().any(|f| f == file) {
+                cp.completed.push(file.to_string());
+            }
+            cp.file.clear();
+            cp.last_id.clear();
+            cp.offset = 0;
+        } else {
+            cp.file = file.to_string();
+            cp.last_id.clear();
+            cp.last_id.push_str(last_id);
+            cp.offset = offset;
+        }
+    }
+
+    /// The rebuild checkpoint to resume from, if one was interrupted.
+    pub fn rebuild_checkpoint(&self) -> Option<nostrsearch_stats::RebuildCheckpoint> {
+        self.store
+            .as_ref()
+            .and_then(|s| s.load_rebuild().ok().flatten())
+    }
+
+    /// Clear the checkpoint once a rebuild completes.
+    pub fn clear_rebuild_checkpoint(&mut self) {
+        self.rebuild_mark = None;
+        if let Some(store) = &self.store
+            && let Err(e) = store.clear_rebuild()
+        {
+            tracing::warn!(error = %e, "clearing rebuild checkpoint failed");
+        }
     }
 
     /// Discard one analysis's state, and every analysis that depends on it, so
@@ -336,6 +385,14 @@ impl Pipeline {
                 let t1 = Instant::now();
                 if let Err(e) = self.registry.persist(store) {
                     tracing::warn!(error = %e, "stats persist failed");
+                }
+                // Written with the state it describes, never separately: a
+                // checkpoint ahead of the state skips events on resume, behind
+                // it folds them twice and inflates every counter.
+                if let Some(cp) = &self.rebuild_mark
+                    && let Err(e) = store.save_rebuild(cp)
+                {
+                    tracing::warn!(error = %e, "rebuild checkpoint persist failed");
                 }
                 persist_ms = t1.elapsed().as_millis();
                 self.last_persist = Instant::now();

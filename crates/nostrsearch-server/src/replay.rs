@@ -32,6 +32,9 @@ const BATCH: usize = 512;
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct FileProgress {
+    /// Lines skipped while fast-forwarding to a rebuild checkpoint.
+    #[serde(default)]
+    pub skipped: u64,
     pub name: String,
     pub bytes_total: u64,
     pub bytes_read: u64,
@@ -189,6 +192,14 @@ pub struct ReplaySelection {
     pub rebuild: bool,
 }
 
+/// Raw substring search, so fast-forwarding to a checkpoint never parses JSON.
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
 fn is_dump(name: &str) -> bool {
     let l = name.to_ascii_lowercase();
     [".jsonl", ".json", ".jsonl.zst", ".jsonl.zstd", ".json.zst"]
@@ -206,6 +217,7 @@ pub fn spawn(
     selection: ReplaySelection,
     dedupe: Option<Arc<IdStore>>,
     submit: crate::node::ReplaySink,
+    resume: Option<nostrsearch_stats::RebuildCheckpoint>,
 ) -> Result<(), String> {
     if state.is_running() {
         return Err("a replay is already running".into());
@@ -228,6 +240,7 @@ pub fn spawn(
         return Err("no dump files matched".into());
     }
     let rebuild = selection.rebuild;
+    let checkpoint = resume;
 
     state.cancel.store(false, Ordering::Relaxed);
     state.update(|s| {
@@ -243,6 +256,20 @@ pub fn spawn(
         for name in names {
             if state.cancel.load(Ordering::Relaxed) {
                 break;
+            }
+            // Resume an interrupted rebuild: files already folded are skipped
+            // outright, and the one in progress is fast-forwarded to the last
+            // event that was folded from it.
+            let mut resume_after: Option<String> = None;
+            if let Some(cp) = &checkpoint {
+                if cp.completed.iter().any(|f| *f == name) {
+                    tracing::info!(file = %name, "already folded by an earlier rebuild; skipping");
+                    state.update(|s| s.files_done += 1);
+                    continue;
+                }
+                if cp.file == name && !cp.last_id.is_empty() {
+                    resume_after = Some(cp.last_id.clone());
+                }
             }
             let path = dir.join(&name);
             state.update(|s| s.current = Some(name.clone()));
@@ -263,6 +290,8 @@ pub fn spawn(
                     dedupe.as_deref(),
                     &submit,
                     rebuild,
+                    Arc::from(name.as_str()),
+                    resume_after.as_deref(),
                 ),
                 Err(e) => fp.error = Some(format!("open failed: {e}")),
             }
@@ -313,10 +342,18 @@ fn replay_file(
     dedupe: Option<&IdStore>,
     submit: &crate::node::ReplaySink,
     rebuild: bool,
+    name: Arc<str>,
+    resume_after: Option<&str>,
 ) {
     let mut line = Vec::with_capacity(4096);
     let mut batch = 0usize;
     let mut last_publish = std::time::Instant::now();
+    // Skip forward to just past the last event the previous run folded. The id
+    // is matched against the raw line, so skipping costs a substring search
+    // rather than a JSON parse.
+    let mut skipping = resume_after.is_some();
+    let needle: Vec<u8> = resume_after.unwrap_or("").as_bytes().to_vec();
+    let mut decompressed = 0u64;
 
     loop {
         if state.cancel.load(Ordering::Relaxed) {
@@ -338,9 +375,24 @@ fn replay_file(
                 fp.bytes_read = counter.load(Ordering::Relaxed);
                 return;
             }
-            Ok(_) => {
+            Ok(n) => {
+                decompressed += n as u64;
                 let trimmed = line.strip_suffix(b"\n").unwrap_or(&line);
                 if trimmed.is_empty() {
+                    continue;
+                }
+                // Resuming: discard everything up to and including the last
+                // event folded, then fold the rest.
+                if skipping {
+                    if contains(trimmed, &needle) {
+                        skipping = false;
+                        tracing::info!(
+                            file = %name,
+                            bytes = decompressed,
+                            "rebuild resumed from checkpoint"
+                        );
+                    }
+                    fp.skipped += 1;
                     continue;
                 }
                 match serde_json::from_slice::<NostrEvent>(trimmed) {
@@ -359,7 +411,8 @@ fn replay_file(
                         }
                         // Rebuild: fold everything, index only what is missing.
                         let fold = if known { Fold::Only } else { Fold::AndIndex };
-                        submit.blocking_submit(ev, fold);
+                        let mark = rebuild.then(|| (name.clone(), decompressed));
+                        submit.blocking_submit(ev, fold, mark);
                         batch += 1;
                         if batch >= BATCH {
                             batch = 0;
