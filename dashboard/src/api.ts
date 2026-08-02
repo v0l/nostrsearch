@@ -155,8 +155,18 @@ export const api = {
   archiveFiles: () => open<ArchiveFileInfo[]>("/archive/files"),
 
   analyses: () => signed<AnalysisStatus[]>("/admin/analyses"),
+  /**
+   * Resets an analysis *and everything that depends on it*, then starts a
+   * rebuild over the archive.
+   *
+   * `reset` lists every analysis cleared, not just the one named: dependents
+   * fold their dependency's output into stored totals, so clearing a
+   * dependency alone would leave them holding numbers derived from state that
+   * no longer exists. `rebuild` is false when nothing could be started --
+   * no archive, or a rebuild already running.
+   */
   resetAnalysis: (name: string) =>
-    signed<{ reset: boolean; detail: string }>(
+    signed<{ reset: string[]; rebuild: boolean; detail: string }>(
       `/admin/analyses/${encodeURIComponent(name)}/reset`,
       "POST",
     ),

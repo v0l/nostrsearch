@@ -9,7 +9,7 @@ export function Analyses({ authed, gate }: { authed: boolean; gate: string }) {
   const reset = async (name: string) => {
     try {
       const r = await api.resetAnalysis(name);
-      notify("ok", r.detail);
+      notify(r.rebuild ? "ok" : "err", r.detail);
       poll.refresh();
     } catch (e) {
       notify("err", e instanceof Error ? e.message : String(e));
@@ -18,6 +18,28 @@ export function Analyses({ authed, gate }: { authed: boolean; gate: string }) {
 
   const rows = poll.data ?? [];
   const pending = rows.filter((r) => !r.backfilled).length;
+
+  /**
+   * Everything that would be cleared along with `name`, transitively.
+   *
+   * A reset cascades to dependents on the server, so showing only the analysis
+   * clicked would understate what the button does -- re-deriving follow_graph
+   * also empties activity and active_users, and the reports they publish.
+   */
+  const blastRadius = (name: string): string[] => {
+    const out: string[] = [];
+    const queue = [name];
+    while (queue.length) {
+      const cur = queue.pop()!;
+      for (const r of rows) {
+        if (r.deps.includes(cur) && !out.includes(r.name)) {
+          out.push(r.name);
+          queue.push(r.name);
+        }
+      }
+    }
+    return out;
+  };
 
   return (
     <Panel
@@ -69,7 +91,11 @@ export function Analyses({ authed, gate }: { authed: boolean; gate: string }) {
                     <ConfirmButton
                       tiny
                       label="Re-derive"
-                      confirmLabel="Confirm re-derive"
+                      confirmLabel={
+                        blastRadius(a.name).length
+                          ? `Also clears ${blastRadius(a.name).join(", ")}`
+                          : "Confirm re-derive"
+                      }
                       onConfirm={() => reset(a.name)}
                     />
                   </td>

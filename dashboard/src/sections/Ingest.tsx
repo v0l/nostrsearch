@@ -119,6 +119,9 @@ function Current({ f }: { f: FileProgress }) {
       <div class="row tight">
         <Chip tone="mute">{num(f.events)} read</Chip>
         <Chip tone="mute">{num(f.new)} new</Chip>
+        {/* Fast-forwarding to a resume point looks identical to reading with
+            nothing to show for it, so say which one is happening. */}
+        {f.skipped > 0 ? <Chip tone="mute">{num(f.skipped)} skipped (resuming)</Chip> : null}
         {f.malformed > 0 ? <Chip tone="warn">{num(f.malformed)} malformed</Chip> : null}
         {f.error ? <Chip tone="bad">{f.error}</Chip> : null}
       </div>

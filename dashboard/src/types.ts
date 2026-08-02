@@ -84,6 +84,8 @@ export interface FileProgress {
   malformed: number;
   events: number;
   new: number;
+  /** Lines fast-forwarded past while resuming an interrupted rebuild. */
+  skipped: number;
   complete: boolean;
   error: string | null;
 }
