@@ -55,9 +55,38 @@ pub struct ShardWriterConfig {
     pub max_open_shards: usize,
 }
 
+impl ShardWriterConfig {
+    /// Total writer arena across every open shard.
+    ///
+    /// The two knobs *multiply*, which is the whole hazard: `heap_bytes` reads
+    /// like a per-process budget but is charged per open shard, so raising
+    /// either one scales total memory. 512 MB with 64 shards is 32 GB.
+    pub fn total_heap_bytes(&self) -> usize {
+        self.heap_bytes.saturating_mul(self.max_open_shards.max(1))
+    }
+
+    /// Shrink the per-shard heap so the total fits in `budget_bytes`, keeping
+    /// the shard count (which is tuned for the corpus layout, not memory).
+    ///
+    /// Returns the previous per-shard heap when it had to be reduced. A slower
+    /// ingest is strictly better than one the OOM killer stops.
+    pub fn fit_to_budget(&mut self, budget_bytes: usize) -> Option<usize> {
+        if self.total_heap_bytes() <= budget_bytes {
+            return None;
+        }
+        let shards = self.max_open_shards.max(1);
+        let previous = self.heap_bytes;
+        // Tantivy refuses arenas below a few MB; keep a sane floor.
+        self.heap_bytes = (budget_bytes / shards).max(15 * 1_000_000);
+        Some(previous)
+    }
+}
+
 impl Default for ShardWriterConfig {
     fn default() -> Self {
         Self {
+            // Per *open shard*, so this multiplies by `max_open_shards`:
+            // 64 x 64 MB is ~4 GB. Raise it only alongside that cap.
             heap_bytes: 64 * 1_000_000, // 64 MB per hot shard
             commit_every_docs: 100_000,
             commit_every: Duration::from_secs(30),
@@ -431,5 +460,56 @@ mod eviction_tests {
             }
         }
         assert_eq!(found, 12, "every month should have been written to disk");
+    }
+}
+
+#[cfg(test)]
+mod heap_budget_tests {
+    use super::*;
+
+    #[test]
+    fn per_shard_heap_multiplies_by_shard_count() {
+        let cfg = ShardWriterConfig {
+            heap_bytes: 512 * 1_000_000,
+            max_open_shards: 64,
+            ..Default::default()
+        };
+        // The trap that OOM-killed ingest: two reasonable-looking knobs.
+        assert_eq!(cfg.total_heap_bytes(), 32_768_000_000);
+    }
+
+    #[test]
+    fn fitting_to_a_budget_keeps_shard_count_and_shrinks_heap() {
+        let mut cfg = ShardWriterConfig {
+            heap_bytes: 512 * 1_000_000,
+            max_open_shards: 64,
+            ..Default::default()
+        };
+        // Half of a 24 GiB limit.
+        let budget = 12_000_000_000usize;
+        let was = cfg.fit_to_budget(budget).expect("should have reduced");
+
+        assert_eq!(was, 512 * 1_000_000);
+        assert_eq!(cfg.max_open_shards, 64, "shard count is tuned for layout");
+        assert!(cfg.total_heap_bytes() <= budget, "still over budget");
+        assert!(
+            cfg.heap_bytes >= 15_000_000,
+            "must stay above tantivy's floor"
+        );
+    }
+
+    #[test]
+    fn a_config_already_within_budget_is_untouched() {
+        let mut cfg = ShardWriterConfig::default();
+        let before = cfg.heap_bytes;
+        assert!(cfg.fit_to_budget(100_000_000_000).is_none());
+        assert_eq!(cfg.heap_bytes, before);
+    }
+
+    #[test]
+    fn the_default_matches_the_documented_budget() {
+        // ~4 GB, the figure the k8s manifest and docs quote.
+        let cfg = ShardWriterConfig::default();
+        assert_eq!(cfg.total_heap_bytes(), 4_096_000_000);
     }
 }

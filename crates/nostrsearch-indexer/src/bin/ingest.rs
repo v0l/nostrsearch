@@ -53,7 +53,9 @@ impl Args {
         let mut state_dir = Some(env::state_dir());
         let mut wot_out = Some(env::wot_out());
         let mut wot_refresh_every = env::wot_refresh_every();
-        let mut heap_mb = 512usize;
+        // Charged per *open shard*, so this multiplies by --max-open-shards.
+        // Was 512, which at the default 64 shards is a 32 GB arena.
+        let mut heap_mb = 64usize;
         let mut commit_docs = 200_000u64;
         let mut parallelism = 0usize;
         let mut chunk_size = 2_000usize;
@@ -226,6 +228,33 @@ fn main() -> anyhow::Result<()> {
         persist_interval: nostrsearch_indexer::env::persist_interval(),
         wot_out: args.wot_out.clone(),
     };
+    // Writer heap is charged per open shard, so --heap-mb and
+    // --max-open-shards multiply. Log the product and, when the cgroup
+    // publishes a limit, keep it to half of that: a slower ingest beats one
+    // the OOM killer stops. Half, not all, because the stats maps, the id
+    // buffer and the archive cursor also need room.
+    let mut cfg = cfg;
+    let total_gb = cfg.shard.total_heap_bytes() as f64 / 1e9;
+    if let Some(limit_mb) = nostrsearch_indexer::mem::cgroup_limit_mb() {
+        let budget = (limit_mb as usize * 1_000_000) / 2;
+        if let Some(was) = cfg.shard.fit_to_budget(budget) {
+            tracing::warn!(
+                requested_heap_mb = was / 1_000_000,
+                using_heap_mb = cfg.shard.heap_bytes / 1_000_000,
+                max_open_shards = cfg.shard.max_open_shards,
+                requested_total_gb = format!("{total_gb:.1}"),
+                cgroup_limit_mb = limit_mb,
+                "writer heap would exceed half the cgroup limit; reduced per-shard heap"
+            );
+        }
+    }
+    tracing::info!(
+        heap_mb = cfg.shard.heap_bytes / 1_000_000,
+        max_open_shards = cfg.shard.max_open_shards,
+        total_writer_heap_gb = format!("{:.1}", cfg.shard.total_heap_bytes() as f64 / 1e9),
+        "writer heap budget"
+    );
+
     let pipeline = Arc::new(Mutex::new(Pipeline::new(cfg)?));
 
     let rt = tokio::runtime::Builder::new_multi_thread()
