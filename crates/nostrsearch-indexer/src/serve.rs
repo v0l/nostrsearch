@@ -75,27 +75,19 @@ async fn landing() -> Html<&'static str> {
 
 /// The rendered page, built once.
 ///
-/// Built rather than written out because the loader is 48 ticks that differ
-/// only by their animation delay; emitting them in a loop keeps the markup
-/// honest about that, and `OnceLock` keeps it a single allocation for the
-/// life of the process.
+/// Only the `<head>` varies, and only because it is assembled by
+/// [`nostrsearch_archive::theme`]; `OnceLock` keeps it a single allocation for
+/// the life of the process.
 fn page() -> &'static str {
     static PAGE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     PAGE.get_or_init(|| {
-        let ticks: String = (0..TICKS)
-            .map(|i| format!("<i style=\"--i:{i}\"></i>"))
-            .collect();
-        TEMPLATE.replace("{{ticks}}", &ticks).replace(
+        TEMPLATE.replace(
             "{{head}}",
             &nostrsearch_archive::theme::head("nostrsearch — ingest in progress", "/style.css"),
         )
     })
     .as_str()
 }
-
-/// Ticks in the scan bar. Enough to read as a continuous scale rather than a
-/// row of blocks, few enough that the travelling wave stays legible.
-const TICKS: usize = 48;
 
 /// The status page.
 ///
@@ -106,28 +98,40 @@ const TICKS: usize = 48;
 const TEMPLATE: &str = r#"<!doctype html>
 <html lang="en"><head>{{head}}
 <style>
-/* The scan bar. Not a spinner: a wave travelling along a ruled scale, the way
+/* The scan bar. Not a spinner: a band travelling along a ruled scale, the way
    a tape reader draws — it says work is moving through a corpus, which is what
-   is happening, rather than merely that something is busy. Every tick runs one
-   animation, offset by its index. Only this page has one. */
-.scan { display: flex; align-items: flex-end; gap: 2px; height: 34px;
-  border-bottom: 1px solid var(--rule-strong); padding-bottom: 1px; }
-.scan i { flex: 1 1 auto; height: 34%; background: var(--rule-strong);
-  transform-origin: bottom;
-  animation: scan 2.4s cubic-bezier(.4, 0, .2, 1) infinite;
-  animation-delay: calc(var(--i) * 42ms); }
-@keyframes scan {
-  0%, 72%, 100% { transform: scaleY(.36); background: var(--rule-strong); }
-  18% { transform: scaleY(1); background: var(--patina); }
-  40% { transform: scaleY(.55); background: var(--brass); }
-}
+   is happening, rather than merely that something is busy.
+
+   One element moves, and it moves by transform alone. Transform and opacity
+   are the only properties a browser can animate on the compositor; anything
+   else — colour, size, position — repaints every frame. An earlier version
+   animated `background` across 48 separate ticks, which is 48 repaints per
+   frame forever, and cost about half a GPU to say "please wait".
+
+   The ticks are a repeating gradient rather than elements: painted once, and
+   nothing to keep in the DOM. */
+.scan { position: relative; height: 34px; overflow: hidden;
+  border-bottom: 1px solid var(--rule-strong);
+  background-image: repeating-linear-gradient(to right,
+    var(--rule-strong) 0 2px, transparent 2px 12px);
+  background-repeat: no-repeat;
+  background-position: bottom left;
+  background-size: 100% 12px; }
+.scan::after { content: ""; position: absolute; inset: 0; width: 30%;
+  background: linear-gradient(90deg, transparent,
+    color-mix(in srgb, var(--patina) 55%, transparent) 35%,
+    color-mix(in srgb, var(--brass) 45%, transparent) 65%, transparent);
+  transform: translateX(-110%);
+  animation: scan 2.6s linear infinite; }
+@keyframes scan { to { transform: translateX(440%); } }
+
 .scan-legend { display: flex; justify-content: space-between; font-size: 10px;
   letter-spacing: .16em; text-transform: uppercase; color: var(--slate);
   margin: 8px 0 20px; }
 
 /* Motion here is decoration; the page reads the same standing still. */
 @media (prefers-reduced-motion: reduce) {
-  .scan i { animation: none; height: 60%; }
+  .scan::after { animation: none; opacity: .35; transform: none; width: 100%; }
 }
 </style></head>
 <body class="page">
@@ -137,7 +141,7 @@ const TEMPLATE: &str = r#"<!doctype html>
   <section class="panel">
     <div class="plate">Ingest <em>in progress</em></div>
 
-    <div class="scan">{{ticks}}</div>
+    <div class="scan"></div>
     <div class="scan-legend"><span>reading archive</span><span>building index</span></div>
 
     <p>This node is still indexing its corpus. Search stays offline until the
