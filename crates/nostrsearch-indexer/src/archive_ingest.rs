@@ -101,19 +101,21 @@ pub struct IngestProgress {
 ///
 /// Blocking work happens on the blocking pool; the caller may cancel by
 /// setting `cancel`, which is honoured between chunks.
+/// `pending_ids` holds ids indexed since the last checkpoint. It is a
+/// parameter rather than an internal so a caller that shuts down on a signal
+/// can flush the same buffer this engine is filling: a second buffer would
+/// always be empty, and flushing it would record nothing while the documents
+/// were committed -- turning every graceful restart into a window of duplicate
+/// documents.
 pub async fn ingest(
     pipeline: Arc<Mutex<Pipeline>>,
     opts: IngestOptions,
     id_store: Option<Arc<IdStore>>,
+    pending_ids: Arc<Mutex<Vec<[u8; 32]>>>,
     progress: Arc<IngestProgress>,
     cancel: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     progress.running.store(true, Ordering::Relaxed);
-
-    // Ids indexed since the last checkpoint. Flushed while holding the
-    // pipeline lock across commit, so an id is only recorded once its document
-    // is durable.
-    let pending_ids: Arc<Mutex<Vec<[u8; 32]>>> = Arc::new(Mutex::new(Vec::new()));
 
     // Periodic checkpoint: commit, then record what that commit made durable.
     //

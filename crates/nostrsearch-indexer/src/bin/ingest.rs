@@ -30,6 +30,7 @@ struct Args {
     wot_refresh_every: u64,
     heap_mb: usize,
     commit_docs: u64,
+    checkpoint_secs: u64,
     parallelism: usize,
     chunk_size: usize,
     dedupe: bool,
@@ -55,6 +56,7 @@ impl Args {
         // Was 512, which at the default 64 shards is a 32 GB arena.
         let mut heap_mb = 64usize;
         let mut commit_docs = 200_000u64;
+        let mut checkpoint_secs = 60u64;
         let mut parallelism = 0usize;
         let mut chunk_size = 2_000usize;
         let mut dedupe = true;
@@ -94,6 +96,17 @@ impl Args {
                         .ok_or("--heap-mb value")?
                         .parse()
                         .map_err(|_| "bad heap")?
+                }
+                // A kill re-processes at most one checkpoint window, and any
+                // shard that auto-committed inside it contributes duplicate
+                // documents. Shorten this when restarts are expected; each
+                // checkpoint commits every open shard, so it is not free.
+                "--checkpoint-secs" => {
+                    checkpoint_secs = it
+                        .next()
+                        .ok_or("--checkpoint-secs value")?
+                        .parse()
+                        .map_err(|_| "bad checkpoint-secs")?
                 }
                 "--commit-docs" => {
                     commit_docs = it
@@ -153,6 +166,7 @@ impl Args {
             wot_refresh_every,
             heap_mb,
             commit_docs,
+            checkpoint_secs: checkpoint_secs.max(1),
             parallelism,
             chunk_size,
             dedupe,
@@ -415,43 +429,10 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
         let chunk_size = args.chunk_size;
         let sort_batches = args.sort_batches;
 
-        // Persistent event-id dedupe, so a restarted backfill resumes instead
-        // of duplicating everything (Tantivy has no unique key on writes).
-        // Ids reach the store only via checkpoints, *after* a Tantivy commit
-        // of the documents they refer to: flushing them earlier would turn a
-        // crash into permanent holes in the index. The window between
-        // checkpoints is re-processed on restart, which is merely redundant
-        // work, never duplicate documents.
-        if let Some(store) = &id_store {
-            let store = store.clone();
-            let pending = pending_ids.clone();
-            let pipe_ck = pipeline.clone();
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
-                tick.tick().await; // skip immediate fire
-                loop {
-                    tick.tick().await;
-                    let store = store.clone();
-                    let pending = pending.clone();
-                    let pipe_ck = pipe_ck.clone();
-                    let res = tokio::task::spawn_blocking(move || {
-                        let mut p = pipe_ck.lock().unwrap();
-                        p.commit()?;
-                        let ids = std::mem::take(&mut *pending.lock().unwrap());
-                        store.flush(ids.iter())?;
-                        anyhow::Ok(ids.len())
-                    })
-                    .await;
-                    match res {
-                        Ok(Ok(n)) if n > 0 => {
-                            tracing::debug!(ids = n, "dedupe checkpoint")
-                        }
-                        Ok(Ok(_)) => {}
-                        other => tracing::warn!(?other, "dedupe checkpoint failed"),
-                    }
-                }
-            });
-        }
+        // Checkpointing belongs to the engine, which owns the ids and the
+        // commit that makes them safe to record. A second checkpoint task here
+        // committed all open shards on its own timer while flushing a buffer
+        // the engine no longer filled -- paying the fsyncs, recording nothing.
 
         // The engine is shared with the server's admin ingest: one reader,
         // one staging scheme, one set of id-store rules. They used to be two
@@ -465,9 +446,11 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
                 chunk_size,
                 sort_batches,
                 dedupe: args.dedupe,
+                checkpoint_every: std::time::Duration::from_secs(args.checkpoint_secs),
                 ..Default::default()
             },
             id_store.clone(),
+            pending_ids.clone(),
             progress.clone(),
             cancel,
         )

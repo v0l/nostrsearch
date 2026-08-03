@@ -140,6 +140,9 @@ pub fn start(ctx: &IngestCtx, dedupe: bool, parallelism: usize) -> Result<(), St
             pipeline,
             opts,
             id_store,
+            // The server has no signal-time flush of its own, so nothing else
+            // needs this buffer; the engine still owns commit-then-record.
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
             run.progress.clone(),
             run.cancel.clone(),
         )
