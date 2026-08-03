@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/nostrsearch-archive",
     "crates/nostrsearch-core",
     "crates/nostrsearch-indexer",
     "crates/nostrsearch-server",

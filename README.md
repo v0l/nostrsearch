@@ -109,6 +109,10 @@ Two rules hold the design together:
 - **`nostrsearch-indexer`** — archive ingest, live firehose, `ShardManager`
   (per-shard writers, scheduled commits), dedupe store, network scrape, and
   the `ingest` / `archive` / `stats` / `scrape` binaries.
+- **`nostrsearch-archive`** — the archive HTTP routes (listing, download,
+  event-by-id), shared by the server node and by `ingest --bind`. Its own
+  crate because the server depends on the indexer, so the shared half cannot
+  live in either without a cycle.
 - **`nostrsearch-stats`** — the analysis engine: follow graph, pagerank,
   activity, clients, relays, and the reports the console renders.
 - **`nostrsearch-server`** — `ShardRegistry` (fan-out, merge, hydrate), axum
@@ -152,7 +156,27 @@ ingest --index-root ./data/index --input-dir ./dumps \
 # firehose only, also archiving what it sees
 ingest --index-root ./data/index --relays wss://relay.damus.io \
        --archive-dir ./data/archive
+
+# backfill, serving a status page + the corpus while it works
+ingest --index-root ./data/index --input-dir ./dumps --bind 0.0.0.0:8080
 ```
+
+### Serving during a backfill
+
+A full backfill runs for hours, and for that whole time the node has nothing on
+its port. `--bind <addr>` gives it three routes while it works:
+
+| Route | |
+|---|---|
+| `GET /` | static "ingest in progress" page |
+| `GET /healthz` | `ok`, so a liveness probe passes during the run |
+| `GET /archive` | the corpus — listing, JSON index, file downloads |
+
+Search is deliberately **not** served: the index is half-built, and answering
+queries from a partial corpus looks like data loss rather than progress. The
+archive handle is opened index-free (no RocksDB lock, which the ingest itself
+holds), so file listing and downloads work throughout; `/archive/event/{id}`
+answers `503` rather than pretending the event is missing.
 
 Backfill is resumable: indexed ids are recorded in `<index-root>/.dedupe` and
 checkpointed after Tantivy commits, so a killed run re-processes at most one

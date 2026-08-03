@@ -22,15 +22,18 @@ RUN apt-get update && \
         clang libclang-dev llvm-dev && \
     rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml Cargo.lock ./
+COPY crates/nostrsearch-archive/Cargo.toml    crates/nostrsearch-archive/Cargo.toml
 COPY crates/nostrsearch-core/Cargo.toml       crates/nostrsearch-core/Cargo.toml
 COPY crates/nostrsearch-indexer/Cargo.toml    crates/nostrsearch-indexer/Cargo.toml
 COPY crates/nostrsearch-server/Cargo.toml     crates/nostrsearch-server/Cargo.toml
 COPY crates/nostrsearch-stats/Cargo.toml      crates/nostrsearch-stats/Cargo.toml
 # Stub out the crates so cargo builds only dependencies.
-RUN mkdir -p crates/nostrsearch-core/src \
+RUN mkdir -p crates/nostrsearch-archive/src \
+             crates/nostrsearch-core/src \
              crates/nostrsearch-indexer/src/bin \
              crates/nostrsearch-server/src/bin \
              crates/nostrsearch-stats/src && \
+    echo "" > crates/nostrsearch-archive/src/lib.rs && \
     echo "" > crates/nostrsearch-core/src/lib.rs && \
     echo "" > crates/nostrsearch-indexer/src/lib.rs && \
     echo "fn main() {}" > crates/nostrsearch-indexer/src/bin/ingest.rs && \
@@ -57,8 +60,14 @@ FROM rust-deps AS rust-build
 COPY crates ./crates
 # include_str! target for crates/nostrsearch-server/src/dashboard.rs.
 COPY --from=dashboard /dash/dist/index.html dashboard/dist/index.html
+# include_str! target for crates/nostrsearch-archive/src/theme.rs: the archive
+# listing and the ingest status page serve the console's own stylesheet. The
+# bundle above is a single inlined HTML file with no separate CSS asset, so the
+# source is what they point at.
+COPY dashboard/src/styles.css dashboard/src/styles.css
 # Touch entry points so Cargo rebuilds the app crates, not the world.
-RUN touch crates/nostrsearch-core/src/lib.rs \
+RUN touch crates/nostrsearch-archive/src/lib.rs \
+          crates/nostrsearch-core/src/lib.rs \
           crates/nostrsearch-indexer/src/lib.rs \
           crates/nostrsearch-server/src/lib.rs \
           crates/nostrsearch-stats/src/lib.rs && \

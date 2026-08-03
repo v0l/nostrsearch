@@ -2,14 +2,21 @@
 //!
 //! Serves the raw `.jsonl.zst` corpus files (what `hole.v0l.io` publishes) plus
 //! a directory listing, from the same `JsonFilesDatabase` the unified ingest
-//! writes. Ported from nostrhole's hyper handler to axum so it shares the
-//! search server's router, middleware, and port.
+//! writes. Ported from nostrhole's hyper handler to axum so it shares a router,
+//! middleware, and port with whatever else the process is serving.
+//!
+//! This lives in its own crate because two binaries serve these routes: the
+//! server node, and `ingest`, which publishes the corpus from the same process
+//! that is writing it during a long backfill. The server depends on the
+//! indexer, so the shared half cannot live there without a dependency cycle.
 //!
 //! Routes:
 //! - `GET /archive`            — HTML listing of archive files + totals
 //! - `GET /archive/files`      — JSON listing (name, size, timestamp)
 //! - `GET /archive/event/{id}` — one event by id, straight from the index
 //! - `GET /archive/{file}`     — stream one archive file
+
+pub mod theme;
 
 use axum::body::Body;
 use axum::extract::{Path as AxPath, State};
@@ -155,6 +162,8 @@ pub fn router(state: ArchiveState) -> Router {
         .route("/event/{id}", get(serve_event))
         .route("/{file}", get(serve_file))
         .with_state(state)
+        // Nested under /archive, so the pages link /archive/style.css.
+        .merge(theme::css_router())
 }
 
 /// `GET /archive/stats`
@@ -341,43 +350,77 @@ async fn index(State(st): State<ArchiveState>) -> Result<Html<String>, Response>
     // Only known when this process holds the index (i.e. relay mode).
     let total_events = st.event_count();
 
-    let links = files
-        .iter()
-        .map(|f| {
-            format!(
-                "<li><a href=\"/archive/{}\">{}</a> <span class=\"s\">{:.2} MiB</span></li>",
-                f.name,
-                f.name,
-                f.size as f64 / 1024.0 / 1024.0
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
+    let rows = if files.is_empty() {
+        "<li class=\"empty\">no archive files yet</li>".to_string()
+    } else {
+        files
+            .iter()
+            .map(|f| {
+                format!(
+                    "<li><a href=\"/archive/{name}\">{name}</a>\
+                     <span class=\"s\">{size}</span></li>",
+                    name = f.name,
+                    size = theme::human_size(f.size),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+
+    // The event count is only knowable with the index open, and a readout that
+    // says "0" when the answer is "not measurable here" is a lie -- so it says
+    // where the number went instead.
+    let events = match total_events {
+        Some(n) => format!("<div class=\"v\">{n}</div>"),
+        None => "<div class=\"v mute\">not indexed here</div>".to_string(),
+    };
 
     Ok(Html(format!(
         r#"<!doctype html>
-<html><head><meta charset="utf-8"><title>nostr archive</title>
+<html lang="en"><head>{head}
 <style>
-body{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;max-width:52rem;margin:3rem auto;padding:0 1rem;background:#0d0d0f;color:#d8d8dc}}
-h1{{font-size:1.25rem;letter-spacing:.02em}}
-.meta{{color:#8a8a93;margin-bottom:2rem}}
-ul{{list-style:none;padding:0}}
-li{{padding:.35rem 0;border-bottom:1px solid #1d1d22}}
-a{{color:#7aa2f7;text-decoration:none}} a:hover{{text-decoration:underline}}
-.s{{color:#6a6a73;float:right}}
-</style></head><body>
-<h1>nostr event archive</h1>
-<div class="meta">{files_n} files &middot; {events}{total_gib:.2} GiB</div>
-<ul>
-{links}
-</ul>
+/* A listing is a register: ruled rows, sizes right-aligned so the digits form
+   a column you can scan down. Only this page has one. */
+.files {{ list-style: none; margin: 18px 0 0; padding: 0; }}
+.files li {{ display: grid; grid-template-columns: 1fr auto; align-items: baseline;
+  gap: 16px; padding: 8px 0; border-bottom: 1px solid var(--rule); }}
+.files li:last-child {{ border-bottom: 0; }}
+.files a {{ text-decoration: none; }}
+.files a:hover {{ text-decoration: underline; }}
+.files .s {{ color: var(--slate); font-variant-numeric: tabular-nums; }}
+.files .empty {{ color: var(--slate); padding: 8px 0; }}
+</style></head>
+<body class="page">
+<main>
+  <div class="wordmark">nostr<span>search</span><small>Event archive</small></div>
+
+  <section class="panel">
+    <div class="plate">Corpus <em>{files_n} files</em></div>
+
+    <p class="panel-note">Raw events as newline-delimited JSON, zstd-compressed, one
+    file per month. Every file is a complete shard: download and replay it, no
+    API required.</p>
+
+    <div class="readouts">
+      <div class="readout"><div class="v">{files_n}</div>
+        <div class="k">Files</div></div>
+      <div class="readout"><div class="v">{total}</div>
+        <div class="k">Total size</div></div>
+      <div class="readout">{events}
+        <div class="k">Events</div></div>
+    </div>
+
+    <ul class="files">
+{rows}
+    </ul>
+  </section>
+</main>
 </body></html>"#,
+        head = theme::head("nostr event archive", "/archive/style.css"),
         files_n = files.len(),
-        events = total_events
-            .map(|n| format!("{n} events &middot; "))
-            .unwrap_or_default(),
-        total_gib = total_size as f64 / 1024.0 / 1024.0 / 1024.0,
-        links = links,
+        total = theme::human_size(total_size),
+        events = events,
+        rows = rows,
     )))
 }
 

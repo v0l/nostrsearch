@@ -9,11 +9,17 @@
 # Everything optional is an env var below — uncomment to turn a role on or off.
 # Bulk archive backfill is a separate one-shot Job, commented out at the bottom.
 #
-# DO NOT run the backfill by overriding this Deployment's command/args: the
-# liveness probe below expects /healthz, and the ingest binary serves no HTTP,
-# so kubelet kills the container on a fixed schedule (~140s: three failed
-# probes plus the termination grace period) with exit 137 — which looks
-# exactly like an OOM kill but is reported as Reason: Error, not OOMKilled.
+# DO NOT run the backfill by overriding this Deployment's command/args unless
+# you also pass `--bind`: the liveness probe below expects /healthz, and the
+# ingest binary serves no HTTP until it is given a bind address, so kubelet
+# kills the container on a fixed schedule (~140s: three failed probes plus the
+# termination grace period) with exit 137 — which looks exactly like an OOM
+# kill but is reported as Reason: Error, not OOMKilled.
+#
+# With `--bind 0.0.0.0:8080` the ingest serves /healthz, a static "ingest in
+# progress" page at /, and the archive files at /archive — so a backfill that
+# runs for hours keeps the port answering and keeps publishing the corpus,
+# instead of refusing connections until it finishes.
 ---
 apiVersion: v1
 kind: Namespace
@@ -271,8 +277,16 @@ spec:
 #             - "64"
 #             - "--heap-mb"
 #             - "64"
+#             # Serve /healthz + / (status page) + /archive during the run, so
+#             # the port answers for the hours this takes and the corpus stays
+#             # downloadable. Search is NOT served: the index is half-built.
+#             - "--bind"
+#             - "0.0.0.0:8080"
 #             # A Job should finish; the default is to idle (see above).
 #             - "--exit-when-done"
+#           ports:
+#             - name: http
+#               containerPort: 8080
 #           env:
 #             - name: RUST_LOG
 #               value: nostrsearch=info,nostr_archive_cursor=info

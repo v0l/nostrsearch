@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+nostrsearch-archive = { path = "../nostrsearch-archive" }
 nostrsearch-core = { path = "../nostrsearch-core" }
 nostrsearch-indexer = { path = "../nostrsearch-indexer" }
 nostrsearch-stats = { path = "../nostrsearch-stats" }

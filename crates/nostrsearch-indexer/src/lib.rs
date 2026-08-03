@@ -28,6 +28,7 @@ pub mod id_store;
 pub mod mem;
 pub mod pipeline;
 pub mod scrape;
+pub mod serve;
 pub mod shard_writer;
 
 pub use pipeline::{Pipeline, PipelineConfig};

@@ -859,3 +859,48 @@ td.empty {
     transition-duration: 1ms !important;
   }
 }
+
+/* --------------------------------------------------- server-rendered pages -- */
+/*
+  The archive listing and the ingest status page are plain HTML served by the
+  node, not this app — but they are the same instrument, so they load this
+  stylesheet and set `class="page"` on the body. The app never uses these
+  rules; anything specific to one of those pages lives inline in that page.
+*/
+
+body.page {
+  padding: 40px 20px;
+  display: flex;
+  justify-content: center;
+}
+
+body.page main {
+  width: 100%;
+  max-width: 720px;
+}
+
+body.page .wordmark {
+  margin-bottom: 26px;
+}
+
+body.page .panel {
+  padding: 30px 24px 24px;
+}
+
+/* Few readouts and no dashboard around them, so the fluid display size the
+   console uses is oversized here. */
+body.page .readout .v {
+  font-size: clamp(18px, 2vw, 24px);
+  letter-spacing: -0.02em;
+}
+
+/* A readout with no number still takes a value's worth of height, so the
+   labels beneath stay on one line with the rest. */
+body.page .readout .v.mute {
+  display: flex;
+  align-items: center;
+  min-height: clamp(18px, 2vw, 24px);
+  color: var(--slate);
+  font: 400 13px var(--mono);
+  letter-spacing: 0;
+}

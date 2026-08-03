@@ -6,6 +6,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+nostrsearch-archive = { path = "../nostrsearch-archive" }
 nostrsearch-core = { path = "../nostrsearch-core" }
 nostrsearch-stats = { path = "../nostrsearch-stats" }
 tantivy.workspace = true
@@ -15,6 +16,7 @@ thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tokio.workspace = true
+axum.workspace = true
 bytes.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 tracing-subscriber.workspace = true
@@ -29,3 +31,5 @@ clap = { version = "4.6.5", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
+reqwest = { workspace = true }
+zstd = { workspace = true }

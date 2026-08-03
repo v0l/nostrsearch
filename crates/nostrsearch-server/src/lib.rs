@@ -4,7 +4,8 @@
 //! REST search API. Fan-out across pruned shards, top-k merge, hydration.
 
 pub mod admin;
-pub mod archive;
+/// Archive serving, shared with `ingest` (see `nostrsearch-archive`).
+pub use nostrsearch_archive as archive;
 pub mod dashboard;
 pub mod http;
 pub mod ingest_job;

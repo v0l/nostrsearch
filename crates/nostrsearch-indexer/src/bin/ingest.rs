@@ -143,6 +143,13 @@ struct Args {
     #[arg(long)]
     reindex: bool,
 
+    /// Serve a status page and the archive files on this address.
+    ///
+    /// Off by default. A backfill takes hours, and for that whole time the
+    /// node would otherwise refuse connections on its port.
+    #[arg(long, value_name = "ADDR")]
+    bind: Option<std::net::SocketAddr>,
+
     /// Exit when the backfill finishes.
     ///
     /// The default is to idle, because anything with a restart policy of
@@ -180,6 +187,7 @@ struct Config {
     compact_archive_index: bool,
     reindex: bool,
     exit_when_done: bool,
+    bind: Option<std::net::SocketAddr>,
 }
 
 impl Config {
@@ -224,6 +232,7 @@ impl Config {
             compact_archive_index: a.compact_archive_index,
             reindex: a.reindex || a.rebuild,
             exit_when_done: a.exit_when_done,
+            bind: a.bind,
         };
 
         if cfg.input_dir.is_none() && cfg.relays.is_empty() {
@@ -431,6 +440,14 @@ fn wipe_index(args: &Config) -> anyhow::Result<()> {
 }
 
 async fn run(args: Config, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
+    // Before any of the long work, so the port answers for the whole run and a
+    // bind conflict (usually a second ingest on the same index) fails here
+    // rather than hours in.
+    if let Some(bind) = args.bind {
+        nostrsearch_indexer::serve::spawn(bind, args.archive_index_dir().map(|p| p.as_path()))
+            .await?;
+    }
+
     let total = Arc::new(AtomicU64::new(0));
     // The engine's live counters, shared with the progress reporter below.
     // Reporting off `total` alone would print nothing until the run ended,
