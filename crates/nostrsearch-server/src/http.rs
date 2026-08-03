@@ -22,6 +22,18 @@ pub struct AppState {
 
 pub type SharedState = Arc<AppState>;
 
+/// State for the search routes: the index, plus the archive they hydrate
+/// complete signed events from.
+///
+/// Kept separate from [`AppState`] so a node without an archive (a read-only
+/// search replica) is a `None` here rather than a different constructor
+/// everywhere.
+#[derive(Clone)]
+pub struct SearchState {
+    pub app: SharedState,
+    pub archive: Option<crate::archive::ArchiveState>,
+}
+
 pub fn router(state: SharedState) -> Router {
     router_with_archive(state, None)
 }
@@ -74,12 +86,20 @@ pub fn router_full_node(
     scrape: Option<std::sync::Arc<nostrsearch_indexer::scrape::ScrapeState>>,
     admin: Option<crate::admin::AdminState>,
 ) -> Router {
+    let search_state = SearchState {
+        app: state.clone(),
+        archive: archive.clone(),
+    };
     let mut app = Router::new()
         .route("/search", get(search_get).post(search_post))
         .route("/event/{id}", get(get_event))
-        .route("/stats", get(stats))
-        .route("/healthz", get(healthz))
-        .with_state(state);
+        .with_state(search_state)
+        .merge(
+            Router::new()
+                .route("/stats", get(stats))
+                .route("/healthz", get(healthz))
+                .with_state(state),
+        );
 
     if let Some(a) = archive {
         app = app.nest("/archive", crate::archive::router(a));
@@ -131,9 +151,15 @@ struct SearchParams {
     since: Option<u64>,
     until: Option<u64>,
     lang: Option<String>,
+    site: Option<String>,  // comma-separated URL hosts
+    nip05: Option<String>, // comma-separated NIP-05 identifiers
+    geo: Option<String>,   // comma-separated geohash cells (prefix match)
     limit: Option<usize>,
-    exclude_deleted: Option<bool>,
-    exclude_superseded: Option<bool>,
+    // `exclude_deleted` / `exclude_superseded` are gone. They read columns
+    // that only ever held zero, so the parameters errored rather than
+    // filtering; both views are derivable from what is indexed (see the schema
+    // module docs). Unknown query parameters are ignored, so an old client
+    // sending them now gets results instead of a 500.
 }
 
 fn split_csv(s: &Option<String>) -> Vec<String> {
@@ -152,7 +178,7 @@ fn split_kinds(s: &Option<String>) -> Vec<u16> {
 }
 
 async fn search_get(
-    State(state): State<SharedState>,
+    State(state): State<SearchState>,
     Query(p): Query<SearchParams>,
 ) -> Result<Json<Vec<SearchHit>>, ApiError> {
     let filter = SearchFilter {
@@ -163,12 +189,13 @@ async fn search_get(
         since: p.since,
         until: p.until,
         lang: p.lang,
+        tag_g: split_csv(&p.geo),
+        hosts: split_csv(&p.site),
+        nip05: split_csv(&p.nip05),
         limit: p.limit.unwrap_or(50).min(500),
-        exclude_deleted: p.exclude_deleted.unwrap_or(false),
-        exclude_superseded: p.exclude_superseded.unwrap_or(false),
         ..Default::default()
     };
-    run_search(state, filter)
+    run_search(state, filter).await
 }
 
 // ---------------------------------------------------------------------------
@@ -176,10 +203,10 @@ async fn search_get(
 // ---------------------------------------------------------------------------
 
 async fn search_post(
-    State(state): State<SharedState>,
+    State(state): State<SearchState>,
     Json(filter): Json<SearchFilterDto>,
 ) -> Result<Json<Vec<SearchHit>>, ApiError> {
-    run_search(state, filter.into())
+    run_search(state, filter.into()).await
 }
 
 /// The wire form of a search filter (mirrors `SearchFilter`, serde-friendly).
@@ -198,8 +225,8 @@ pub struct SearchFilterDto {
     pub since: Option<u64>,
     pub until: Option<u64>,
     pub lang: Option<String>,
-    pub exclude_deleted: bool,
-    pub exclude_superseded: bool,
+    pub hosts: Vec<String>,
+    pub nip05: Vec<String>,
     pub limit: Option<usize>,
 }
 
@@ -218,8 +245,8 @@ impl Default for SearchFilterDto {
             since: None,
             until: None,
             lang: None,
-            exclude_deleted: false,
-            exclude_superseded: false,
+            hosts: vec![],
+            nip05: vec![],
             limit: None,
         }
     }
@@ -240,17 +267,42 @@ impl From<SearchFilterDto> for SearchFilter {
             since: d.since,
             until: d.until,
             lang: d.lang,
-            exclude_deleted: d.exclude_deleted,
-            exclude_superseded: d.exclude_superseded,
+            hosts: d.hosts,
+            nip05: d.nip05,
             limit: d.limit.unwrap_or(50).min(500),
         }
     }
 }
 
-fn run_search(state: SharedState, filter: SearchFilter) -> Result<Json<Vec<SearchHit>>, ApiError> {
-    let mut reg = state.registry.lock().map_err(|_| ApiError::Poisoned)?;
-    let hits = reg.search(&filter).map_err(ApiError::Registry)?;
+async fn run_search(
+    state: SearchState,
+    filter: SearchFilter,
+) -> Result<Json<Vec<SearchHit>>, ApiError> {
+    let mut hits = {
+        // Scoped so the registry lock is released before the (async) archive
+        // reads: a MutexGuard must not be held across an await.
+        let mut reg = state.app.registry.lock().map_err(|_| ApiError::Poisoned)?;
+        reg.search(&filter).map_err(ApiError::Registry)?
+    };
+    hydrate_events(&state, &mut hits).await;
     Ok(Json(hits))
+}
+
+/// Attach the complete signed event to each hit, from the archive.
+///
+/// One batched lookup for the whole page, after ranking and truncation, so the
+/// cost is proportional to what is returned rather than to what matched.
+async fn hydrate_events(state: &SearchState, hits: &mut [SearchHit]) {
+    let Some(archive) = state.archive.as_ref() else {
+        return;
+    };
+    if hits.is_empty() {
+        return;
+    }
+    let ids: Vec<String> = hits.iter().map(|h| h.event_id.clone()).collect();
+    for (hit, ev) in hits.iter_mut().zip(archive.events_by_hex_ids(&ids).await) {
+        hit.event = ev;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -258,12 +310,21 @@ fn run_search(state: SharedState, filter: SearchFilter) -> Result<Json<Vec<Searc
 // ---------------------------------------------------------------------------
 
 async fn get_event(
-    State(state): State<SharedState>,
+    State(state): State<SearchState>,
     Path(id): Path<String>,
 ) -> Result<Json<SearchHit>, ApiError> {
-    let mut reg = state.registry.lock().map_err(|_| ApiError::Poisoned)?;
-    match reg.get_event(&id).map_err(ApiError::Registry)? {
-        Some(hit) => Ok(Json(hit)),
+    // Hex ids are indexed lowercase, so a caller using uppercase must be
+    // folded the same way or the lookup misses.
+    let id = nostrsearch_core::schema::normalize_hex(id.trim());
+    let hit = {
+        let mut reg = state.app.registry.lock().map_err(|_| ApiError::Poisoned)?;
+        reg.get_event(&id).map_err(ApiError::Registry)?
+    };
+    match hit {
+        Some(mut hit) => {
+            hydrate_events(&state, std::slice::from_mut(&mut hit)).await;
+            Ok(Json(hit))
+        }
         None => Err(ApiError::NotFound),
     }
 }

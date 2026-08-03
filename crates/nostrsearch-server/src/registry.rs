@@ -31,6 +31,13 @@ struct ShardReader {
 }
 
 /// A hydrated search hit.
+///
+/// The index stores what it needs to *rank* an event, not the event itself:
+/// `tags` and `sig` are not in the index at all, so these fields alone cannot
+/// reconstruct anything a client could verify. [`event`](Self::event) carries
+/// the complete signed event when the node has an archive to fetch it from --
+/// which is what a NIP-50 relay has to return -- and is absent on a node with
+/// no archive attached.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchHit {
     pub event_id: String,
@@ -39,7 +46,17 @@ pub struct SearchHit {
     pub created_at: u64,
     pub score: f32,
     pub content: String,
+    /// Title / display name, when the event has one (long-form posts,
+    /// listings, calendar entries, profiles).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// Detected language (ISO 639-1), when detection was confident.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
     pub shard: String,
+    /// The complete signed event, hydrated by id from the archive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub event: Option<serde_json::Value>,
 }
 
 /// Maximum shard readers held open at once, before the least-recently-used is
@@ -373,6 +390,12 @@ fn hydrate(
     };
     let get_u64 =
         |f: tantivy::schema::Field| doc.get_first(f).and_then(|v| v.as_u64()).unwrap_or(0);
+    let opt_text = |f: tantivy::schema::Field| {
+        doc.get_first(f)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    };
     Ok(SearchHit {
         event_id: get_text(schema.event_id),
         pubkey: get_text(schema.pubkey),
@@ -380,7 +403,12 @@ fn hydrate(
         created_at: get_u64(schema.created_at),
         score,
         content: get_text(schema.raw_content),
+        title: opt_text(schema.title),
+        lang: opt_text(schema.lang),
         shard: shard.name(),
+        // Filled in by the caller from the archive; the index has no signed
+        // event to give.
+        event: None,
     })
 }
 

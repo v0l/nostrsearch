@@ -13,3 +13,4 @@ thiserror.workspace = true
 tracing.workspace = true
 hex.workspace = true
 chrono.workspace = true
+whatlang = "0.18.0"

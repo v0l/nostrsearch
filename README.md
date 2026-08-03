@@ -160,11 +160,24 @@ Inside the `search`/`q` string, on top of Tantivy's grammar (`"phrase"`,
 
 | Operator | Meaning |
 |---|---|
-| `author:<hex>` | restrict to an author |
+| `author:<hex\|npub>` | restrict to an author |
 | `kind:<n>` | restrict to a kind |
 | `since:<unix\|YYYY-MM-DD>` / `until:<...>` | time bound (drives shard pruning) |
 | `#tag` or `tag:<x>` | hashtag (`t`) lookup |
-| `lang:<code>` | language filter |
+| `lang:<code>` | language filter (detected at index time) |
+| `geo:<geohash>` | everything inside that cell (any precision) |
+| `site:<domain>` | events linking to that host |
+| `nip05:<id>` | profile by NIP-05 identifier |
+
+Bare terms are **ANDed** and matched against `title`, `summary` and `content`
+(titles boosted), so `bitcoin conference` means both words, anywhere in the
+event's searchable text. Explicit `OR` still works. Scripts written without
+spaces (Chinese, Japanese, Korean, Thai) are indexed as bigrams, so substring
+search works there too.
+
+Hits carry the complete signed event when the node has an archive attached: the
+index holds no `tags` or `sig`, so the event is fetched by id from the archive,
+which records each event's shard and offset.
 
 ## Scoring
 
@@ -184,8 +197,14 @@ The single-node core is done. The scale-out layer is designed but not yet built:
 - [ ] **Stateless searchers** — fetch cold shards from S3 on demand (the
       Quickwit-style decoupled-compute/storage model)
 - [ ] **Parallel multi-file ingest** + open-shard eviction + event-id dedup
-- [ ] **Mutability flags** — `deleted`/`superseded` already in schema; wire the
-      kind-5 / replaceable-event tracking to populate them
+
+There are deliberately no `deleted` / `superseded` columns: this is a full
+archive, and both are derived views over what is already indexed rather than
+properties of an event. The version history of a replaceable event is the query
+`authors + kind + #d` ordered by `created_at` (newest is live, the rest are
+superseded); a deletion is a kind-5 event naming its target in an `e` tag, and
+stays searchable as the ordinary event it is. Enacting either is the caller's
+policy, not the archive's.
 
 ## License
 

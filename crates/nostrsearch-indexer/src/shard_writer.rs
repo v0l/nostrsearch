@@ -307,24 +307,23 @@ impl ShardManager {
         Ok(())
     }
 
-    /// Index one event. `deleted`/`superseded` are computed by the caller's
-    /// mutability policy (default: both false — "index everything").
+    /// Index one event.
     pub fn index_event(&self, ev: &NostrEvent) -> Result<ShardId, ShardError> {
-        self.index_event_with_flags(ev, false, false)
-    }
-
-    /// Index one event with explicit mutability flags.
-    pub fn index_event_with_flags(
-        &self,
-        ev: &NostrEvent,
-        deleted: bool,
-        superseded: bool,
-    ) -> Result<ShardId, ShardError> {
         let wot = self.wot_lookup.as_ref().map(|f| f(&ev.pubkey)).unwrap_or(0);
+
+        // Language is detected here, not in the schema, because it is a
+        // property of the *text* and only text kinds have any. It used to be
+        // passed as an unconditional `None`, which left `lang:` matching
+        // nothing at all.
+        let lang = if ev.is_text_kind() {
+            nostrsearch_core::lang::detect(&ev.content)
+        } else {
+            None
+        };
 
         let id = ShardId::from_timestamp(ev.created_at);
         let shard = self.shard_for(ev.created_at)?;
-        let doc = shard.schema.to_document(ev, wot, deleted, superseded, None);
+        let doc = shard.schema.to_document(ev, wot, lang);
         // Outside every map lock: this is the expensive part, and holding a
         // lock across it is what pinned the whole ingest to one core.
         shard.add(doc)?;

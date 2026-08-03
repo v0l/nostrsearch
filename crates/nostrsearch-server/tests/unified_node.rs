@@ -127,6 +127,55 @@ async fn relay_write_is_archived_and_searchable_in_one_process() -> anyhow::Resu
         "get_event should resolve the relay-published event {event_id}"
     );
 
+    // A search hit must be a *complete signed event*, which a NIP-50 relay has
+    // to be able to return. The index stores neither `tags` nor `sig`, so this
+    // only works because the hit is hydrated by id from the archive.
+    db.flush().await?;
+    let body: serde_json::Value =
+        get_json(&format!("http://{addr}/search?q={unique}&limit=5")).await?;
+    let first = body
+        .as_array()
+        .and_then(|a| a.first())
+        .expect("search over HTTP should return the note");
+    let event = first
+        .get("event")
+        .expect("hit should carry the full signed event");
+    assert_eq!(event["id"].as_str(), Some(event_id.as_str()));
+    assert_eq!(
+        event["pubkey"].as_str(),
+        Some(keys.public_key().to_hex()).as_deref()
+    );
+    assert!(event["tags"].is_array(), "tags must survive hydration");
+    assert_eq!(
+        event["sig"].as_str().map(str::len),
+        Some(128),
+        "a client cannot verify a hit without the signature"
+    );
+
+    // Same for the single-event endpoint, including uppercase hex (ids are
+    // indexed lowercase, so the query side has to be folded).
+    let by_id_http: serde_json::Value =
+        get_json(&format!("http://{addr}/event/{}", event_id.to_uppercase())).await?;
+    assert_eq!(by_id_http["event"]["id"].as_str(), Some(event_id.as_str()));
+
     let _ = std::fs::remove_dir_all(&root);
     Ok(())
+}
+
+/// Minimal JSON GET without adding an HTTP client dependency.
+async fn get_json(url: &str) -> anyhow::Result<serde_json::Value> {
+    let url = url.strip_prefix("http://").unwrap();
+    let (host, path) = url.split_once('/').unwrap();
+    let mut stream = tokio::net::TcpStream::connect(host).await?;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    stream
+        .write_all(
+            format!("GET /{path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .await?;
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).await?;
+    let text = String::from_utf8_lossy(&buf);
+    let body = text.split("\r\n\r\n").nth(1).unwrap_or("");
+    Ok(serde_json::from_str(body.trim())?)
 }

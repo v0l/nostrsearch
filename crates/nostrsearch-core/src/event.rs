@@ -72,20 +72,48 @@ impl NostrEvent {
     ///
     /// This drives which kinds get their `content` tokenized vs stored raw.
     /// The caller decides policy; this just classifies.
+    ///
+    /// The rule is "would a human read this field as prose", not "is this kind
+    /// interesting": media kinds carry captions, voice notes carry
+    /// transcripts, git patches carry commit messages. The one deliberate
+    /// *removal* is kind 30078 (app-specific data), whose content is routinely
+    /// base64 or NIP-44 ciphertext -- exactly the term-dictionary pollution
+    /// this classification exists to avoid.
     pub fn is_text_kind(&self) -> bool {
         matches!(
             self.kind,
-            0          // profile metadata
+            0          // profile metadata (JSON: name/about/nip05)
             | 1        // short text note
-            | 1111     // generic reply / comment (NIP-22)
-            | 9802     // highlight (NIP-84)
+            | 20       // picture (NIP-68) -- caption
+            | 21       // video (NIP-71) -- description
+            | 22       // short video (NIP-71)
             | 1063     // file metadata (NIP-94)
+            | 1111     // generic reply / comment (NIP-22)
+            | 1222     // voice message (NIP-A0) -- transcript
+            | 1244     // voice reply (NIP-A0)
+            | 1617     // git patch (NIP-34) -- commit message + diff
+            | 1621     // git issue (NIP-34)
+            | 1622     // git reply (NIP-34)
+            | 9802     // highlight (NIP-84)
+            | 30017    // stall (NIP-15)
+            | 30018    // product (NIP-15)
             | 30023    // long-form content (NIP-23)
             | 30024    // draft long-form
-            | 30078    // app-specific data (often descriptive)
+            | 30311    // live event (NIP-53) -- summary
             | 30402    // classified listing (NIP-99)
+            | 31922    // date-based calendar event (NIP-52)
+            | 31923    // time-based calendar event (NIP-52)
             | 34550 // community definition (NIP-72)
         )
+    }
+
+    /// The first value of a multi-character tag (`title`, `summary`, `alt`,
+    /// `name`, ...).
+    ///
+    /// [`tag_values`](Self::tag_values) already matches on the whole name, so
+    /// this is just the "at most one" case spelled out at the call site.
+    pub fn tag_value(&self, name: &str) -> Option<&str> {
+        self.tag_values(name).next()
     }
 }
 
@@ -133,5 +161,20 @@ mod tests {
         assert!(ev(5, vec![]).is_deletion());
         assert!(ev(1, vec![]).is_text_kind());
         assert!(!ev(4, vec![]).is_text_kind());
+    }
+
+    #[test]
+    fn text_kinds_cover_media_voice_git_and_commerce() {
+        // Kinds whose content is prose a user would search for, and which the
+        // original list omitted entirely.
+        for k in [
+            20, 21, 22, 1222, 1244, 1617, 1621, 1622, 30017, 30018, 30311, 31922, 31923,
+        ] {
+            assert!(ev(k, vec![]).is_text_kind(), "kind {k} should be text");
+        }
+        // Encrypted or opaque payloads must stay out of the term dictionary.
+        for k in [4, 1059, 30078] {
+            assert!(!ev(k, vec![]).is_text_kind(), "kind {k} should not be text");
+        }
     }
 }
