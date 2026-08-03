@@ -21,112 +21,96 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// Fill index gaps by scraping the whole relay network.
+///
+/// Owns its own pipeline and `.dedupe` store, so it must not run while another
+/// process holds the index writers.
+#[derive(clap::Parser, Debug)]
+#[command(name = "scrape", version)]
 struct Args {
+    /// Index root
+    #[arg(long, value_name = "DIR", default_value_os_t = nostrsearch_indexer::env::index_root())]
     index_root: PathBuf,
+
+    /// Pipeline + scrape state
+    #[arg(long, value_name = "DIR", default_value_os_t = nostrsearch_indexer::env::state_dir())]
     state_dir: PathBuf,
+
+    /// Refresh relay targets from kind-10002, print them, and exit
+    #[arg(long = "discover")]
     discover_only: bool,
+
+    /// Refresh targets, then scrape
+    #[arg(long)]
     rediscover: bool,
+
+    /// Stop walking backwards at this date
+    #[arg(long, value_name = "YYYY-MM-DD", default_value = "2022-01-01",
+          value_parser = parse_date_arg)]
     min_date: u64,
+
+    /// Scrape the top N relays by advertiser count
+    #[arg(long, value_name = "N", default_value_t = 300)]
     max_relays: usize,
+
+    /// Minimum distinct advertisers for a relay to qualify
+    #[arg(long, value_name = "N", default_value_t = 3)]
     min_sources: u32,
+
+    /// Relays scraped in parallel
+    #[arg(long, value_name = "N", default_value_t = 12)]
     concurrency: usize,
-    floor_secs: u64,
+
+    /// Smallest bisection window, in minutes
+    #[arg(long = "floor-mins", value_name = "N", default_value_t = 10,
+          value_parser = clap::value_parser!(u64).range(1..))]
+    floor_mins: u64,
+
+    /// Stop a relay after N consecutive empty days
+    #[arg(long, value_name = "N", default_value_t = 14)]
     birthday_days: u32,
+
+    /// Extra seed relay (repeatable)
+    #[arg(long = "relay", value_name = "URL")]
     seed_relays: Vec<String>,
+
+    /// Tantivy writer heap per shard, in MB (charged per open shard)
+    #[arg(long, value_name = "MB", default_value_t = 64)]
     heap_mb: usize,
+
+    /// Commit every N docs per shard
+    #[arg(long, value_name = "N", default_value_t = 100_000)]
     commit_docs: u64,
+
+    /// Shard writers held open
+    #[arg(long, value_name = "N", default_value_t = nostrsearch_indexer::env::max_open_shards())]
     max_open_shards: usize,
-    wot_out: Option<PathBuf>,
+
+    /// Do not write a WoT snapshot
+    #[arg(long)]
+    no_wot_out: bool,
+
+    /// Write the WoT snapshot here
+    #[arg(long, value_name = "FILE", conflicts_with = "no_wot_out",
+          default_value_os_t = nostrsearch_indexer::env::wot_out())]
+    wot_out: PathBuf,
 }
 
 impl Args {
-    fn parse() -> Result<Self, String> {
-        use nostrsearch_indexer::env;
-        let mut a = Args {
-            index_root: env::index_root(),
-            state_dir: env::state_dir(),
-            discover_only: false,
-            rediscover: false,
-            min_date: parse_date("2022-01-01").unwrap(),
-            max_relays: 300,
-            min_sources: 3,
-            concurrency: 12,
-            floor_secs: 600,
-            birthday_days: 14,
-            seed_relays: Vec::new(),
-            heap_mb: 64,
-            commit_docs: 100_000,
-            max_open_shards: env::max_open_shards(),
-            wot_out: Some(env::wot_out()),
-        };
-        let mut it = std::env::args().skip(1);
-        while let Some(arg) = it.next() {
-            let mut val = |name: &str| it.next().ok_or(format!("{name} needs a value"));
-            match arg.as_str() {
-                "--index-root" => a.index_root = val("--index-root")?.into(),
-                "--state-dir" => a.state_dir = val("--state-dir")?.into(),
-                "--discover" => a.discover_only = true,
-                "--rediscover" => a.rediscover = true,
-                "--min-date" => {
-                    a.min_date = parse_date(&val("--min-date")?).ok_or("bad --min-date")?
-                }
-                "--max-relays" => {
-                    a.max_relays = val("--max-relays")?.parse().map_err(|_| "bad max-relays")?
-                }
-                "--min-sources" => {
-                    a.min_sources = val("--min-sources")?
-                        .parse()
-                        .map_err(|_| "bad min-sources")?
-                }
-                "--concurrency" => {
-                    a.concurrency = val("--concurrency")?
-                        .parse()
-                        .map_err(|_| "bad concurrency")?
-                }
-                "--floor-mins" => {
-                    a.floor_secs = val("--floor-mins")?
-                        .parse::<u64>()
-                        .map_err(|_| "bad floor-mins")?
-                        * 60
-                }
-                "--birthday-days" => {
-                    a.birthday_days = val("--birthday-days")?
-                        .parse()
-                        .map_err(|_| "bad birthday-days")?
-                }
-                "--relay" => a.seed_relays.push(val("--relay")?),
-                "--heap-mb" => a.heap_mb = val("--heap-mb")?.parse().map_err(|_| "bad heap-mb")?,
-                "--commit-docs" => {
-                    a.commit_docs = val("--commit-docs")?
-                        .parse()
-                        .map_err(|_| "bad commit-docs")?
-                }
-                "--max-open-shards" => {
-                    a.max_open_shards = val("--max-open-shards")?
-                        .parse()
-                        .map_err(|_| "bad max-open-shards")?
-                }
-                "--no-wot-out" => a.wot_out = None,
-                "--help" | "-h" => {
-                    return Err("scrape: fill index gaps from the whole relay network\n\
-     --index-root <dir>    index root ($INDEX_ROOT)\n\
-     --state-dir <dir>     pipeline + scrape state ($STATE_DIR)\n\
-     --discover            refresh relay targets from kind-10002, print, exit\n\
-     --rediscover          refresh targets, then scrape\n\
-     --min-date <d>        stop walking backwards at YYYY-MM-DD (2022-01-01)\n\
-     --max-relays <n>      scrape the top n relays by advertisers (300)\n\
-     --min-sources <n>     min distinct advertisers to qualify (3)\n\
-     --concurrency <n>     relays scraped in parallel (12)\n\
-     --floor-mins <n>      smallest bisection window (10)\n\
-     --birthday-days <n>   stop a relay after n consecutive empty days (14)\n\
-     --relay <url>         extra seed relay (repeatable)"
-                        .into());
-                }
-                other => return Err(format!("unknown arg: {other}")),
-            }
-        }
-        Ok(a)
+    /// Smallest bisection window, in seconds.
+    fn floor_secs(&self) -> u64 {
+        self.floor_mins * 60
     }
+
+    /// Where to write the WoT snapshot, or `None` for --no-wot-out.
+    fn wot_out(&self) -> Option<PathBuf> {
+        (!self.no_wot_out).then(|| self.wot_out.clone())
+    }
+}
+
+/// `YYYY-MM-DD` to a unix timestamp, for clap's value parser.
+fn parse_date_arg(s: &str) -> Result<u64, String> {
+    parse_date(s).ok_or_else(|| format!("expected YYYY-MM-DD, got {s:?}"))
 }
 
 /// Pipeline-backed sink for standalone runs: `.dedupe`-gated, checkpointed.
@@ -211,6 +195,9 @@ fn to_core(ev: &nostr_sdk::Event) -> NostrEvent {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Before the subscriber, so --help/--version print without log lines.
+    let args = <Args as clap::Parser>::parse();
+
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();
@@ -220,14 +207,6 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| "info,nostr_relay_pool=warn,nostr_sdk=warn".into()),
         )
         .init();
-    let args = match Args::parse() {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(2);
-        }
-    };
-
     let state = Arc::new(ScrapeState::open(&args.state_dir.join("scrape"))?);
 
     // Target discovery from kind-10002 lists already in the index.
@@ -277,7 +256,7 @@ fn main() -> anyhow::Result<()> {
         wot_refresh_every: nostrsearch_indexer::env::wot_refresh_every(),
         min_refresh_interval: nostrsearch_indexer::env::min_refresh_interval(),
         persist_interval: nostrsearch_indexer::env::persist_interval(),
-        wot_out: args.wot_out.clone(),
+        wot_out: args.wot_out(),
     };
     let pipeline = Arc::new(Mutex::new(Pipeline::new(cfg)?));
     // Scraped events are new arrivals: fold them as live, not backfill.
@@ -348,7 +327,7 @@ async fn run(args: Args, state: Arc<ScrapeState>, sink: Arc<PipelineSink>) -> an
 
     let cfg = ScrapeConfig {
         min_date: args.min_date,
-        floor_secs: args.floor_secs,
+        floor_secs: args.floor_secs(),
         concurrency: args.concurrency,
         empty_days_limit: args.birthday_days,
     };

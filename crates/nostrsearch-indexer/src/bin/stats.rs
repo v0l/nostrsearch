@@ -11,6 +11,7 @@
 //! Usage:
 //!   stats --input-dir ./dumps --state-dir ./data/stats --wot-out ./data/wot.bin
 
+use clap::Parser;
 use nostr_archive_cursor::NostrCursor;
 use nostrsearch_core::event::NostrEvent;
 use nostrsearch_stats::analyses::{FollowGraph, Pagerank};
@@ -20,78 +21,37 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+/// Stats/WoT backfill: stream a Nostr JSONL archive through the analysis
+/// pipeline and emit a web-of-trust snapshot for search scoring.
+///
+/// Defaults come from $STATE_DIR / $WOT_OUT, the same variables the server
+/// node and `ingest` read; flags override them.
+#[derive(clap::Parser, Debug)]
+#[command(name = "stats", version)]
 struct Args {
+    /// Directory of .jsonl/.json/.zst/.gz/.bz2 dumps
+    #[arg(long, value_name = "DIR", required = true)]
     input_dir: PathBuf,
+
+    /// Analysis state store
+    #[arg(long, value_name = "DIR", default_value_os_t = nostrsearch_indexer::env::state_dir())]
     state_dir: PathBuf,
+
+    /// Output WoT snapshot
+    #[arg(long, value_name = "FILE", default_value_os_t = nostrsearch_indexer::env::wot_out())]
     wot_out: PathBuf,
+
+    /// Files read in parallel [default: available cores]
+    #[arg(long, value_name = "N", default_value_t = 0, hide_default_value = true)]
     parallelism: usize,
+
+    /// Events per read chunk
+    #[arg(long, value_name = "N", default_value_t = 2_000)]
     chunk_size: usize,
+
+    /// Disable event-id dedup
+    #[arg(long = "no-dedupe", action = clap::ArgAction::SetFalse)]
     dedupe: bool,
-}
-
-impl Args {
-    fn parse() -> Result<Self, String> {
-        // Same env contract as the server node and `ingest`; flags override.
-        use nostrsearch_indexer::env;
-        let mut input_dir = None;
-        let mut state_dir = env::state_dir();
-        let mut wot_out = env::wot_out();
-        let mut parallelism = 0usize;
-        let mut chunk_size = 2_000usize;
-        let mut dedupe = true;
-
-        let mut it = std::env::args().skip(1);
-        while let Some(a) = it.next() {
-            match a.as_str() {
-                "--input-dir" => {
-                    input_dir = Some(PathBuf::from(it.next().ok_or("--input-dir value")?))
-                }
-                "--state-dir" => state_dir = PathBuf::from(it.next().ok_or("--state-dir value")?),
-                "--wot-out" => wot_out = PathBuf::from(it.next().ok_or("--wot-out value")?),
-                "--parallelism" => {
-                    parallelism = it
-                        .next()
-                        .ok_or("--parallelism value")?
-                        .parse()
-                        .map_err(|_| "bad parallelism")?
-                }
-                "--chunk-size" => {
-                    chunk_size = it
-                        .next()
-                        .ok_or("--chunk-size value")?
-                        .parse()
-                        .map_err(|_| "bad chunk-size")?
-                }
-                "--no-dedupe" => dedupe = false,
-                "-h" | "--help" => {
-                    println!("{}", help());
-                    std::process::exit(0);
-                }
-                other => return Err(format!("unknown arg: {other}")),
-            }
-        }
-        Ok(Self {
-            input_dir: input_dir.ok_or("missing --input-dir <dir>")?,
-            state_dir,
-            wot_out,
-            parallelism,
-            chunk_size,
-            dedupe,
-        })
-    }
-}
-
-fn help() -> String {
-    "nostrsearch stats/WoT backfill (via nostr-archive-cursor)\n\
-     Defaults read from STATE_DIR / WOT_OUT; flags override.\n\
-     \n\
-     --input-dir <dir>      directory of .jsonl/.json/.zst/.gz/.bz2 dumps\n\
-     --state-dir <dir>      analysis state store ($STATE_DIR, ./data/stats)\n\
-     --wot-out <file>       output WoT snapshot ($WOT_OUT, ./data/wot.bin)\n\
-     --parallelism <n>      files read in parallel (default: num cores)\n\
-     --chunk-size <n>       events per read chunk (default 2000)\n\
-     --no-dedupe            disable event-id dedup"
-        .to_string()
 }
 
 fn now_secs() -> u64 {
@@ -102,6 +62,9 @@ fn now_secs() -> u64 {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Before the subscriber, so --help/--version print without log lines.
+    let args = Args::parse();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -109,7 +72,6 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let args = Args::parse().map_err(anyhow::Error::msg)?;
     if !args.input_dir.is_dir() {
         anyhow::bail!(
             "--input-dir {} is not a directory",

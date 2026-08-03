@@ -1,145 +1,221 @@
 # nostrsearch
 
-**The mother of all Nostr search relays.** A distributed, full-text search
-engine over the entire Nostr event corpus, built in Rust on
+Full-text search over the entire Nostr event corpus, in Rust on
 [Tantivy](https://github.com/quickwit-oss/tantivy).
 
-Target: index the **hole.v0l.io** archive — **~900M events / ~763 GiB** of
-JSONL dumps — and serve advanced search (NIP-50 + rich filters) at scale.
+One process is a search API, a NIP-50-shaped query planner, an archive server,
+an archival relay, a live firehose ingest and a stats/web-of-trust engine —
+over a single time-sharded index, a single archive, and a single writer.
 
-## Status: working POC
+Target corpus: the **hole.v0l.io** archive, ~900M events / ~763 GiB of JSONL
+dumps.
 
-Single-node engine is functional and benchmarked against real hole.v0l.io data:
+## Status
 
-| Metric | Value |
+Single-node engine works end to end. The scale-out layer is designed, not
+built.
+
+| | |
 |---|---|
-| Ingest throughput | **~122,000 events/sec** (single node, 48 cores) |
-| 1.34M-event day dump | indexed in **~11s** |
-| Index size | ~2.5 GB per 2.8 GB raw day dump |
-| Full-text search | BM25 × (WoT + recency) scoring, working |
-| NIP-50 search | `search` string + extension operators, working |
-| REST API | `/search` `/event/{id}` `/stats` `/healthz`, working |
-| Tests | 17 passing |
+| Ingest | archive backfill + live firehose, both feeding index and stats |
+| Search | BM25 × (WoT + recency), NIP-50 search string + structured filters |
+| Hydration | hits carry the complete signed event, fetched by id from the archive |
+| Archive | serves the corpus, indexes it by id, accepts relay writes |
+| API | `/search`, `/event/{id}`, `/stats`, `/archive/*`, `/reports/*`, `/admin/*` |
+| Console | built into the binary, live-patched from `/reports/stream` |
+| Tests | 152 passing |
+
+Throughput measured on real hole.v0l.io data at ~122k events/sec (48 cores),
+and ~2.5 GB of index per 2.8 GB day dump. Both predate the current schema:
+documents now carry more fields and CJK text is bigrammed, while `content` is
+no longer stored twice. Neither number has been re-measured since — treat them
+as the right order of magnitude, not a benchmark.
+
+## Quick start
+
+```bash
+./scripts/build-dashboard.sh          # console is compiled into the binary
+docker compose up --build             # node on :8080, console at /
+```
+
+Or from a checkout:
+
+```bash
+./scripts/build-dashboard.sh
+cargo build --release
+
+# backfill an archive directory, then serve it
+./target/release/ingest --index-root ./data/index --input-dir ./dumps --exit-when-done
+INDEX_ROOT=./data/index BIND=0.0.0.0:8080 ./target/release/nostrsearch-server
+```
+
+The console is compiled in from `dashboard/dist/index.html`, a build artifact
+rather than a committed file, so build it before `cargo build` and again after
+changing anything under `dashboard/` (needs [bun](https://bun.sh)). Docker and
+CI do it themselves.
 
 ## Architecture
 
 ```
-                ┌────────────────────────────────────────────┐
- hole.v0l.io    │  nostrsearch-indexer                       │
- .jsonl(.zst) ─►│  parse ─► route by created_at ─► ShardWriter│
-                │                          (one per month,    │
-                │                           own IndexWriter,  │
-                │                           no global lock)   │
-                └───────────────┬────────────────────────────┘
-                                │  <root>/<YYYY-MM>/  (Tantivy index)
-                ┌───────────────▼────────────────────────────┐
-                │  nostrsearch-server                        │
-                │  ShardRegistry: discover + fan-out + merge │
-                │  QueryPlanner: NIP-50 filter ─► Tantivy    │
-                │  REST API (axum)                           │
-                └────────────────────────────────────────────┘
+   dumps (.jsonl.zst)          upstream relays            inbound writes
+          │                          │                          │
+          ▼                          ▼                          ▼
+    ┌─────────────┐            ┌───────────┐             ┌────────────┐
+    │ ingest CLI  │            │ firehose  │             │   relay    │
+    └──────┬──────┘            └─────┬─────┘             └──────┬─────┘
+           │                         │                          │
+           │                         ▼                          │
+           │                  ┌──────────────┐                  │
+           └─────────────────►│ archive (id  │◄─────────────────┘
+                              │  index +     │   .jsonl.zst corpus, RocksDB
+                              │  .jsonl.zst) │   index: id → shard + offset
+                              └──────┬───────┘
+                                     │
+                              ┌──────▼───────┐
+                              │ writer task  │  single owner of the pipeline
+                              └──────┬───────┘
+                                     │
+                     ┌───────────────┴───────────────┐
+                     ▼                               ▼
+            ┌─────────────────┐            ┌──────────────────┐
+            │ Tantivy shards  │            │ stats / WoT      │
+            │ <root>/YYYY-MM/ │            │ analyses+reports │
+            └────────┬────────┘            └────────┬─────────┘
+                     │                              │
+                     ▼                              ▼
+            ShardRegistry: prune → fan out → merge → hydrate
+                     │
+                     ▼
+              /search, /event/{id}   ──(by id)──►  archive
 ```
 
-### Why this design (vs. moar / nostrarchives)
+Two rules hold the design together:
 
-Built after studying [barrydeen/moar](https://github.com/barrydeen/moar)
-(Tantivy secondary index) and
-[barrydeen/nostrarchives-api](https://github.com/barrydeen/nostrarchives-api)
-(Postgres FTS). Those are single-node and hit a wall well before 1B events.
-This engine keeps moar's correct secondary-index idea but fixes what doesn't
-scale:
-
-- **Time-sharded indices** (one per month) instead of one monolithic index →
-  shard pruning, bounded merges, cold-shard offload.
-- **Shard-per-writer, no global `Mutex<IndexWriter>`** → ingest parallelism
-  scales with cores.
-- **Tags are first-class** (`t/e/p/a/d/g/l/url` as exact-match term fields) —
-  moar only indexes content/pubkey/kind.
-- **Fast-field scoring** — WoT tier + recency read from columnar fast fields in
-  a custom collector, not per-hit stored-doc deserialization.
-- **Content split** — only human-text kinds are tokenized for BM25; the other
-  ~90% of the corpus (encrypted DMs, gift-wraps, app blobs) is fully indexed
-  for *metadata* but doesn't pollute the term dictionary with ciphertext.
+- **One writer.** Tantivy shard writers, the RocksDB id index and the dedupe
+  store all take exclusive locks, so exactly one process may write at a time.
+  A node that is not writing serves search and the archive read-only, with no
+  locks, beside a writer.
+- **Time-sharded index.** One Tantivy index per month under
+  `<root>/<YYYY-MM>/`, each with its own writer and commit policy. Time
+  filters prune whole shards, merges stay bounded, cold shards can be closed,
+  and ingest parallelism scales with cores instead of queueing on one
+  `Mutex<IndexWriter>`.
 
 ## Crates
 
-- **`nostrsearch-core`** — event model, Tantivy schema, time-shard layout,
-  NIP-50 query planner, composite scoring. No I/O.
-- **`nostrsearch-indexer`** — JSONL/zstd source, `ShardManager` (per-shard
-  writers, scheduled commits), `ingest` CLI.
-- **`nostrsearch-server`** — `ShardRegistry` (fan-out + merge + hydrate), axum
-  REST API, NIP-98 admin endpoints, embedded operator console.
-- **`dashboard/`** — the console itself (Preact + Vite, built to a single HTML
-  file the server crate compiles in with `include_str!`). Build it before
-  `cargo build`; see [dashboard/README.md](dashboard/README.md).
+- **`nostrsearch-core`** — event model, Tantivy schema, script-aware
+  tokenizer, language detection, NIP-19 decoding, time-shard layout, query
+  planner, scoring. No I/O.
+- **`nostrsearch-indexer`** — archive ingest, live firehose, `ShardManager`
+  (per-shard writers, scheduled commits), dedupe store, network scrape, and
+  the `ingest` / `archive` / `stats` / `scrape` binaries.
+- **`nostrsearch-stats`** — the analysis engine: follow graph, pagerank,
+  activity, clients, relays, and the reports the console renders.
+- **`nostrsearch-server`** — `ShardRegistry` (fan-out, merge, hydrate), axum
+  API, archive HTTP, relay endpoint, NIP-98 admin, embedded console.
+- **`dashboard/`** — the console (Preact + Vite), see
+  [dashboard/README.md](dashboard/README.md).
 
-## Usage
+## Running a node
 
-### Ingest the corpus
+Every binary reads the same environment, so one container image configures all
+of them; flags override.
+
+| Variable | Meaning | Default |
+|---|---|---|
+| `INDEX_ROOT` | Tantivy shard root | `./data/index` |
+| `BIND` | listen address | `0.0.0.0:8080` |
+| `ARCHIVE_DIR` | `.jsonl.zst` corpus + id index; enables `/archive` | unset |
+| `ENABLE_RELAY` | accept inbound writes at `/` (needs `ARCHIVE_DIR`) | off |
+| `RELAY_KINDS` | kind whitelist for the relay | all |
+| `RELAYS` | comma-separated upstreams; enables the firehose | unset |
+| `STATE_DIR` | analysis state store | `./data/stats` |
+| `WOT_OUT` | web-of-trust snapshot | `./data/wot.bin` |
+| `WOT_REFRESH_EVERY` | events between WoT rebuilds | `100000` |
+| `MAX_OPEN_SHARDS` | shard writers held open | `64` |
+| `MAX_OPEN_SHARD_READERS` | shard readers held open | `48` |
+| `ADMIN_PUBKEYS` | comma-separated hex/npub; enables the admin API | unset |
+
+Any write role (relay or firehose) makes the process the writer. Without one
+it opens the index and archive read-only.
+
+## Ingest
 
 ```bash
-# a single dump
-cargo run --release --bin ingest -- \
-  --index-root ./data/index --input events_20260715.jsonl
+# backfill a directory of dumps
+ingest --index-root ./data/index --input-dir ./dumps
 
-# a whole directory of dumps (date order)
-cargo run --release --bin ingest -- \
-  --index-root ./data/index --input-dir ./dumps/
+# backfill, then tail the live firehose into the same index
+ingest --index-root ./data/index --input-dir ./dumps \
+       --relays wss://relay.damus.io --relays wss://nos.lol
 
-# straight from hole.v0l.io
-cargo run --release --bin ingest -- \
-  --index-root ./data/index --url https://hole.v0l.io/events_20260714.jsonl.zst
+# firehose only, also archiving what it sees
+ingest --index-root ./data/index --relays wss://relay.damus.io \
+       --archive-dir ./data/archive
 ```
 
-### Run the search API
+Backfill is resumable: indexed ids are recorded in `<index-root>/.dedupe` and
+checkpointed after Tantivy commits, so a killed run re-processes at most one
+checkpoint window rather than duplicating documents. Wiping the index wipes the
+dedupe store with it, keeping the two in sync.
+
+When it finishes, ingest **idles instead of exiting** — anything with a restart
+policy of `Always` treats a clean exit as a reason to run the whole backfill
+again. Pass `--exit-when-done` for batch use (a Job, or a local run). `SIGTERM`
+always flushes and exits promptly.
+
+### Rebuilding
 
 ```bash
-INDEX_ROOT=./data/index BIND=0.0.0.0:8080 \
-  cargo run --release --bin nostrsearch-server
+ingest --index-root ./data/index --input-dir ./dumps --rebuild
 ```
 
-### Operate the node
+`--rebuild` runs both migrations in the only order that works, then a normal
+backfill:
 
-Every node serves the operator console on `/` (and `/dashboard`), built into the
-binary. It shows backfill coverage, the published analysis reports — activity,
-zap volume, publishers, trending hashtags, kinds, clients — live-patched from
-`/reports/stream`, plus relay health and index memory. All of that comes from
-open endpoints and needs no key.
+1. rebuild the **archive** id index — frame sidecars, then each event's
+   location (shard + frame offset + length), reframing single-frame dumps so a
+   lookup decodes one frame instead of a whole file;
+2. wipe the **Tantivy** index and the dedupe store;
+3. re-ingest.
 
-Set `ADMIN_PUBKEYS` (comma-separated hex or npub) to additionally enable the
-admin API, which unlocks replay control and the resets in the console. Admin
-calls are signed in the browser with a NIP-07 extension (NIP-98 auth) — no
-shared secret, no token to leak.
+It is O(corpus) twice and deletes the serving index before it starts, so scale
+the node down first and run it deliberately. The parts are also available
+separately (`--rebuild-archive-index`, `--reindex`, `--compact-archive-index`).
+
+### Other binaries
+
+| Binary | For |
+|---|---|
+| `ingest` | archive backfill + firehose (the main one) |
+| `archive` | archive maintenance: `--stats`, `--index-new`, `--rebuild-index`, `--compact`, `--locate <id>` |
+| `stats` | stats/WoT backfill, emits a WoT snapshot for scoring |
+| `scrape` | dedicated full-network historical scrape session |
+
+All of them write, so none may run while a writing node is up.
+
+## HTTP API
+
+| Route | |
+|---|---|
+| `GET /search?q=…` | search (query-string form) |
+| `POST /search` | search (full filter DSL) |
+| `GET /event/{id}` | one event by hex id |
+| `GET /stats` | index/cluster stats |
+| `GET /healthz` | liveness |
+| `GET /archive` `…/files` `…/stats` | corpus listing |
+| `GET /archive/{file}` | stream one dump |
+| `GET /archive/event/{id}` | one event straight from the archive index |
+| `GET /reports` `…/{name}` `…/stream` | analyses, and an SSE patch stream |
+| `GET /sync` | scrape/backfill coverage |
+| `POST /admin/*` | replay control and resets (NIP-98 signed) |
+| `GET /` | console, or a relay websocket on upgrade |
 
 ```bash
-INDEX_ROOT=./data/index BIND=0.0.0.0:8080 \
-  ADMIN_PUBKEYS=npub1... ADMIN_ORIGIN=https://archive.example \
-  cargo run --release --bin nostrsearch-server
-# then open http://localhost:8080/
-```
-
-The console is compiled into the binary from `dashboard/dist/index.html`, which
-is a build artifact rather than a committed file — so build it once before
-`cargo build`, and again after changing anything under `dashboard/` (requires
-[bun](https://bun.sh)). Docker and CI do this themselves.
-
-```bash
-./scripts/build-dashboard.sh
-```
-
-### Query
-
-```bash
-# full-text, kind-1 notes about bitcoin
 curl 'localhost:8080/search?q=bitcoin&kind=1&limit=20'
+curl 'localhost:8080/search?tag=nostr&since=1784000000'
+curl 'localhost:8080/search?q=lightning+author:npub1…+since:2026-01-01'
 
-# hashtag + time range
-curl 'localhost:8080/search?tag=nostr&since=1784000000&limit=20'
-
-# NIP-50 extension operators inside the search string
-curl 'localhost:8080/search?q=lightning author:<hex> kind:1 since:2026-01-01'
-
-# full DSL
 curl -XPOST localhost:8080/search -H 'content-type: application/json' -d '{
   "search": "bitcoin AND lightning",
   "kinds": [1, 30023],
@@ -147,13 +223,12 @@ curl -XPOST localhost:8080/search -H 'content-type: application/json' -d '{
   "since": 1780000000,
   "limit": 50
 }'
-
-# fetch one event, cluster stats
-curl localhost:8080/event/<hex-id>
-curl localhost:8080/stats
 ```
 
-## NIP-50 search extensions
+Admin calls are signed in the browser with a NIP-07 extension — no shared
+secret, no token to leak. `scripts/nsadmin` does the same from a shell.
+
+## Search
 
 Inside the `search`/`q` string, on top of Tantivy's grammar (`"phrase"`,
 `AND`/`OR`, `-negation`, `*`):
@@ -162,22 +237,26 @@ Inside the `search`/`q` string, on top of Tantivy's grammar (`"phrase"`,
 |---|---|
 | `author:<hex\|npub>` | restrict to an author |
 | `kind:<n>` | restrict to a kind |
-| `since:<unix\|YYYY-MM-DD>` / `until:<...>` | time bound (drives shard pruning) |
+| `since:<unix\|YYYY-MM-DD>` / `until:<…>` | time bound (drives shard pruning) |
 | `#tag` or `tag:<x>` | hashtag (`t`) lookup |
-| `lang:<code>` | language filter (detected at index time) |
-| `geo:<geohash>` | everything inside that cell (any precision) |
+| `lang:<code>` | language, detected at index time |
+| `geo:<geohash>` | everything inside that cell, at any precision |
 | `site:<domain>` | events linking to that host |
 | `nip05:<id>` | profile by NIP-05 identifier |
 
-Bare terms are **ANDed** and matched against `title`, `summary` and `content`
-(titles boosted), so `bitcoin conference` means both words, anywhere in the
-event's searchable text. Explicit `OR` still works. Scripts written without
-spaces (Chinese, Japanese, Korean, Thai) are indexed as bigrams, so substring
-search works there too.
+Semantics worth knowing:
 
-Hits carry the complete signed event when the node has an archive attached: the
-index holds no `tags` or `sig`, so the event is fetched by id from the archive,
-which records each event's shard and offset.
+- **Bare terms are ANDed**, and matched against `title`, `summary` and
+  `content` with titles boosted. `bitcoin conference` means both words
+  anywhere in the event's searchable text; explicit `OR` still works.
+- **Scripts written without spaces** (Chinese, Japanese, Korean, Thai) are
+  indexed as overlapping bigrams, so substring search works there too.
+- **Hex is case-folded** on both sides, and `npub`/`note`/`nprofile`/`nevent`
+  are decoded, so an identifier matches however it was written.
+- **Hits carry the complete signed event** when the node has an archive: the
+  index stores no `tags` and no `sig`, so the event is fetched by id from the
+  archive, which records where each one lives. Without an archive a hit is
+  metadata plus content.
 
 ## Scoring
 
@@ -186,25 +265,46 @@ score = BM25 × (1 + wot_weight·wot_tier + recency_weight·recency_decay)
 recency_decay = max(0, 1 − age_days / half_life_days)   (default half-life 365d)
 ```
 
-WoT tier is injectable at ingest (`ShardManager::with_wot_lookup`); default 0.
+WoT tier comes from the stats engine's follow graph and is hot-swapped into the
+writer every `WOT_REFRESH_EVERY` events; it defaults to 0, which makes scoring
+BM25 + recency. A live tail alone sees too few kind-3 contact lists to
+bootstrap it, so run a backfill before serving if ranking matters.
 
-## Roadmap to distributed ("enterprise")
+## Design notes
 
-The single-node core is done. The scale-out layer is designed but not yet built:
+**Tags are first-class.** Nostr "advanced search" is mostly tag lookup, so
+`t/e/p/a/d/g/l` and URL hosts are dedicated exact-match term fields, not
+something recovered from a text blob.
 
-- [ ] **NIP-50 websocket relay** — second frontend over the same `QueryPlanner`
+**Two content paths.** Only human-text kinds are tokenized for BM25. The rest
+of the corpus — encrypted DMs, gift wraps, app blobs — is still fully indexed
+for *metadata*, but tokenizing ciphertext buys nothing and costs terabytes of
+term dictionary.
+
+**Fast fields for scoring.** `created_at`, `kind` and `wot_tier` are columnar
+and read by a custom collector, rather than deserializing a stored document per
+hit.
+
+**Stored once.** Exactly one copy of the content lives in the index; complete
+events come from the archive by id. Duplicating 763 GiB of JSON inside the
+index to avoid an O(1) lookup is not a trade worth making.
+
+**No `deleted` / `superseded` columns.** This is a full archive, and both are
+derived views over what is already indexed rather than properties of an event.
+The version history of a replaceable event is the query `authors + kind + #d`
+ordered by `created_at` — newest is live, the rest are superseded by
+definition. A deletion is a kind-5 event naming its target in an `e` tag, which
+stays searchable as the ordinary event it is. Recording either as a column
+would freeze one answer at index time and be wrong as soon as the next version
+arrived; enacting them is the caller's policy, not the archive's.
+
+## Roadmap
+
+- [ ] **NIP-50 websocket relay** — serve `REQ` from the same planner (the relay
+      endpoint currently accepts writes and rejects queries)
 - [ ] **S3 segment offload** — finalized monthly shards pushed to object storage
-- [ ] **Stateless searchers** — fetch cold shards from S3 on demand (the
-      Quickwit-style decoupled-compute/storage model)
-- [ ] **Parallel multi-file ingest** + open-shard eviction + event-id dedup
-
-There are deliberately no `deleted` / `superseded` columns: this is a full
-archive, and both are derived views over what is already indexed rather than
-properties of an event. The version history of a replaceable event is the query
-`authors + kind + #d` ordered by `created_at` (newest is live, the rest are
-superseded); a deletion is a kind-5 event naming its target in an `e` tag, and
-stays searchable as the ordinary event it is. Enacting either is the caller's
-policy, not the archive's.
+- [ ] **Stateless searchers** — fetch cold shards on demand, the
+      Quickwit-style decoupled compute/storage model
 
 ## License
 

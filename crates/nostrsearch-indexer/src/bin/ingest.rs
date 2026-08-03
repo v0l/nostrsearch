@@ -32,13 +32,134 @@
 //! starts the Tantivy index from empty so the pass rebuilds it rather than
 //! adding to what is already there.
 
+use clap::Parser;
 use nostrsearch_indexer::{Pipeline, PipelineConfig, ShardWriterConfig};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+/// Unified ingest: archive backfill + live firehose, into the index and the
+/// stats/WoT engine.
+///
+/// Defaults come from the same environment the server node reads (INDEX_ROOT,
+/// STATE_DIR, WOT_OUT, ARCHIVE_DIR, RELAYS, WOT_REFRESH_EVERY,
+/// MAX_OPEN_SHARDS, WRITER_THREADS); flags override them.
+#[derive(Parser, Debug)]
+#[command(name = "ingest", version)]
 struct Args {
+    /// Index output root
+    #[arg(long, value_name = "DIR")]
+    index_root: Option<PathBuf>,
+
+    /// JSONL dumps to backfill (.jsonl/.json/.zst/.gz/.bz2)
+    #[arg(long, value_name = "DIR")]
+    input_dir: Option<PathBuf>,
+
+    /// Live firehose relay (repeatable); appends to $RELAYS
+    #[arg(long = "relays", alias = "relay", value_name = "URL")]
+    relays: Vec<String>,
+
+    /// Also archive firehose events here as .jsonl.zst + id index
+    #[arg(long, value_name = "DIR")]
+    archive_dir: Option<PathBuf>,
+
+    /// Analysis state store
+    #[arg(long, value_name = "DIR")]
+    state_dir: Option<PathBuf>,
+
+    /// Do not persist analysis state
+    #[arg(long, conflicts_with = "state_dir")]
+    no_state: bool,
+
+    /// Also write a WoT snapshot here
+    #[arg(long, value_name = "FILE")]
+    wot_out: Option<PathBuf>,
+
+    /// Do not write a WoT snapshot
+    #[arg(long, conflicts_with = "wot_out")]
+    no_wot_out: bool,
+
+    /// Re-materialize and hot-swap the WoT every N events
+    #[arg(long, value_name = "N")]
+    wot_refresh_every: Option<u64>,
+
+    /// Tantivy writer heap per shard, in MB.
+    ///
+    /// Charged per *open shard*, so this multiplies by --max-open-shards.
+    #[arg(long, value_name = "MB", default_value_t = 64)]
+    heap_mb: usize,
+
+    /// Commit every N docs per shard
+    #[arg(long, value_name = "N", default_value_t = 200_000)]
+    commit_docs: u64,
+
+    /// Checkpoint interval, in seconds.
+    ///
+    /// A kill re-processes at most one checkpoint window. Shorten it when
+    /// restarts are expected; each checkpoint commits every open shard.
+    #[arg(long, value_name = "SECS", default_value_t = 60, value_parser = clap::value_parser!(u64).range(1..))]
+    checkpoint_secs: u64,
+
+    /// Archive files read in parallel [default: available cores]
+    #[arg(long, value_name = "N", default_value_t = 0, hide_default_value = true)]
+    parallelism: usize,
+
+    /// Events per read chunk
+    #[arg(long, value_name = "N", default_value_t = 2_000)]
+    chunk_size: usize,
+
+    /// Disable archive event-id dedup
+    #[arg(long)]
+    no_dedupe: bool,
+
+    /// Shard writers held open; total writer heap is this x --heap-mb
+    #[arg(long, value_name = "N")]
+    max_open_shards: Option<usize>,
+
+    /// Indexing threads per shard; total is this x open shards
+    #[arg(long, value_name = "N")]
+    writer_threads: Option<usize>,
+
+    /// Do not sort batches before indexing
+    #[arg(long)]
+    no_sort: bool,
+
+    /// Full migration: --rebuild-archive-index then --reindex, then ingest
+    #[arg(long)]
+    rebuild: bool,
+
+    /// Rebuild the archive id index first, recording each event's location and
+    /// reframing single-frame dumps so lookups decode one frame (O(n))
+    #[arg(long)]
+    rebuild_archive_index: bool,
+
+    /// Force a full RocksDB compaction of the archive index afterwards
+    #[arg(long)]
+    compact_archive_index: bool,
+
+    /// Wipe the Tantivy index + dedupe store first, then rebuild it from the
+    /// archive. DESTROYS the existing index.
+    #[arg(long)]
+    reindex: bool,
+
+    /// Exit when the backfill finishes.
+    ///
+    /// The default is to idle, because anything with a restart policy of
+    /// Always treats a clean exit as a reason to run the whole ingest again.
+    /// Use this for a batch Job.
+    #[arg(long)]
+    exit_when_done: bool,
+}
+
+/// The parsed arguments, merged with the environment contract.
+///
+/// Defaults live in [`nostrsearch_indexer::env`] rather than in clap's `env`
+/// attribute: the server node reads the same variables through those helpers,
+/// and they treat an empty value as unset, which clap does not. A container
+/// that sets `ARCHIVE_DIR=""` to mean "off" would otherwise get an archive
+/// directory named "".
+struct Config {
     index_root: PathBuf,
     input_dir: Option<PathBuf>,
     relays: Vec<String>,
@@ -55,168 +176,60 @@ struct Args {
     max_open_shards: usize,
     writer_threads: usize,
     sort_batches: bool,
-    /// Rebuild the archive's id index before ingesting.
     rebuild_archive_index: bool,
-    /// Compact the archive index after rebuilding it.
     compact_archive_index: bool,
-    /// Wipe the Tantivy index + dedupe store before ingesting.
     reindex: bool,
-    /// Exit when the work is done instead of idling.
     exit_when_done: bool,
 }
 
-impl Args {
-    fn parse() -> Result<Self, String> {
-        // Defaults come from the same environment contract the server node
-        // uses (INDEX_ROOT, STATE_DIR, WOT_OUT, ARCHIVE_DIR, RELAYS), so the
-        // container image configures every entry point once. Flags override.
+impl Config {
+    fn load() -> Result<Self, String> {
+        Self::from_args(Args::parse())
+    }
+
+    fn from_args(a: Args) -> Result<Self, String> {
         use nostrsearch_indexer::env;
-        let mut index_root = env::index_root();
-        let mut input_dir = None;
+
+        // Relays accumulate: the image sets a baseline in $RELAYS and a flag
+        // adds to it, which is how the two were combined before clap.
         let mut relays = env::relays();
-        let mut archive_dir = env::archive_dir();
-        let mut state_dir = Some(env::state_dir());
-        let mut wot_out = Some(env::wot_out());
-        let mut wot_refresh_every = env::wot_refresh_every();
-        // Charged per *open shard*, so this multiplies by --max-open-shards.
-        // Was 512, which at the default 64 shards is a 32 GB arena.
-        let mut heap_mb = 64usize;
-        let mut commit_docs = 200_000u64;
-        let mut checkpoint_secs = 60u64;
-        let mut parallelism = 0usize;
-        let mut chunk_size = 2_000usize;
-        let mut dedupe = true;
-        let mut max_open_shards = nostrsearch_indexer::env::max_open_shards();
-        let mut writer_threads = nostrsearch_indexer::env::writer_threads();
-        let mut sort_batches = true;
-        let mut rebuild_archive_index = false;
-        let mut compact_archive_index = false;
-        let mut reindex = false;
-        let mut exit_when_done = false;
+        relays.extend(a.relays);
 
-        let mut it = std::env::args().skip(1);
-        while let Some(a) = it.next() {
-            match a.as_str() {
-                "--index-root" => {
-                    index_root = PathBuf::from(it.next().ok_or("--index-root value")?)
-                }
-                "--input-dir" => {
-                    input_dir = Some(PathBuf::from(it.next().ok_or("--input-dir value")?))
-                }
-                "--relays" | "--relay" => relays.push(it.next().ok_or("--relays value")?),
-                "--archive-dir" => {
-                    archive_dir = Some(PathBuf::from(it.next().ok_or("--archive-dir value")?))
-                }
-                "--state-dir" => {
-                    state_dir = Some(PathBuf::from(it.next().ok_or("--state-dir value")?))
-                }
-                "--no-state" => state_dir = None,
-                "--wot-out" => wot_out = Some(PathBuf::from(it.next().ok_or("--wot-out value")?)),
-                "--no-wot-out" => wot_out = None,
-                "--wot-refresh-every" => {
-                    wot_refresh_every = it
-                        .next()
-                        .ok_or("--wot-refresh-every value")?
-                        .parse()
-                        .map_err(|_| "bad wot-refresh-every")?
-                }
-                "--heap-mb" => {
-                    heap_mb = it
-                        .next()
-                        .ok_or("--heap-mb value")?
-                        .parse()
-                        .map_err(|_| "bad heap")?
-                }
-                // A kill re-processes at most one checkpoint window, and any
-                // shard that auto-committed inside it contributes duplicate
-                // documents. Shorten this when restarts are expected; each
-                // checkpoint commits every open shard, so it is not free.
-                "--checkpoint-secs" => {
-                    checkpoint_secs = it
-                        .next()
-                        .ok_or("--checkpoint-secs value")?
-                        .parse()
-                        .map_err(|_| "bad checkpoint-secs")?
-                }
-                "--commit-docs" => {
-                    commit_docs = it
-                        .next()
-                        .ok_or("--commit-docs value")?
-                        .parse()
-                        .map_err(|_| "bad commit-docs")?
-                }
-                "--parallelism" => {
-                    parallelism = it
-                        .next()
-                        .ok_or("--parallelism value")?
-                        .parse()
-                        .map_err(|_| "bad parallelism")?
-                }
-                "--chunk-size" => {
-                    chunk_size = it
-                        .next()
-                        .ok_or("--chunk-size value")?
-                        .parse()
-                        .map_err(|_| "bad chunk-size")?
-                }
-                "--no-dedupe" => dedupe = false,
-                "--max-open-shards" => {
-                    max_open_shards = it
-                        .next()
-                        .ok_or("--max-open-shards value")?
-                        .parse()
-                        .map_err(|_| "bad max-open-shards")?
-                }
-                "--writer-threads" => {
-                    writer_threads = it
-                        .next()
-                        .ok_or("--writer-threads value")?
-                        .parse()
-                        .map_err(|_| "bad writer-threads")?
-                }
-                "--no-sort" => sort_batches = false,
-                // The whole migration, in the order that works.
-                "--rebuild" => {
-                    rebuild_archive_index = true;
-                    reindex = true;
-                }
-                "--rebuild-archive-index" => rebuild_archive_index = true,
-                "--compact-archive-index" => compact_archive_index = true,
-                "--reindex" => reindex = true,
-                "--exit-when-done" => exit_when_done = true,
-                "-h" | "--help" => {
-                    println!("{}", help());
-                    std::process::exit(0);
-                }
-                other => return Err(format!("unknown arg: {other}")),
-            }
-        }
+        let cfg = Self {
+            index_root: a.index_root.unwrap_or_else(env::index_root),
+            input_dir: a.input_dir,
+            relays,
+            archive_dir: a.archive_dir.or_else(env::archive_dir),
+            state_dir: if a.no_state {
+                None
+            } else {
+                Some(a.state_dir.unwrap_or_else(env::state_dir))
+            },
+            wot_out: if a.no_wot_out {
+                None
+            } else {
+                Some(a.wot_out.unwrap_or_else(env::wot_out))
+            },
+            wot_refresh_every: a.wot_refresh_every.unwrap_or_else(env::wot_refresh_every),
+            heap_mb: a.heap_mb,
+            commit_docs: a.commit_docs,
+            checkpoint_secs: a.checkpoint_secs,
+            parallelism: a.parallelism,
+            chunk_size: a.chunk_size,
+            dedupe: !a.no_dedupe,
+            max_open_shards: a.max_open_shards.unwrap_or_else(env::max_open_shards),
+            writer_threads: a.writer_threads.unwrap_or_else(env::writer_threads),
+            sort_batches: !a.no_sort,
+            rebuild_archive_index: a.rebuild_archive_index || a.rebuild,
+            compact_archive_index: a.compact_archive_index,
+            reindex: a.reindex || a.rebuild,
+            exit_when_done: a.exit_when_done,
+        };
 
-        if input_dir.is_none() && relays.is_empty() {
+        if cfg.input_dir.is_none() && cfg.relays.is_empty() {
             return Err("provide --input-dir <dir> and/or --relays <url>".into());
         }
-        Ok(Self {
-            index_root,
-            input_dir,
-            relays,
-            archive_dir,
-            state_dir,
-            wot_out,
-            wot_refresh_every,
-            heap_mb,
-            commit_docs,
-            checkpoint_secs: checkpoint_secs.max(1),
-            parallelism,
-            chunk_size,
-            dedupe,
-            max_open_shards,
-            writer_threads,
-            sort_batches,
-            rebuild_archive_index,
-            compact_archive_index,
-            reindex,
-            exit_when_done,
-        })
+        Ok(cfg)
     }
 
     /// Directory holding the archive dumps + their id index.
@@ -230,50 +243,11 @@ impl Args {
     }
 }
 
-fn help() -> String {
-    "nostrsearch unified ingest (archive + firehose → index + stats/WoT)\n\
-     \n\
-     Defaults are read from the same env vars as the server node:\n\
-     INDEX_ROOT, STATE_DIR, WOT_OUT, ARCHIVE_DIR, RELAYS, WOT_REFRESH_EVERY.\n\
-     Flags below override them.\n\
-     \n\
-     --index-root <dir>        index output root ($INDEX_ROOT, ./data/index)\n\
-     --input-dir <dir>         JSONL dumps to backfill (.jsonl/.json/.zst/.gz/.bz2)\n\
-     --relays <url>            live firehose relay (repeatable)\n\
-     --archive-dir <dir>       ALSO archive firehose events as .jsonl.zst + id index\n\
-     \x20                        (absorbs nostrhole: produces the hole.v0l.io corpus)\n\
-     --state-dir <dir>         analysis state store (default ./data/stats)  | --no-state\n\
-     --wot-out <file>          also write WoT snapshot here (default ./data/wot.bin) | --no-wot-out\n\
-     --wot-refresh-every <n>   re-materialize + hot-swap WoT every N events (default 1000000)\n\
-     --heap-mb <n>             tantivy writer heap per shard (default 512)\n\
-     --commit-docs <n>         commit every N docs per shard (default 200000)\n\
-     --parallelism <n>         archive files read in parallel (default: num cores)\n\
-     --chunk-size <n>          events per read chunk (default 2000)\n\
-     --no-dedupe               disable archive event-id dedup\n\
-     --max-open-shards <n>     shard writers held open ($MAX_OPEN_SHARDS, 64);\n\
-     \x20                        total writer heap is n x --heap-mb\n\
-     --writer-threads <n>      indexing threads per shard ($WRITER_THREADS, 1);\n\
-     \x20                        total threads is n x open shards\n\
-     \n\
-     Rebuilds (run before ingest, in this order):\n\
-     --rebuild                 --rebuild-archive-index + --reindex: the full\n\
-     \x20                        migration after an archive-cursor or schema change\n\
-     --rebuild-archive-index   rebuild the archive id index first, recording each\n\
-     \x20                        event's location and reframing single-frame dumps\n\
-     \x20                        so lookups decode one frame, not a whole file (O(n))\n\
-     --compact-archive-index   also force a full RocksDB compaction afterwards\n\
-     --reindex                 wipe the Tantivy index + dedupe store first, then\n\
-     \x20                        rebuild it from the archive (required after a\n\
-     \x20                        schema change; DESTROYS the existing index)\n\
-     \n\
-     --exit-when-done          exit once the backfill finishes. The default is to\n\
-     \x20                        idle instead, because a Deployment restarts a\n\
-     \x20                        container that exits 0 and would re-run the whole\n\
-     \x20                        ingest forever. Use this for a batch Job."
-        .to_string()
-}
-
 fn main() -> anyhow::Result<()> {
+    // Arguments first: `--help` and `--version` exit here, and doing it before
+    // the subscriber is installed keeps them free of log lines.
+    let args = Config::load().map_err(anyhow::Error::msg)?;
+
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();
@@ -296,8 +270,6 @@ fn main() -> anyhow::Result<()> {
         nofile_hard = hard,
         "file descriptor limit"
     );
-
-    let args = Args::parse().map_err(anyhow::Error::msg)?;
 
     // ── Phase 0: rebuilds, before anything opens the index ─────────────────
     // Both run here rather than inside `run()` because they must happen before
@@ -380,7 +352,7 @@ fn main() -> anyhow::Result<()> {
 ///
 /// O(n) over the corpus: hours on a 763 GiB archive. Deliberately explicit,
 /// never automatic.
-fn rebuild_archive_index(args: &Args) -> anyhow::Result<()> {
+fn rebuild_archive_index(args: &Config) -> anyhow::Result<()> {
     let Some(dir) = args.archive_index_dir() else {
         anyhow::bail!("--rebuild-archive-index needs --archive-dir or --input-dir");
     };
@@ -428,7 +400,7 @@ fn rebuild_archive_index(args: &Args) -> anyhow::Result<()> {
 ///
 /// Only shard directories (`YYYY-MM`) and `.dedupe` are removed; anything else
 /// under the root belongs to someone else and is left alone.
-fn wipe_index(args: &Args) -> anyhow::Result<()> {
+fn wipe_index(args: &Config) -> anyhow::Result<()> {
     if args.input_dir.is_none() {
         anyhow::bail!(
             "--reindex without --input-dir would delete the index and have nothing \
@@ -458,7 +430,7 @@ fn wipe_index(args: &Args) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
+async fn run(args: Config, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
     let total = Arc::new(AtomicU64::new(0));
     // The engine's live counters, shared with the progress reporter below.
     // Reporting off `total` alone would print nothing until the run ended,
