@@ -29,6 +29,7 @@ use crate::id_store::IdStore;
 use crate::pipeline::Pipeline;
 use nostr_archive_cursor::NostrCursor;
 use nostrsearch_core::event::NostrEvent;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -111,7 +112,7 @@ pub async fn ingest(
     pipeline: Arc<Mutex<Pipeline>>,
     opts: IngestOptions,
     id_store: Option<Arc<IdStore>>,
-    pending_ids: Arc<Mutex<Vec<[u8; 32]>>>,
+    pending_ids: Arc<Mutex<HashSet<[u8; 32]>>>,
     progress: Arc<IngestProgress>,
     cancel: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
@@ -208,7 +209,14 @@ pub async fn ingest(
         let indexer = pipeline.lock().unwrap().indexer();
 
         tokio::task::spawn_blocking(move || {
-            let cursor = NostrCursor::new(input_dir).with_parallelism(parallelism);
+            // The cursor's own dedupe keeps every event id it has seen in a
+            // DashMap, which for a corpus this size is tens of gigabytes of
+            // resident memory and the reason ingest kept being OOM-killed.
+            // IdStore does the same job on disk and survives restarts, so the
+            // in-memory copy is redundant as well as fatal.
+            let cursor = NostrCursor::new(input_dir)
+                .with_parallelism(parallelism)
+                .with_dedupe(false);
             cursor.walk_with_chunked_sync(
                 move |events: Vec<nostr_archive_cursor::NostrEventBorrowed>| {
                     if cancel_cb.load(Ordering::Relaxed) {
@@ -234,14 +242,20 @@ pub async fn ingest(
                         let known = store.contains_batch(&ids);
                         let mut keep = Vec::with_capacity(batch.len());
                         new_ids.reserve(batch.len());
+                        // Ids indexed since the last checkpoint are not in the
+                        // store yet. Without checking them too, a duplicate
+                        // arriving inside the checkpoint window is indexed
+                        // twice -- and tantivy has no unique key to catch it.
+                        let pend = ck_pending.lock().unwrap();
                         for ((ev, id), known) in batch.into_iter().zip(ids).zip(known) {
-                            if known {
+                            if known || pend.contains(&id) {
                                 skipped += 1;
                             } else {
                                 keep.push(ev);
                                 new_ids.push(id);
                             }
                         }
+                        drop(pend);
                         batch = keep;
                         prog.skipped.fetch_add(skipped, Ordering::Relaxed);
                     }

@@ -300,7 +300,8 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
     // durable. A hard kill therefore re-processes at most one checkpoint
     // window — redundant work, never holes; duplicates only if a shard
     // happened to auto-commit inside that window.
-    let pending_ids: Arc<Mutex<Vec<[u8; 32]>>> = Arc::new(Mutex::new(Vec::new()));
+    let pending_ids: Arc<Mutex<std::collections::HashSet<[u8; 32]>>> =
+        Arc::new(Mutex::new(std::collections::HashSet::new()));
 
     // In a container this binary is PID 1, and PID 1 ignores SIGTERM unless a
     // handler is installed — so `kubectl delete` / probe kills hung for the
