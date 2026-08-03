@@ -74,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
     if let Some(limit) = nostrsearch_indexer::mem::cgroup_limit_mb() {
         tracing::info!(limit_mb = limit, "cgroup memory limit");
     }
-    let bind = std::env::var("BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
+    let bind = env::bind().unwrap_or_else(|| "0.0.0.0:8080".into());
     let archive_dir = env::archive_dir();
     let relays = env::relays();
     let want_relay = env::flag("ENABLE_RELAY");

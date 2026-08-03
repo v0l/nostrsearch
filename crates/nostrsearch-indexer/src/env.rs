@@ -11,6 +11,7 @@
 //! | `WOT_OUT` | web-of-trust snapshot path | `./data/wot.bin` |
 //! | `ARCHIVE_DIR` | `.jsonl.zst` corpus + id index | unset |
 //! | `RELAYS` | comma-separated upstream relays | unset |
+//! | `BIND` | HTTP listen address | `0.0.0.0:8080` (server), off (ingest) |
 //! | `MAX_OPEN_SHARDS` | shard writers held open | `64` |
 //! | `WOT_REFRESH_EVERY` | events between WoT rebuilds | `100000` |
 //! | `WOT_MIN_REFRESH_SECS` | wall-clock floor between rebuilds | `60` |
@@ -84,6 +85,16 @@ pub fn archive_dir() -> Option<PathBuf> {
 
 pub fn relays() -> Vec<String> {
     list("RELAYS")
+}
+
+/// HTTP listen address (`BIND`), or `None` when unset.
+///
+/// The server node defaults this to `0.0.0.0:8080`; `ingest` serves nothing
+/// unless it is set (or `--bind` is passed), because most ingests are batch
+/// jobs. Both read the same variable, so a container that sets it once gets a
+/// port from whichever entry point it runs.
+pub fn bind() -> Option<String> {
+    non_empty("BIND")
 }
 
 /// Shard writers held open at once (`MAX_OPEN_SHARDS`, 64). Total writer heap

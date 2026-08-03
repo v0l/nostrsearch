@@ -22,7 +22,6 @@
 use axum::Router;
 use axum::response::Html;
 use axum::routing::get;
-use std::net::SocketAddr;
 use std::path::Path;
 
 /// Routes for the ingest-time service: landing page, health, archive files.
@@ -48,7 +47,7 @@ pub fn router(archive_dir: Option<&Path>) -> anyhow::Result<Router> {
 /// the server runs on the same runtime as the ingest. A bind failure is
 /// returned rather than logged, because a port that is already taken usually
 /// means a second ingest is running against the same index.
-pub async fn spawn(bind: SocketAddr, archive_dir: Option<&Path>) -> anyhow::Result<()> {
+pub async fn spawn(bind: &str, archive_dir: Option<&Path>) -> anyhow::Result<()> {
     let app = router(archive_dir)?;
     let listener = tokio::net::TcpListener::bind(bind).await?;
     let local = listener.local_addr()?;

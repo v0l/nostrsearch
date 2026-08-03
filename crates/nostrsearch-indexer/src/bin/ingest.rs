@@ -145,10 +145,11 @@ struct Args {
 
     /// Serve a status page and the archive files on this address.
     ///
-    /// Off by default. A backfill takes hours, and for that whole time the
+    /// Defaults to $BIND, the same variable the server node reads; off when
+    /// neither is set. A backfill takes hours, and for that whole time the
     /// node would otherwise refuse connections on its port.
     #[arg(long, value_name = "ADDR")]
-    bind: Option<std::net::SocketAddr>,
+    bind: Option<String>,
 
     /// Exit when the backfill finishes.
     ///
@@ -187,7 +188,7 @@ struct Config {
     compact_archive_index: bool,
     reindex: bool,
     exit_when_done: bool,
-    bind: Option<std::net::SocketAddr>,
+    bind: Option<String>,
 }
 
 impl Config {
@@ -232,7 +233,7 @@ impl Config {
             compact_archive_index: a.compact_archive_index,
             reindex: a.reindex || a.rebuild,
             exit_when_done: a.exit_when_done,
-            bind: a.bind,
+            bind: a.bind.or_else(env::bind),
         };
 
         if cfg.input_dir.is_none() && cfg.relays.is_empty() {
@@ -279,6 +280,21 @@ fn main() -> anyhow::Result<()> {
         nofile_hard = hard,
         "file descriptor limit"
     );
+
+    // The runtime comes up first so the status service can be listening before
+    // any of the long work starts. The rebuilds below are blocking, but they
+    // run on this thread while the runtime's workers serve HTTP, so the port
+    // answers throughout — a rebuild is the longest phase there is, and it was
+    // the phase most likely to be mistaken for a hung container.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    if let Some(bind) = args.bind.as_deref() {
+        rt.block_on(nostrsearch_indexer::serve::spawn(
+            bind,
+            args.archive_index_dir().map(|p| p.as_path()),
+        ))?;
+    }
 
     // ── Phase 0: rebuilds, before anything opens the index ─────────────────
     // Both run here rather than inside `run()` because they must happen before
@@ -343,9 +359,6 @@ fn main() -> anyhow::Result<()> {
     }
     let pipeline = Arc::new(Mutex::new(pipeline));
 
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()?;
     rt.block_on(run(args, pipeline))
 }
 
@@ -440,14 +453,6 @@ fn wipe_index(args: &Config) -> anyhow::Result<()> {
 }
 
 async fn run(args: Config, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
-    // Before any of the long work, so the port answers for the whole run and a
-    // bind conflict (usually a second ingest on the same index) fails here
-    // rather than hours in.
-    if let Some(bind) = args.bind {
-        nostrsearch_indexer::serve::spawn(bind, args.archive_index_dir().map(|p| p.as_path()))
-            .await?;
-    }
-
     let total = Arc::new(AtomicU64::new(0));
     // The engine's live counters, shared with the progress reporter below.
     // Reporting off `total` alone would print nothing until the run ended,
