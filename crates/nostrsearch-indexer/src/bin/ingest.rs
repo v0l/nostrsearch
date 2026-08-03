@@ -13,6 +13,24 @@
 //!   ingest --index-root ./data/index --input-dir ./dumps
 //!   ingest --index-root ./data/index --relays wss://relay.damus.io --relays wss://nos.lol
 //!   ingest --index-root ./data/index --input-dir ./dumps --relays wss://relay.damus.io
+//!
+//! ## Full rebuild
+//!
+//! `--rebuild` runs both migrations in the only order that works, then the
+//! normal backfill:
+//!
+//!   1. rebuild the **archive** id index, so every event's location (shard +
+//!      frame offset) is recorded and single-frame imports are reframed;
+//!   2. wipe the **Tantivy** index and the dedupe store;
+//!   3. re-ingest the corpus into a fresh index.
+//!
+//! ```text
+//! ingest --index-root ./data/index --input-dir ./dumps --rebuild
+//! ```
+//!
+//! Step 1 is what makes an event fetchable by id without scanning; step 2
+//! starts the Tantivy index from empty so the pass rebuilds it rather than
+//! adding to what is already there.
 
 use nostrsearch_indexer::{Pipeline, PipelineConfig, ShardWriterConfig};
 use std::path::PathBuf;
@@ -37,6 +55,14 @@ struct Args {
     max_open_shards: usize,
     writer_threads: usize,
     sort_batches: bool,
+    /// Rebuild the archive's id index before ingesting.
+    rebuild_archive_index: bool,
+    /// Compact the archive index after rebuilding it.
+    compact_archive_index: bool,
+    /// Wipe the Tantivy index + dedupe store before ingesting.
+    reindex: bool,
+    /// Exit when the work is done instead of idling.
+    exit_when_done: bool,
 }
 
 impl Args {
@@ -63,6 +89,10 @@ impl Args {
         let mut max_open_shards = nostrsearch_indexer::env::max_open_shards();
         let mut writer_threads = nostrsearch_indexer::env::writer_threads();
         let mut sort_batches = true;
+        let mut rebuild_archive_index = false;
+        let mut compact_archive_index = false;
+        let mut reindex = false;
+        let mut exit_when_done = false;
 
         let mut it = std::env::args().skip(1);
         while let Some(a) = it.next() {
@@ -145,6 +175,15 @@ impl Args {
                         .map_err(|_| "bad writer-threads")?
                 }
                 "--no-sort" => sort_batches = false,
+                // The whole migration, in the order that works.
+                "--rebuild" => {
+                    rebuild_archive_index = true;
+                    reindex = true;
+                }
+                "--rebuild-archive-index" => rebuild_archive_index = true,
+                "--compact-archive-index" => compact_archive_index = true,
+                "--reindex" => reindex = true,
+                "--exit-when-done" => exit_when_done = true,
                 "-h" | "--help" => {
                     println!("{}", help());
                     std::process::exit(0);
@@ -173,7 +212,21 @@ impl Args {
             max_open_shards,
             writer_threads,
             sort_batches,
+            rebuild_archive_index,
+            compact_archive_index,
+            reindex,
+            exit_when_done,
         })
+    }
+
+    /// Directory holding the archive dumps + their id index.
+    ///
+    /// `--archive-dir` when set (the firehose's own corpus), otherwise the
+    /// backfill source: in the unified deployment they are the same directory,
+    /// and rebuilding the index of a directory we are not reading would be a
+    /// silent no-op.
+    fn archive_index_dir(&self) -> Option<&PathBuf> {
+        self.archive_dir.as_ref().or(self.input_dir.as_ref())
     }
 }
 
@@ -200,7 +253,23 @@ fn help() -> String {
      --max-open-shards <n>     shard writers held open ($MAX_OPEN_SHARDS, 64);\n\
      \x20                        total writer heap is n x --heap-mb\n\
      --writer-threads <n>      indexing threads per shard ($WRITER_THREADS, 1);\n\
-     \x20                        total threads is n x open shards"
+     \x20                        total threads is n x open shards\n\
+     \n\
+     Rebuilds (run before ingest, in this order):\n\
+     --rebuild                 --rebuild-archive-index + --reindex: the full\n\
+     \x20                        migration after an archive-cursor or schema change\n\
+     --rebuild-archive-index   rebuild the archive id index first, recording each\n\
+     \x20                        event's location and reframing single-frame dumps\n\
+     \x20                        so lookups decode one frame, not a whole file (O(n))\n\
+     --compact-archive-index   also force a full RocksDB compaction afterwards\n\
+     --reindex                 wipe the Tantivy index + dedupe store first, then\n\
+     \x20                        rebuild it from the archive (required after a\n\
+     \x20                        schema change; DESTROYS the existing index)\n\
+     \n\
+     --exit-when-done          exit once the backfill finishes. The default is to\n\
+     \x20                        idle instead, because a Deployment restarts a\n\
+     \x20                        container that exits 0 and would re-run the whole\n\
+     \x20                        ingest forever. Use this for a batch Job."
         .to_string()
 }
 
@@ -209,10 +278,15 @@ fn main() -> anyhow::Result<()> {
         .install_default()
         .ok();
 
+    // `ingest=info` covers this binary's own logs: a bin's tracing target is
+    // its crate name, so a filter listing only the libraries silently hides
+    // every line the CLI itself emits -- including the rebuild progress and
+    // the warning that the index was wiped.
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "nostrsearch=info,nostr_archive_cursor=warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "nostrsearch=info,ingest=info,nostr_archive_cursor=warn".into()
+            }),
         )
         .init();
 
@@ -224,6 +298,17 @@ fn main() -> anyhow::Result<()> {
     );
 
     let args = Args::parse().map_err(anyhow::Error::msg)?;
+
+    // ── Phase 0: rebuilds, before anything opens the index ─────────────────
+    // Both run here rather than inside `run()` because they must happen before
+    // `Pipeline::new` takes the index root, and because the archive rebuild is
+    // long, blocking, single-threaded work with no reason to hold a runtime.
+    if args.rebuild_archive_index {
+        rebuild_archive_index(&args)?;
+    }
+    if args.reindex {
+        wipe_index(&args)?;
+    }
 
     let cfg = PipelineConfig {
         index_root: args.index_root.clone(),
@@ -267,12 +352,110 @@ fn main() -> anyhow::Result<()> {
         "writer heap budget"
     );
 
-    let pipeline = Arc::new(Mutex::new(Pipeline::new(cfg)?));
+    let mut pipeline = Pipeline::new(cfg)?;
+    if args.reindex {
+        // The analyses fold every event they see. Replaying the whole corpus
+        // over state that already counted it would double every total, so a
+        // reindex resets them and lets them rebuild from the same pass.
+        let reset = pipeline.reset_all_analyses();
+        tracing::info!(analyses = ?reset, "reset analyses for reindex");
+    }
+    let pipeline = Arc::new(Mutex::new(pipeline));
 
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     rt.block_on(run(args, pipeline))
+}
+
+/// Rebuild the archive's id index from every dump in the directory.
+///
+/// Index values now record *where* each event lives (shard + frame offset +
+/// length), which is what lets a search hit be hydrated into a complete signed
+/// event without scanning the corpus. An index written by an older version
+/// still opens and still dedupes, but it carries no locations, so this is the
+/// migration that makes lookups O(1). It also reframes archives that are one
+/// giant zstd frame -- the usual shape of a dump produced elsewhere -- because
+/// otherwise every lookup into them decompresses from byte zero.
+///
+/// O(n) over the corpus: hours on a 763 GiB archive. Deliberately explicit,
+/// never automatic.
+fn rebuild_archive_index(args: &Args) -> anyhow::Result<()> {
+    let Some(dir) = args.archive_index_dir() else {
+        anyhow::bail!("--rebuild-archive-index needs --archive-dir or --input-dir");
+    };
+    if !dir.is_dir() {
+        anyhow::bail!("archive dir {} is not a directory", dir.display());
+    }
+
+    let started = Instant::now();
+    tracing::info!(dir = %dir.display(), "rebuilding archive id index (O(n) over the corpus)");
+
+    let index = nostr_archive_cursor::RocksDbIndex::open(dir.join("index-rocksdb"))?;
+    let mut db: nostr_archive_cursor::DefaultJsonFilesDatabase =
+        nostr_archive_cursor::JsonFilesDatabase::new_with_index(dir, index.clone())?;
+
+    // Frame sidecars first: without them a rebuilt index records offsets into
+    // shards nobody can seek into.
+    let built = db.rebuild_missing_frame_indexes();
+    if built > 0 {
+        tracing::info!(shards = built, "built missing frame sidecars");
+    }
+    db.rebuild_index()?;
+    tracing::info!(
+        events = db.count_keys(),
+        elapsed_s = format!("{:.0}", started.elapsed().as_secs_f64()),
+        "archive id index rebuilt"
+    );
+
+    if args.compact_archive_index {
+        // Data written by older versions is uncompressed, and RocksDB will not
+        // rewrite it on its own (manual compaction skips the bottommost level,
+        // which in a mostly-static index is where everything lives).
+        tracing::info!("compacting the archive index");
+        index.compact();
+        tracing::info!("archive index compaction complete");
+    }
+    Ok(())
+}
+
+/// Delete the Tantivy shards and the dedupe store so the next pass rebuilds
+/// them from scratch.
+///
+/// The dedupe store goes with them: it records what has already been indexed,
+/// so leaving it behind would make the rebuild skip the entire corpus it is
+/// supposed to re-add.
+///
+/// Only shard directories (`YYYY-MM`) and `.dedupe` are removed; anything else
+/// under the root belongs to someone else and is left alone.
+fn wipe_index(args: &Args) -> anyhow::Result<()> {
+    if args.input_dir.is_none() {
+        anyhow::bail!(
+            "--reindex without --input-dir would delete the index and have nothing \
+             to rebuild it from"
+        );
+    }
+    let root = &args.index_root;
+    if !root.exists() {
+        return Ok(());
+    }
+
+    let mut removed = 0usize;
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        let is_shard = nostrsearch_core::shard::ShardId::parse(&name).is_some();
+        if (is_shard || name == ".dedupe") && entry.path().is_dir() {
+            std::fs::remove_dir_all(entry.path())?;
+            removed += 1;
+        }
+    }
+    tracing::warn!(
+        root = %root.display(),
+        removed,
+        "wiped the index for a full reindex"
+    );
+    Ok(())
 }
 
 async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
@@ -283,6 +466,10 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
     let progress =
         std::sync::Arc::new(nostrsearch_indexer::archive_ingest::IngestProgress::default());
     let started = Instant::now();
+    // Set once the work is finished, so the progress reporter stops rather
+    // than printing the same final line every 5s for as long as the process
+    // idles.
+    let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Persistent event-id dedupe, so a restarted backfill resumes instead of
     // duplicating everything (Tantivy has no unique key on writes). Lives
@@ -365,9 +552,13 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
         });
 
         let stage_pipe = pipeline.clone();
+        let reporter_done = finished.clone();
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(5));
+                if reporter_done.load(Ordering::Relaxed) {
+                    return;
+                }
                 // Prefer the engine's live count; fall back to the final
                 // total once the run has handed it over.
                 let live_n = live.indexed.load(Ordering::Relaxed);
@@ -511,11 +702,34 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
 
     let done = total.load(Ordering::Relaxed);
     let secs = started.elapsed().as_secs_f64();
+    finished.store(true, Ordering::Relaxed);
     println!(
         "ingest complete: {} events in {:.1}s = {:.0}/s",
         done,
         secs,
         done as f64 / secs
     );
-    Ok(())
+
+    if args.exit_when_done {
+        return Ok(());
+    }
+
+    // Everything is committed and flushed; from here the process exists only
+    // to stay alive.
+    //
+    // Exiting 0 is the wrong end state under a Deployment: the container is
+    // restarted, and a restarted ingest re-walks the entire corpus. The dedupe
+    // store means that is redundant work rather than duplicate documents, but
+    // on a 763 GiB archive it is hours of IO per restart, forever. Idling makes
+    // the pod a no-op until something actually asks it to stop.
+    //
+    // SIGTERM is still handled (the task installed above flushes and exits
+    // 143), so `kubectl delete` / `rollout restart` terminate promptly.
+    tracing::info!(
+        "ingest finished; idling (pass --exit-when-done to exit instead). \
+         SIGTERM will shut down cleanly."
+    );
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+    }
 }

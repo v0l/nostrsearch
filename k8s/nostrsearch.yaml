@@ -224,6 +224,16 @@ spec:
 #   kubectl -n nostrsearch logs -f job/nostrsearch-ingest
 #   kubectl -n nostrsearch scale deploy/nostrsearch --replicas=1
 #
+# `--exit-when-done` below matters for the Job form: by default the ingest
+# binary idles once it finishes instead of exiting, because anything with a
+# restart policy of Always treats a clean exit as a reason to run the whole
+# backfill again. A Job wants the opposite -- exit so it can be marked
+# complete.
+#
+# To rebuild after an archive-cursor change, add `--rebuild`: it rebuilds the
+# archive id index (recording each event's location) and then reindexes into a
+# fresh Tantivy index. It is O(corpus) twice over, so run it deliberately.
+#
 # ---
 # apiVersion: batch/v1
 # kind: Job
@@ -261,6 +271,8 @@ spec:
 #             - "64"
 #             - "--heap-mb"
 #             - "64"
+#             # A Job should finish; the default is to idle (see above).
+#             - "--exit-when-done"
 #           env:
 #             - name: RUST_LOG
 #               value: nostrsearch=info,nostr_archive_cursor=info
