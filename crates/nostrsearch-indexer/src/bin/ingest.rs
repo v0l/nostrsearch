@@ -376,13 +376,20 @@ async fn run(args: Args, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()> {
                 } else {
                     total_prog.load(Ordering::Relaxed)
                 };
-                let stages = stage_pipe
+                // Serial fold time comes from the pipeline; the reader stages
+                // are summed across threads, so they are thread-seconds and are
+                // labelled to say so. Reporting only the fold made every
+                // slowdown look like the fold.
+                let fold = stage_pipe
                     .try_lock()
-                    .map(|p| {
-                        let (st, ix) = p.stage_secs();
-                        format!("  stats={st:.0}s index={ix:.0}s")
-                    })
+                    .map(|p| format!("  fold={:.0}s", p.stage_secs().0))
                     .unwrap_or_default();
+                let stages = format!(
+                    "{fold}  [thread-s parse={:.0} dedupe={:.0} index={:.0}]",
+                    live.parse_ns.load(Ordering::Relaxed) as f64 / 1e9,
+                    live.dedupe_ns.load(Ordering::Relaxed) as f64 / 1e9,
+                    live.index_ns.load(Ordering::Relaxed) as f64 / 1e9,
+                );
                 if done > 0 {
                     let rate = done as f64 / started.elapsed().as_secs_f64();
                     let (rss, peak) = nostrsearch_indexer::mem::rss_mb();

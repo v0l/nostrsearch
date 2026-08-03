@@ -94,6 +94,20 @@ pub struct IngestProgress {
     /// Events the indexer rejected. These keep their ids unclaimed, so a
     /// later run over the same archive will retry them.
     pub failed: AtomicU64,
+
+    // Time attribution for the reader threads, in nanoseconds summed across
+    // them -- thread-time, not wall time, so compare them against each other
+    // and against `parallelism × elapsed`, not against elapsed alone.
+    //
+    // Without these the only measured stage is the serial fold, which makes
+    // every slowdown look like the fold by default and leaves the rest of the
+    // pipeline as one unattributed lump.
+    /// Deserializing archive lines into owned events.
+    pub parse_ns: AtomicU64,
+    /// Id-store lookups deciding what is already indexed.
+    pub dedupe_ns: AtomicU64,
+    /// Building documents and handing them to shard writers.
+    pub index_ns: AtomicU64,
     pub running: AtomicBool,
     pub finished_at: AtomicU64,
 }
@@ -222,7 +236,10 @@ pub async fn ingest(
                     if cancel_cb.load(Ordering::Relaxed) {
                         return;
                     }
+                    let t_parse = std::time::Instant::now();
                     let mut batch: Vec<NostrEvent> = events.iter().map(to_core).collect();
+                    prog.parse_ns
+                        .fetch_add(t_parse.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     if sort_batches {
                         batch.sort_unstable_by_key(|e| e.created_at);
                     }
@@ -234,6 +251,7 @@ pub async fn ingest(
                     // Ids of the events kept, positionally aligned with
                     // `batch`. Claimed only once their documents exist.
                     let mut new_ids: Vec<[u8; 32]> = Vec::new();
+                    let t_dedupe = std::time::Instant::now();
                     if let Some(store) = &ck_store {
                         let ids: Vec<[u8; 32]> = batch
                             .iter()
@@ -259,6 +277,8 @@ pub async fn ingest(
                         batch = keep;
                         prog.skipped.fetch_add(skipped, Ordering::Relaxed);
                     }
+                    prog.dedupe_ns
+                        .fetch_add(t_dedupe.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
                     // Fold under the pipeline lock. This mutates per-analysis
                     // state so it must be serial, but it is only hashmap work.
@@ -280,6 +300,7 @@ pub async fn ingest(
                         // fails here is recorded as done and skipped by every
                         // later run: the archive still has the event, but
                         // nothing will ever look at it again.
+                        let t_index = std::time::Instant::now();
                         let mut ok_ids = Vec::with_capacity(new_ids.len());
                         let mut failed = 0u64;
                         for (i, ev) in batch.iter().enumerate() {
@@ -301,6 +322,8 @@ pub async fn ingest(
                         let ok = batch.len() as u64 - failed;
                         prog.indexed.fetch_add(ok, Ordering::Relaxed);
                         prog.failed.fetch_add(failed, Ordering::Relaxed);
+                        prog.index_ns
+                            .fetch_add(t_index.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     }
                 },
                 chunk_size,
