@@ -90,12 +90,14 @@ impl ArchiveState {
                     indexed,
                     reframed,
                     new_events,
+                    repaired,
                 }) => tracing::info!(
                     shards,
                     unchanged,
                     indexed,
                     reframed,
                     new_events,
+                    repaired,
                     "archive shard indexing pass complete"
                 ),
                 Err(e) => tracing::error!(error = %e, "archive shard indexing failed"),
