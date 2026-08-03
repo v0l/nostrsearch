@@ -8,6 +8,7 @@
 //! Routes:
 //! - `GET /archive`            — HTML listing of archive files + totals
 //! - `GET /archive/files`      — JSON listing (name, size, timestamp)
+//! - `GET /archive/event/{id}` — one event by id, straight from the index
 //! - `GET /archive/{file}`     — stream one archive file
 
 use axum::body::Body;
@@ -16,7 +17,8 @@ use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use nostr_archive_cursor::DefaultJsonFilesDatabase;
+use nostr_archive_cursor::{DefaultJsonFilesDatabase, IndexReport};
+use nostr_sdk::prelude::EventId;
 use serde::Serialize;
 use std::sync::Arc;
 use tokio_util::io::ReaderStream;
@@ -60,6 +62,81 @@ impl ArchiveState {
     pub fn event_count(&self) -> Option<u64> {
         self.db.as_ref().map(|d| d.count_keys())
     }
+
+    /// Index shards that appeared or changed since the last pass, in the
+    /// background.
+    ///
+    /// The index now stores *where* each event lives (shard + offset), so a
+    /// shard dropped into the directory by an external backup has to be read
+    /// once before its events can be fetched by id. This is incremental —
+    /// unchanged shards cost one `stat` each — so it is safe on every start,
+    /// unlike the O(n) `rebuild_index`.
+    ///
+    /// No-op without the index lock.
+    pub fn spawn_index_new_shards(&self) -> Option<tokio::task::JoinHandle<()>> {
+        let db = self.db.clone()?;
+        Some(tokio::task::spawn_blocking(move || {
+            match db.index_new_shards() {
+                Ok(IndexReport {
+                    shards,
+                    unchanged,
+                    indexed,
+                    reframed,
+                    new_events,
+                }) => tracing::info!(
+                    shards,
+                    unchanged,
+                    indexed,
+                    reframed,
+                    new_events,
+                    "archive shard indexing pass complete"
+                ),
+                Err(e) => tracing::error!(error = %e, "archive shard indexing failed"),
+            }
+        }))
+    }
+
+    /// Fetch one event's raw JSON line by id. `None` when this process has no
+    /// index, or the archive does not hold the event.
+    pub async fn event_raw(&self, id: &EventId) -> Option<Vec<u8>> {
+        self.db.as_ref()?.get_raw(id).await
+    }
+
+    /// Fetch many events by hex id, in the order given.
+    ///
+    /// This is what turns a search hit into something a client can verify: the
+    /// index holds no `tags` and no `sig`, so the signed event has to come
+    /// from the corpus. Batched deliberately -- one index `multi_get`, reads
+    /// grouped by (shard, frame) so each frame is decoded once for the whole
+    /// page, on the blocking pool.
+    pub async fn events_by_hex_ids(&self, ids: &[String]) -> Vec<Option<serde_json::Value>> {
+        let Some(db) = self.db.as_ref() else {
+            return vec![None; ids.len()];
+        };
+        // Keep the mapping from request position to the ids we could parse, so
+        // a malformed id yields `None` in its own slot rather than shifting
+        // every later event onto the wrong hit.
+        let mut slots: Vec<Option<usize>> = Vec::with_capacity(ids.len());
+        let mut wanted: Vec<EventId> = Vec::with_capacity(ids.len());
+        for id in ids {
+            match EventId::from_hex(id) {
+                Ok(eid) => {
+                    slots.push(Some(wanted.len()));
+                    wanted.push(eid);
+                }
+                Err(_) => slots.push(None),
+            }
+        }
+
+        let raws = db.get_many_raw(&wanted).await;
+        slots
+            .into_iter()
+            .map(|slot| {
+                let raw = raws.get(slot?)?.as_ref()?;
+                serde_json::from_slice(raw).ok()
+            })
+            .collect()
+    }
 }
 
 #[derive(Serialize)]
@@ -75,6 +152,7 @@ pub fn router(state: ArchiveState) -> Router {
         .route("/", get(index))
         .route("/files", get(files_json))
         .route("/stats", get(stats_json))
+        .route("/event/{id}", get(serve_event))
         .route("/{file}", get(serve_file))
         .with_state(state)
 }
@@ -185,6 +263,36 @@ async fn list(st: &ArchiveState) -> Result<Vec<ArchiveFileInfo>, Response> {
             .into_response()
     })?;
     Ok(entries)
+}
+
+/// `GET /archive/event/{id}`
+///
+/// One event, by hex id, as its original JSON line. Served from the id index:
+/// the index value records the shard, frame offset and length, so this reads
+/// and decodes a single frame rather than scanning the corpus.
+async fn serve_event(
+    State(st): State<ArchiveState>,
+    AxPath(id): AxPath<String>,
+) -> Result<Response, Response> {
+    if st.db.is_none() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            "this node does not hold the archive index",
+        )
+            .into_response());
+    }
+    let id = EventId::from_hex(id.trim())
+        .map_err(|_| (StatusCode::BAD_REQUEST, "invalid event id").into_response())?;
+    let raw = st
+        .event_raw(&id)
+        .await
+        .ok_or_else(|| (StatusCode::NOT_FOUND, "no such event").into_response())?;
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        raw,
+    )
+        .into_response())
 }
 
 /// Stream one archive file by name.

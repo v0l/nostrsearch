@@ -103,6 +103,10 @@ async fn main() -> anyhow::Result<()> {
     };
     if let Some(a) = &archive {
         tracing::info!(dir = %a.dir.display(), indexed = a.db.is_some(), "serving archive at /archive");
+        // Pick up shards written by anything other than this process (an
+        // external relay backup, a restored dump) so their events are
+        // fetchable by id. Incremental: unchanged shards cost one stat each.
+        a.spawn_index_new_shards();
     }
 
     // ── Writer task: single owner of the Pipeline (index + stats + WoT) ─────

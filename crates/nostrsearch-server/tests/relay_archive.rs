@@ -66,6 +66,9 @@ async fn signed_event_published_to_relay_lands_in_archive() -> anyhow::Result<()
     let out = client.send_event_builder(builder).await?;
     let event_id = *out.id();
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // `save_event` returns once the event is queued; the writer thread assigns
+    // its offset and indexes it. Read-after-write needs that to have happened.
+    db_check.flush().await?;
 
     // The archive database should now know this event id.
     let known = db_check
@@ -80,6 +83,29 @@ async fn signed_event_published_to_relay_lands_in_archive() -> anyhow::Result<()
     assert!(
         body.as_array().map(|a| !a.is_empty()).unwrap_or(false),
         "archive listing should contain at least one file, got {body}"
+    );
+
+    // The index records *where* the event is (shard + frame offset + length),
+    // so it can be read back by id without scanning the corpus -- both through
+    // the database and over the HTTP endpoint that exposes it.
+    let loc = db_check
+        .locate(&event_id)?
+        .expect("event location recorded");
+    assert!(loc.len > 0, "located event should have a length");
+
+    let raw = db_check.get_raw(&event_id).await.expect("event by id");
+    let parsed: serde_json::Value = serde_json::from_slice(&raw)?;
+    assert_eq!(parsed["id"].as_str(), Some(event_id.to_hex().as_str()));
+
+    let served: serde_json::Value = reqwest_get_json(&format!(
+        "http://{addr}/archive/event/{}",
+        event_id.to_hex()
+    ))
+    .await?;
+    assert_eq!(served["id"].as_str(), Some(event_id.to_hex().as_str()));
+    assert_eq!(
+        served["content"].as_str(),
+        Some("archived via the absorbed relay")
     );
 
     let _ = std::fs::remove_dir_all(&root);

@@ -293,9 +293,17 @@ All four of its roles now live in nostrsearch:
 | nostrhole role | Where it lives now |
 |---|---|
 | Ingest (firehose → JSONL archive) | `firehose.rs` — `JsonFilesDatabase` attached to the *same* client that feeds the pipeline |
-| HTTP archive serving | `nostrsearch-server::archive` — `/archive`, `/archive/files`, `/archive/{file}` |
+| HTTP archive serving | `nostrsearch-server::archive` — `/archive`, `/archive/files`, `/archive/event/{id}`, `/archive/{file}` |
 | Nostr relay (inbound writes) | `nostrsearch-server::relay` — WS upgrade at `/` → `LocalRelay` |
-| Maintenance | `archive` binary — `--stats`, `--rebuild-index` |
+| Maintenance | `archive` binary — `--stats`, `--index-new`, `--rebuild-index`, `--compact`, `--locate` |
+
+The archive index stores each event's **location** (shard + frame offset +
+length), so `/archive/event/{id}` decodes one 512 KiB zstd frame instead of
+scanning the corpus. Shards written by anything other than this process (an
+external relay backup, a restored dump) are picked up by the incremental
+`index_new_shards()` pass run at startup and by `archive --index-new`; an index
+written by an older version keeps working, but only gains O(1) lookups after
+`archive --rebuild-index`.
 
 One subscription now writes **three** sinks:
 

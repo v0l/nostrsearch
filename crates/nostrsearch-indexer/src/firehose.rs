@@ -71,11 +71,34 @@ impl FirehoseConfig {
     }
 }
 
-/// Open the archive database (JSONL files + RocksDB id index), rebuilding the
-/// index in the background if it's empty but archives exist.
+/// Open the archive database (JSONL files + RocksDB id index).
 pub fn open_archive(dir: impl AsRef<Path>) -> anyhow::Result<DefaultJsonFilesDatabase> {
     let db = DefaultJsonFilesDatabase::new(dir.as_ref())?;
     Ok(db)
+}
+
+/// Bring the id index up to date with the shards on disk, on a background
+/// thread.
+///
+/// Index values carry each event's location (shard + frame offset + length), so
+/// a shard has to be read once before its events can be fetched by id. The pass
+/// is incremental — a shard whose size and mtime are unchanged is skipped after
+/// one `stat` — so this is cheap enough to run on every start, and it reframes
+/// single-frame imports (which would otherwise decode from byte zero on every
+/// lookup) as it goes.
+pub fn spawn_index_new_shards(db: &DefaultJsonFilesDatabase) -> std::thread::JoinHandle<()> {
+    let db = db.clone();
+    std::thread::spawn(move || match db.index_new_shards() {
+        Ok(r) => tracing::info!(
+            shards = r.shards,
+            unchanged = r.unchanged,
+            indexed = r.indexed,
+            reframed = r.reframed,
+            new_events = r.new_events,
+            "archive shard indexing pass complete"
+        ),
+        Err(e) => tracing::error!(error = %e, "archive shard indexing failed"),
+    })
 }
 
 /// Connect to `cfg.relays` and stream live events into `sink` until stopped.
@@ -91,16 +114,11 @@ where
     if let Some(dir) = &cfg.archive_dir {
         let db = open_archive(dir)?;
         if db.is_index_empty() && !db.list_files().await?.is_empty() {
-            tracing::info!("archive id index empty; rebuilding in background");
-            let mut db_rebuild = db.clone();
-            std::thread::spawn(move || {
-                if let Err(e) = db_rebuild.rebuild_index() {
-                    tracing::error!(error = %e, "archive index rebuild failed");
-                } else {
-                    tracing::info!("archive index rebuild complete");
-                }
-            });
+            tracing::info!("archive id index empty; indexing shards in background");
         }
+        // Incremental either way: an empty index indexes everything, a warm one
+        // only picks up shards that appeared or changed since the last pass.
+        spawn_index_new_shards(&db);
         tracing::info!(dir = %dir.display(), events = db.count_keys(), "archiving enabled");
         builder = builder.database(db);
     }
