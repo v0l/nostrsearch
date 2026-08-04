@@ -172,26 +172,11 @@ impl Sink for PipelineSink {
 }
 
 fn hex32(hex: &str) -> Option<[u8; 32]> {
-    if hex.len() != 64 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    for (i, b) in out.iter_mut().enumerate() {
-        *b = u8::from_str_radix(hex.get(i * 2..i * 2 + 2)?, 16).ok()?;
-    }
-    Some(out)
+    nostrsearch_indexer::archive_ingest::hex32(hex)
 }
 
 fn to_core(ev: &nostr_sdk::Event) -> NostrEvent {
-    NostrEvent {
-        id: ev.id.to_hex(),
-        pubkey: ev.pubkey.to_hex(),
-        created_at: ev.created_at.as_secs(),
-        kind: ev.kind.as_u16(),
-        tags: ev.tags.iter().map(|t| t.clone().to_vec()).collect(),
-        content: ev.content.clone(),
-        sig: ev.sig.to_string(),
-    }
+    nostrsearch_indexer::firehose::to_core(ev)
 }
 
 fn main() -> anyhow::Result<()> {

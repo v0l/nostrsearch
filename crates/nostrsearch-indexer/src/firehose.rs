@@ -23,7 +23,11 @@ use nostrsearch_core::event::NostrEvent;
 use std::path::Path;
 
 /// Convert an sdk event to the canonical corpus event.
-fn to_core(ev: &Event) -> NostrEvent {
+///
+/// This is the single home for the `nostr_sdk::Event → NostrEvent` conversion;
+/// the firehose, the server node and the scraper all funnel through it so the
+/// field mapping (and any future change to it) lives in one place.
+pub fn to_core(ev: &Event) -> NostrEvent {
     NostrEvent {
         id: ev.id.to_hex(),
         pubkey: ev.pubkey.to_hex(),

@@ -31,17 +31,10 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
 
 /// Convert an sdk event into the canonical corpus event.
-pub fn to_core(ev: &Event) -> NostrEvent {
-    NostrEvent {
-        id: ev.id.to_hex(),
-        pubkey: ev.pubkey.to_hex(),
-        created_at: ev.created_at.as_secs(),
-        kind: ev.kind.as_u16(),
-        tags: ev.tags.iter().map(|t| t.clone().to_vec()).collect(),
-        content: ev.content.clone(),
-        sig: ev.sig.to_string(),
-    }
-}
+///
+/// Defined in the indexer crate (the firehose owns the type conversion); this
+/// re-export keeps `crate::scraper`'s `use crate::node::to_core` unchanged.
+pub use nostrsearch_indexer::firehose::to_core;
 
 /// Handle used by event producers (firehose, relay) to submit events to the
 /// single writer task. Cloneable and cheap.

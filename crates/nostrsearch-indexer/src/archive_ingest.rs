@@ -156,17 +156,7 @@ pub async fn ingest(
                 let (pipe, pending, store) = (pipe.clone(), pending.clone(), store.clone());
                 let res = tokio::task::spawn_blocking(move || {
                     let mut p = pipe.lock().unwrap();
-                    p.commit()?;
-                    // Only now: the documents these ids name are durable.
-                    let n = match &store {
-                        Some(s) => {
-                            let ids = std::mem::take(&mut *pending.lock().unwrap());
-                            s.flush(ids.iter())?;
-                            ids.len()
-                        }
-                        None => 0,
-                    };
-                    anyhow::Ok(n)
+                    commit_and_claim(&mut p, store.as_ref(), &pending)
                 })
                 .await;
                 match res {
@@ -342,17 +332,12 @@ pub async fn ingest(
         }
     }
 
-    // Finalize: commit first, then claim the ids, never the other way round.
+    // Finalize: switch to live, then record ids only after their documents are
+    // durable — the commit-and-claim pairing, via the single shared path below.
     {
         let mut p = pipeline.lock().unwrap();
         p.go_live();
-        if let Some(store) = &id_store {
-            let ids = std::mem::take(&mut *pending_ids.lock().unwrap());
-            if let Err(e) = store.flush(ids.iter()) {
-                tracing::warn!(error = %e, "final dedupe flush failed");
-            }
-        }
-        p.commit()?;
+        commit_and_claim(&mut p, id_store.as_ref(), &pending_ids)?;
     }
 
     checkpoint.abort();
@@ -373,6 +358,34 @@ pub async fn ingest(
         "archive ingest complete"
     );
     Ok(())
+}
+
+/// Commit every open shard, then durably record the ids indexed since the
+/// last commit. Returns how many ids were claimed.
+///
+/// This is the **only** place the commit-and-claim ordering lives, and the
+/// order is load-bearing: an id must reach the seen-set no earlier than the
+/// commit that makes its document durable. Claim it first and a crash between
+/// the two writes leaves the store ahead of the index — the next resume skips
+/// an event that was never actually written, a permanent hole that retries
+/// cannot fill. Both the periodic checkpoint and the end-of-backfill finalize
+/// call this, so a caller that gets the order wrong cannot be reintroduced
+/// piecemeal across two hand-rolled copies.
+fn commit_and_claim(
+    p: &mut Pipeline,
+    store: Option<&Arc<IdStore>>,
+    pending: &Mutex<HashSet<[u8; 32]>>,
+) -> anyhow::Result<usize> {
+    p.commit()?;
+    let n = match store {
+        Some(s) => {
+            let ids = std::mem::take(&mut *pending.lock().unwrap());
+            s.flush(ids.iter())?;
+            ids.len()
+        }
+        None => 0,
+    };
+    Ok(n)
 }
 
 fn unix_now() -> u64 {

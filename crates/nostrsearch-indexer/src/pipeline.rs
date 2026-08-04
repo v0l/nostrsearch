@@ -260,14 +260,7 @@ impl Pipeline {
     pub fn fold_only(&mut self, ev: &NostrEvent) {
         let now = Self::now();
         let t0 = Instant::now();
-        if self.live {
-            self.registry.observe_backfill(ev, now, &self.world);
-        } else {
-            let stage = std::mem::take(&mut self.stages[self.pass]);
-            self.registry
-                .observe_backfill_stage(&stage, ev, now, &self.world);
-            self.stages[self.pass] = stage;
-        }
+        self.observe_into_stage(ev, now);
         self.stats_ns += t0.elapsed().as_nanos() as u64;
         self.since_refresh += 1;
         if self.live && self.since_refresh >= self.cfg.wot_refresh_every {
@@ -283,6 +276,33 @@ impl Pipeline {
         self.live || self.pass == 0
     }
 
+    /// Fold one event into the analyses, routed to the right dependency stage.
+    ///
+    /// Live mode feeds every stage at once (the world is already materialized);
+    /// a backfill folds only the stage the current pass is responsible for, so
+    /// consumers never read a half-built world. The `mem::take`/restore on
+    /// `self.stages[self.pass]` is cheap (it owns only a `Vec<usize>`) and is
+    /// needed because `observe_backfill_stage` borrows the stage while we
+    /// mutate nothing else under it.
+    ///
+    /// `observe_backfill` is used rather than `observe` because the two differ
+    /// only for analyses still marked un-backfilled, which fold every event
+    /// regardless of watermark. That is what lets a reset analysis rebuild from
+    /// out-of-order history — the scraper walks the network backwards day by
+    /// day, so its events arrive older than the watermark and `observe` would
+    /// reject every one of them. Analyses that are already backfilled behave
+    /// identically either way, keeping count-once semantics.
+    fn observe_into_stage(&mut self, ev: &NostrEvent, now: u64) {
+        if self.live {
+            self.registry.observe_backfill(ev, now, &self.world);
+        } else {
+            let stage = std::mem::take(&mut self.stages[self.pass]);
+            self.registry
+                .observe_backfill_stage(&stage, ev, now, &self.world);
+            self.stages[self.pass] = stage;
+        }
+    }
+
     /// A handle for indexing without the pipeline lock.
     pub fn indexer(&self) -> Arc<ShardManager> {
         self.manager.clone()
@@ -291,27 +311,11 @@ impl Pipeline {
     pub fn process(&mut self, ev: &NostrEvent) {
         let now = Self::now();
         let t0 = Instant::now();
-        if self.live {
-            // Live tail: the world is already materialized, so one pass feeds
-            // every stage.
-            //
-            // `observe_backfill` rather than `observe` because the two differ
-            // only for analyses still marked un-backfilled, which fold every
-            // event regardless of watermark. That is what lets a reset analysis
-            // rebuild from out-of-order history -- the scraper walks the
-            // network backwards day by day, so its events arrive older than
-            // the watermark and `observe` would reject every one of them.
-            // Analyses that are already backfilled behave identically either
-            // way, keeping count-once semantics.
-            self.registry.observe_backfill(ev, now, &self.world);
-        } else {
-            // Backfill: fold only the stage this pass is responsible for, so
-            // consumers never read a half-built world.
-            let stage = std::mem::take(&mut self.stages[self.pass]);
-            self.registry
-                .observe_backfill_stage(&stage, ev, now, &self.world);
-            self.stages[self.pass] = stage;
-        }
+        // Fold into the right dependency stage. `observe_into_stage` does the
+        // live/backfill split internally; the long comment on live mode (why
+        // `observe_backfill` over `observe`) lives at the top of this file's
+        // fold path.
+        self.observe_into_stage(ev, now);
         let t1 = Instant::now();
         // Index exactly once. Later backfill passes replay the same events
         // purely to feed dependent analyses.
