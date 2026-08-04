@@ -385,9 +385,24 @@ fn rebuild_archive_index(args: &Config) -> anyhow::Result<()> {
     let started = Instant::now();
     tracing::info!(dir = %dir.display(), "rebuilding archive id index (O(n) over the corpus)");
 
+    // The rebuild's parallel walk decompresses one shard per reader thread,
+    // each with its own decode buffer, so the core count is a memory
+    // multiplier. Left to itself it uses every core -- 80 on the production
+    // host -- which is how a rebuild that scanned happily for an hour died the
+    // moment it reached the parallel walk. Honour --parallelism here for the
+    // same reason the backfill does.
+    let parallelism = if args.parallelism == 0 {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    } else {
+        args.parallelism
+    };
     let index = nostr_archive_cursor::RocksDbIndex::open(dir.join("index-rocksdb"))?;
     let mut db: nostr_archive_cursor::DefaultJsonFilesDatabase =
-        nostr_archive_cursor::JsonFilesDatabase::new_with_index(dir, index.clone())?;
+        nostr_archive_cursor::JsonFilesDatabase::new_with_index(dir, index.clone())?
+            .with_rebuild_parallelism(parallelism);
+    tracing::info!(parallelism, "archive rebuild parallelism");
 
     // Frame sidecars first: without them a rebuilt index records offsets into
     // shards nobody can seek into.
