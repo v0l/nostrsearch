@@ -112,6 +112,36 @@ fn run_all_passes(p: &mut Pipeline, events: &[NostrEvent]) {
     p.go_live();
 }
 
+/// `--reindex` resets every analysis before replaying the corpus. Resetting
+/// replaces each analysis with a default instance, which throws away the shared
+/// graph store attached at startup -- so without re-attaching, `follow_graph`
+/// folds every event into nothing, the web of trust rebuilds empty, and every
+/// document is indexed at tier 0. That is invisible until someone notices the
+/// ranking is wrong, hours into a rebuild.
+#[test]
+fn resetting_analyses_keeps_the_graph_store_attached() {
+    let dir = tempfile::tempdir().unwrap();
+    let day0 = 1_700_000_000 - (1_700_000_000 % DAY);
+    let mut p = Pipeline::new(config(dir.path())).unwrap();
+
+    // What `ingest --reindex` does before the replay.
+    p.reset_all_analyses();
+
+    run_all_passes(&mut p, &corpus(day0));
+
+    // The follow graph fed the world: trusted authors exist. With a detached
+    // store this is 0 and every split collapses into "untrusted".
+    let au = report(&p, "active_users");
+    let bucket = &au["daily"][day0.to_string()];
+    assert!(!bucket.is_null(), "day0 bucket missing from {au}");
+    let trusted = bucket["users"]["trusted"].as_u64().unwrap();
+    assert!(
+        trusted > 0,
+        "follow graph came back empty after reset: the graph store was not \
+         re-attached, so everything indexes at tier 0"
+    );
+}
+
 #[test]
 fn multi_pass_backfill_gives_reports_a_materialized_world() {
     let dir = tempfile::tempdir().unwrap();

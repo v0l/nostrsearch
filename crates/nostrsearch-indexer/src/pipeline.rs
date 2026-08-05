@@ -180,6 +180,7 @@ impl Pipeline {
     /// immediately so a restart cannot resurrect the old state.
     pub fn reset_all_analyses(&mut self) -> Vec<&'static str> {
         let names = self.registry.reset_all();
+        self.reattach_graph();
         // The world is derived from analyses that now hold nothing, so leaving
         // it in place would keep labelling events with a web of trust that has
         // been discarded.
@@ -224,6 +225,7 @@ impl Pipeline {
     /// Returns the names that were reset, or `None` if the name is unknown.
     pub fn reset_analysis(&mut self, name: &str) -> Option<Vec<&'static str>> {
         let reset = self.registry.reset(name)?;
+        self.reattach_graph();
         if let Some(store) = &self.store
             && let Err(e) = self.registry.persist(store)
         {
@@ -249,6 +251,28 @@ impl Pipeline {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0)
+    }
+
+    /// Re-attach the shared graph store after a reset.
+    ///
+    /// Resetting an analysis replaces it with a default instance, and that
+    /// throws away the [`GraphStore`](nostrsearch_stats::graph::GraphStore)
+    /// handle attached at startup. Analyses that keep their adjacency on disk
+    /// then have nowhere to put it: `follow_graph` logs that it has no store
+    /// and folds every event into nothing, so the web of trust rebuilds empty
+    /// and every document is indexed at tier 0 -- a silent ranking regression
+    /// that only shows up as "search results look wrong" hours later.
+    fn reattach_graph(&mut self) {
+        let Some(dir) = self.cfg.state_dir.as_deref() else {
+            return;
+        };
+        if let Err(e) = self.registry.attach_all(dir) {
+            tracing::error!(
+                error = %e,
+                "re-attaching the graph store after reset failed; the follow \
+                 graph will stay empty and everything will index at tier 0"
+            );
+        }
     }
     /// Fold one event into the analyses only, without indexing it.
     ///
