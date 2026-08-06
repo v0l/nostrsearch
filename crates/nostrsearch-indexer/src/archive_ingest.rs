@@ -235,9 +235,18 @@ pub async fn ingest(
                     }
                     prog.seen.fetch_add(batch.len() as u64, Ordering::Relaxed);
 
-                    // Drop anything the store already has, before taking any
+                    // Note anything the store already has, before taking any
                     // lock: membership is a read-only lookup.
+                    //
+                    // "Already have it" means "already *indexed* it". It does
+                    // not mean the analyses have seen it: an analysis that was
+                    // reset has no state, and the events it needs to rebuild
+                    // from are exactly the ones the dedupe store already knows.
+                    // So dedupe gates indexing only; every event in the batch
+                    // is still folded.
                     let mut skipped = 0u64;
+                    // Positions in `batch` that still need indexing.
+                    let mut to_index: Vec<usize> = Vec::new();
                     // Ids of the events kept, positionally aligned with
                     // `batch`. Claimed only once their documents exist.
                     let mut new_ids: Vec<[u8; 32]> = Vec::new();
@@ -248,24 +257,22 @@ pub async fn ingest(
                             .map(|e| hex32(&e.id).unwrap_or([0u8; 32]))
                             .collect();
                         let known = store.contains_batch(&ids);
-                        let mut keep = Vec::with_capacity(batch.len());
+                        to_index.reserve(batch.len());
                         new_ids.reserve(batch.len());
                         // Ids indexed since the last checkpoint are not in the
                         // store yet. Without checking them too, a duplicate
                         // arriving inside the checkpoint window is indexed
                         // twice -- and tantivy has no unique key to catch it.
                         let pend = ck_pending.lock().unwrap();
-                        for ((ev, id), known) in batch.into_iter().zip(ids).zip(known) {
-                            if known || pend.contains(&id) {
-                                skipped += 1;
-                            } else {
-                                keep.push(ev);
-                                new_ids.push(id);
-                            }
-                        }
+                        let plan = plan_index_work(&ids, &known, |id| pend.contains(id));
                         drop(pend);
-                        batch = keep;
+                        skipped = plan.skipped;
+                        to_index = plan.to_index;
+                        new_ids = plan.new_ids;
                         prog.skipped.fetch_add(skipped, Ordering::Relaxed);
+                    } else {
+                        // No dedupe store: everything is new.
+                        to_index.extend(0..batch.len());
                     }
                     prog.dedupe_ns
                         .fetch_add(t_dedupe.elapsed().as_nanos() as u64, Ordering::Relaxed);
@@ -293,10 +300,11 @@ pub async fn ingest(
                         let t_index = std::time::Instant::now();
                         let mut ok_ids = Vec::with_capacity(new_ids.len());
                         let mut failed = 0u64;
-                        for (i, ev) in batch.iter().enumerate() {
+                        for (n, &i) in to_index.iter().enumerate() {
+                            let ev = &batch[i];
                             match indexer.index_event(ev) {
                                 Ok(_) => {
-                                    if let Some(id) = new_ids.get(i) {
+                                    if let Some(id) = new_ids.get(n) {
                                         ok_ids.push(*id);
                                     }
                                 }
@@ -309,7 +317,7 @@ pub async fn ingest(
                         if !ok_ids.is_empty() {
                             ck_pending.lock().unwrap().extend(ok_ids);
                         }
-                        let ok = batch.len() as u64 - failed;
+                        let ok = to_index.len() as u64 - failed;
                         prog.indexed.fetch_add(ok, Ordering::Relaxed);
                         prog.failed.fetch_add(failed, Ordering::Relaxed);
                         prog.index_ns
@@ -427,5 +435,107 @@ pub fn to_core(ev: &nostr_archive_cursor::NostrEventBorrowed) -> NostrEvent {
         // point of ingest, verifying against the borrowed bytes rather than
         // carrying a copy through the pipeline.
         sig: String::new(),
+    }
+}
+
+
+/// Which events in a batch still need indexing.
+///
+/// Dedupe answers "have we indexed this?", which is a different question from
+/// "have the analyses seen this?". An analysis that was just reset has no
+/// state, and the events it must rebuild from are precisely the ones the
+/// dedupe store already knows about. So this decides indexing only -- the
+/// caller folds the whole batch either way.
+pub(crate) struct IndexPlan {
+    /// Positions in the batch to index, in order.
+    pub to_index: Vec<usize>,
+    /// Ids of those events, positionally aligned with `to_index`.
+    pub new_ids: Vec<[u8; 32]>,
+    pub skipped: u64,
+}
+
+pub(crate) fn plan_index_work(
+    ids: &[[u8; 32]],
+    known: &[bool],
+    pending: impl Fn(&[u8; 32]) -> bool,
+) -> IndexPlan {
+    let mut plan = IndexPlan {
+        to_index: Vec::with_capacity(ids.len()),
+        new_ids: Vec::with_capacity(ids.len()),
+        skipped: 0,
+    };
+    for (i, id) in ids.iter().enumerate() {
+        // Ids indexed since the last checkpoint are not in the store yet.
+        // Without checking them too, a duplicate arriving inside the
+        // checkpoint window is indexed twice -- tantivy has no unique key.
+        if known.get(i).copied().unwrap_or(false) || pending(id) {
+            plan.skipped += 1;
+        } else {
+            plan.to_index.push(i);
+            plan.new_ids.push(*id);
+        }
+    }
+    plan
+}
+
+#[cfg(test)]
+mod index_plan_tests {
+    use super::plan_index_work;
+
+    fn ids(n: usize) -> Vec<[u8; 32]> {
+        (0..n)
+            .map(|i| {
+                let mut a = [0u8; 32];
+                a[0] = i as u8;
+                a
+            })
+            .collect()
+    }
+
+    /// A fully-known batch indexes nothing -- and the caller still folds all
+    /// of it.
+    ///
+    /// This is the shape of "re-derive an analysis on a corpus already
+    /// ingested": every event is in the dedupe store. The old code removed
+    /// those events from the batch before folding, so a reset analysis was
+    /// rebuilt from an empty stream and reported a handful of events observed
+    /// from live traffic instead of the whole archive.
+    #[test]
+    fn a_fully_deduped_batch_indexes_nothing_but_is_still_available_to_fold() {
+        let ids = ids(64);
+        let known = vec![true; 64];
+        let plan = plan_index_work(&ids, &known, |_| false);
+
+        assert!(plan.to_index.is_empty(), "nothing needs re-indexing");
+        assert_eq!(plan.skipped, 64);
+        // The batch itself is untouched: the caller holds all 64 events and
+        // folds every one. Nothing here may shorten it.
+        assert_eq!(ids.len(), 64, "the batch must not be filtered for folding");
+    }
+
+    /// new_ids must stay aligned with to_index, or a successful index claims
+    /// the wrong id and the real one is retried forever.
+    #[test]
+    fn new_ids_align_with_the_positions_to_index() {
+        let ids = ids(6);
+        let known = vec![false, true, false, true, false, false];
+        let plan = plan_index_work(&ids, &known, |_| false);
+
+        assert_eq!(plan.to_index, vec![0, 2, 4, 5]);
+        assert_eq!(plan.skipped, 2);
+        for (n, &i) in plan.to_index.iter().enumerate() {
+            assert_eq!(plan.new_ids[n], ids[i], "id must match its batch position");
+        }
+    }
+
+    /// Ids indexed since the last checkpoint are not in the store yet.
+    #[test]
+    fn pending_ids_are_skipped_even_when_the_store_has_not_seen_them() {
+        let ids = ids(4);
+        let known = vec![false; 4];
+        let plan = plan_index_work(&ids, &known, |id| id[0] == 2);
+
+        assert_eq!(plan.to_index, vec![0, 1, 3]);
+        assert_eq!(plan.skipped, 1);
     }
 }
