@@ -140,6 +140,9 @@ export function Relays({
               <th>Relay</th>
               <th>Sync method</th>
               <th class="num">Advertised by</th>
+              <th class="num">Days</th>
+              <th class="num">Events</th>
+              <th class="num" title="new to the index">New</th>
               <th class="num">Page size</th>
               <th class="num">Fails</th>
               <th>Last success</th>
@@ -149,7 +152,7 @@ export function Relays({
           <tbody>
             {rows.length === 0 ? (
               <tr>
-                <td colSpan={authed ? 7 : 6} class="empty">
+                <td colSpan={authed ? 10 : 9} class="empty">
                   No relays discovered yet.
                 </td>
               </tr>

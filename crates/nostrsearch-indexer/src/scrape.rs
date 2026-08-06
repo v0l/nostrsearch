@@ -587,8 +587,7 @@ pub async fn run_pass<S: Sink>(
     sink: std::sync::Arc<S>,
     cfg: ScrapeConfig,
 ) {
-    let targets = state.relays();
-    tracing::info!(relays = targets.len(), "scrape pass starting");
+    tracing::info!(relays = state.relays().len(), "scrape pass starting");
 
     // Work is a (relay, day) pair drawn at random, run in batches of at most
     // `concurrency`.
@@ -608,6 +607,16 @@ pub async fn run_pass<S: Sink>(
     let mut scraped = 0u64;
 
     loop {
+        // Re-read between batches rather than working from one snapshot taken
+        // at pass start.
+        //
+        // Each completed day writes the relay's info back. Against a stale
+        // snapshot those writes carry pre-probe values, so a negentropy result
+        // recorded by one batch was overwritten by the next batch's copy and
+        // the relay reverted to unprobed. It also meant `dead_until` was never
+        // visible to later batches, so a dead relay kept being drawn for the
+        // whole pass -- the retirement did nothing.
+        let targets = state.relays();
         let batch = plan_batch(&targets, &state, &cfg, batch_size, &mut rng);
         if batch.is_empty() {
             break;

@@ -201,8 +201,11 @@ function Console() {
         <Today reports={reports} />
         <Reports reports={reports} />
         <Corpus stats={stats.data} />
-        <Ingest authed={authed} gate={gate} />
-        <Analyses authed={authed} gate={gate} />
+        {/* Operator controls, not public status: these panels are actions
+            with a status readout attached, so they are hidden entirely rather
+            than shown disabled. */}
+        {authed ? <Ingest authed={authed} gate={gate} /> : null}
+        {authed ? <Analyses authed={authed} gate={gate} /> : null}
         <Relays
           sync={sync.data}
           authed={authed}
