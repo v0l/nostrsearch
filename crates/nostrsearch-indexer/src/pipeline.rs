@@ -223,6 +223,23 @@ impl Pipeline {
     /// resurrect the old state.
     ///
     /// Returns the names that were reset, or `None` if the name is unknown.
+    /// Do these analyses need a corpus replay to rebuild?
+    ///
+    /// False when none of them consumes events. Pagerank is the case: it
+    /// derives from the adjacency `follow_graph` keeps on disk, so replaying
+    /// 897M events to rebuild it accomplishes nothing a refresh would not.
+    pub fn names_need_corpus(&self, names: &[&str]) -> bool {
+        let idx: Vec<usize> = names
+            .iter()
+            .filter_map(|n| self.registry.index_of(n))
+            .collect();
+        if idx.len() != names.len() {
+            // An unknown name means we cannot prove the replay is pointless.
+            return true;
+        }
+        !matches!(self.registry.stage_kinds(&idx), Some(ks) if ks.is_empty())
+    }
+
     pub fn reset_analysis(&mut self, name: &str) -> Option<Vec<&'static str>> {
         let reset = self.registry.reset(name)?;
         self.reattach_graph();

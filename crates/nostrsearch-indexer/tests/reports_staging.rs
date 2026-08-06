@@ -379,3 +379,32 @@ fn only_a_stage_that_consumes_nothing_can_skip_the_corpus() {
          intended win; update this test to assert the skip"
     );
 }
+
+/// Resetting an analysis that consumes no events must not demand a replay.
+///
+/// Pagerank derives from the adjacency `follow_graph` keeps on disk. Resetting
+/// it used to start a full archive replay unconditionally -- 897M events read
+/// to rebuild something that reads none of them -- because the reset path
+/// never asked whether the corpus was involved.
+#[test]
+fn resetting_a_derived_analysis_needs_no_corpus() {
+    let dir = tempfile::tempdir().unwrap();
+    let p = Pipeline::new(config(dir.path())).unwrap();
+
+    assert!(
+        !p.names_need_corpus(&["pagerank"]),
+        "pagerank reads no events; resetting it must not trigger a replay"
+    );
+    assert!(
+        p.names_need_corpus(&["follow_graph"]),
+        "follow_graph is built from events and does need one"
+    );
+    assert!(
+        p.names_need_corpus(&["pagerank", "follow_graph"]),
+        "a set containing any event-consuming analysis needs the corpus"
+    );
+    assert!(
+        p.names_need_corpus(&["no_such_analysis"]),
+        "an unknown name must not be taken as proof a replay is unnecessary"
+    );
+}

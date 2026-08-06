@@ -116,7 +116,8 @@ pub enum WriterCmd {
     /// Discard an analysis's state so it re-derives from incoming events.
     ResetAnalysis {
         name: String,
-        reply: tokio::sync::oneshot::Sender<Option<Vec<&'static str>>>,
+        /// Reset names, and whether rebuilding them needs a corpus replay.
+        reply: tokio::sync::oneshot::Sender<Option<(Vec<&'static str>, bool)>>,
     },
     /// Per-analysis progress.
     Status {
@@ -169,7 +170,7 @@ impl WriterCtl {
     pub async fn reset_analysis(
         &self,
         name: &str,
-    ) -> Result<Option<Vec<&'static str>>, &'static str> {
+    ) -> Result<Option<(Vec<&'static str>, bool)>, &'static str> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.0
             .send(WriterCmd::ResetAnalysis {
@@ -331,6 +332,13 @@ pub fn spawn_writer_with_reports(
                     }
                     WriterCmd::ResetAnalysis { name, reply } => {
                         let ok = pipeline.lock().unwrap().reset_analysis(&name);
+                        // Whether rebuilding what was reset actually requires
+                        // reading the corpus, decided while the names are in
+                        // hand rather than assumed by the caller.
+                        let needs = ok.as_ref().is_none_or(|names| {
+                            pipeline.lock().unwrap().names_need_corpus(names)
+                        });
+                        let ok = ok.map(|names| (names, needs));
                         // Republish immediately so the dashboard reflects the
                         // now-empty report rather than the stale one.
                         publish_reports(&pipeline.lock().unwrap(), reports.as_ref());

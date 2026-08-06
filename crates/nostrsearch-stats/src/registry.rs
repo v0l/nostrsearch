@@ -499,6 +499,11 @@ impl Registry {
 
     /// Run due refreshes for `stage` and materialize its producers into `world`.
     /// `now_wall` is real wall-clock unix secs (drives refresh intervals).
+    /// Position of the analysis called `name`.
+    pub fn index_of(&self, name: &str) -> Option<usize> {
+        self.entries.iter().position(|e| e.analysis.name() == name)
+    }
+
     /// Union of the kinds every analysis in `stage` consumes.
     ///
     /// `None` means at least one of them takes everything, so nothing can be

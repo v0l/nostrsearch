@@ -396,8 +396,8 @@ async fn reset_all(State(st): State<AdminState>) -> Response {
 /// reset on its own leaves them holding numbers derived from state that no
 /// longer exists.
 async fn reset_analysis(State(st): State<AdminState>, Path(name): Path<String>) -> Response {
-    let reset = match st.ctl.reset_analysis(&name).await {
-        Ok(Some(names)) => names,
+    let (reset, needs_corpus) = match st.ctl.reset_analysis(&name).await {
+        Ok(Some(v)) => v,
         Ok(None) => {
             return (
                 StatusCode::NOT_FOUND,
@@ -422,6 +422,24 @@ async fn reset_analysis(State(st): State<AdminState>, Path(name): Path<String>) 
     // rest of its progress, so it starts from the top while analyses that were
     // not reset keep theirs -- a reset can no longer disturb a rebuild already
     // running for something else.
+    // Nothing to replay for analyses that consume no events: pagerank derives
+    // from the adjacency follow_graph keeps on disk, so a replay of the whole
+    // archive rebuilds it no better than the refresh that runs anyway. Doing
+    // it regardless is how re-deriving pagerank kicked off a full ingest.
+    if !needs_corpus {
+        return Json(ResetResult {
+            reset: reset.clone(),
+            rebuild: false,
+            detail: format!(
+                "reset {}; no replay needed -- {} derive from other analyses' \
+                 output, not from events",
+                reset.join(", "),
+                reset.join(", ")
+            ),
+        })
+        .into_response();
+    }
+
     let rebuild = match st.replay.as_ref() {
         // Dedupe on: this analysis's state is gone, but the index is intact,
         // so events already indexed only need folding, not re-indexing.
