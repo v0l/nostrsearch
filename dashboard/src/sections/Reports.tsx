@@ -1,3 +1,6 @@
+import { useEffect, useState } from "preact/hooks";
+import { api } from "../api";
+import type { Profile } from "../types";
 import {
   asArray,
   asRecord,
@@ -314,12 +317,65 @@ function Clients({ raw }: { raw: unknown }) {
 
 // --- pagerank --------------------------------------------------------------
 
+/**
+ * An avatar, or the initial of a name over a colour derived from the pubkey.
+ *
+ * Profile pictures are arbitrary URLs from arbitrary hosts: plenty 404, hang,
+ * or are not images at all. A broken one must degrade to the fallback rather
+ * than leave a torn image in the list.
+ */
+function Avatar({ src, seed, label }: { src?: string; seed: string; label: string }) {
+  const [failed, setFailed] = useState(false);
+  const hue = parseInt(seed.slice(0, 6) || "0", 16) % 360;
+
+  if (src && !failed) {
+    return (
+      <img
+        class="avatar"
+        src={src}
+        alt=""
+        loading="lazy"
+        referrerpolicy="no-referrer"
+        onError={() => setFailed(true)}
+      />
+    );
+  }
+  return (
+    <span class="avatar avatar-fb" style={{ background: `hsl(${hue} 40% 30%)` }}>
+      {(label[0] ?? "?").toUpperCase()}
+    </span>
+  );
+}
+
 /** `pagerank`: `[[pubkey, score], …]`, already sorted, top 1000. */
 function Rank({ raw }: { raw: unknown }) {
   const rows = asArray<[string, number]>(raw)
     .filter((r) => Array.isArray(r) && typeof r[0] === "string")
     .slice(0, 12);
   const peak = rows.length ? rows[0][1] : 1;
+
+  // Resolve names for exactly the keys on screen, refetched when they change.
+  const keys = rows.map(([pk]) => pk);
+  const sig = keys.join(",");
+  const [people, setPeople] = useState<Record<string, Profile>>({});
+  useEffect(() => {
+    if (!keys.length) return;
+    let alive = true;
+    api
+      .profiles(keys)
+      .then((list) => {
+        if (!alive) return;
+        const by: Record<string, Profile> = {};
+        for (const p of list) by[p.pubkey] = p;
+        setPeople(by);
+      })
+      // A missing name is not worth surfacing: the row still renders with the
+      // key it already has.
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
+  }, [sig]);
 
   return (
     <Panel
@@ -332,18 +388,24 @@ function Rank({ raw }: { raw: unknown }) {
         <p class="empty">No ranks computed yet.</p>
       ) : (
         <ol class="ranks">
-          {rows.map(([pubkey, score], i) => (
-            <li key={pubkey}>
-              <span class="rank">{String(i + 1).padStart(2, "0")}</span>
-              <span class="tag" title={pubkey}>
-                {shortKey(pubkey)}
-              </span>
-              <span class="track">
-                <Meter value={score} max={peak} />
-              </span>
-              <span class="count">{score.toFixed(4)}</span>
-            </li>
-          ))}
+          {rows.map(([pubkey, score], i) => {
+            const p = people[pubkey];
+            const name = p?.display_name || p?.name;
+            return (
+              <li key={pubkey}>
+                <span class="rank">{String(i + 1).padStart(2, "0")}</span>
+                <Avatar src={p?.picture} seed={pubkey} label={name || pubkey} />
+                <span class="who" title={pubkey}>
+                  <span class="who-name">{name || shortKey(pubkey)}</span>
+                  {p?.nip05 ? <span class="who-sub">{p.nip05}</span> : null}
+                </span>
+                <span class="track">
+                  <Meter value={score} max={peak} />
+                </span>
+                <span class="count">{score.toFixed(4)}</span>
+              </li>
+            );
+          })}
         </ol>
       )}
     </Panel>

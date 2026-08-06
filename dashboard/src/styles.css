@@ -912,3 +912,15 @@ body.page .readout .v.mute {
 .pager-at { font-size: 11px; letter-spacing: .08em; color: var(--slate);
   font-variant-numeric: tabular-nums; }
 .pager .btn[disabled] { opacity: .35; cursor: default; }
+
+/* Rank rows: avatar + name, falling back to a colour block and the short key
+   when a profile has no picture or the URL is dead. */
+.avatar { width: 22px; height: 22px; border-radius: 50%; flex: 0 0 auto;
+  object-fit: cover; background: var(--ink2); }
+.avatar-fb { display: inline-flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 600; color: #fff; }
+.who { display: flex; flex-direction: column; min-width: 0; line-height: 1.2; }
+.who-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.who-sub { font-size: 10px; color: var(--slate); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.ranks li { display: flex; align-items: center; gap: 8px; }

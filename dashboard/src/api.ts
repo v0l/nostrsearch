@@ -1,4 +1,5 @@
 import type {
+  Profile,
   AdminScrapeState,
   AnalysisStatus,
   ArchiveFileInfo,
@@ -153,6 +154,9 @@ export const api = {
   // prefix exactly, and 404s on "/sync/".
   sync: (offset = 0, limit = 50) =>
     open<SyncStatus>(`/sync?offset=${offset}&limit=${limit}`),
+  /** kind-0 metadata for a set of pubkeys, newest event per author. */
+  profiles: (pubkeys: string[]) =>
+    open<Profile[]>(`/profiles?pubkeys=${encodeURIComponent(pubkeys.join(","))}`),
   archiveFiles: () => open<ArchiveFileInfo[]>("/archive/files"),
   /**
    * Archive totals. `total_events` is the count of distinct ids the archive

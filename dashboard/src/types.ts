@@ -128,3 +128,12 @@ export interface ReportDelta {
   name: string;
   patch: unknown;
 }
+
+/** kind-0 metadata, reduced to what a list needs. */
+export interface Profile {
+  pubkey: string;
+  name?: string;
+  display_name?: string;
+  picture?: string;
+  nip05?: string;
+}

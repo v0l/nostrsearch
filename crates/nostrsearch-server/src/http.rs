@@ -9,7 +9,7 @@ use axum::{
     routing::get,
 };
 use nostrsearch_core::query::SearchFilter;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// Shared application state. The registry is behind a Mutex because shard
@@ -97,6 +97,7 @@ pub fn router_full_node(
     let mut app = Router::new()
         .route("/search", get(search_get).post(search_post))
         .route("/event/{id}", get(get_event))
+        .route("/profiles", get(profiles))
         .with_state(search_state)
         .merge(
             Router::new()
@@ -365,4 +366,90 @@ impl IntoResponse for ApiError {
         };
         (code, Json(serde_json::json!({ "error": msg }))).into_response()
     }
+}
+
+// ---------------------------------------------------------------------------
+// GET /profiles?pubkeys=hex,hex,...
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct ProfilesParams {
+    pubkeys: Option<String>,
+}
+
+/// A kind-0 profile, reduced to what a list needs.
+#[derive(Debug, Default, Serialize)]
+pub struct Profile {
+    pubkey: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    picture: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nip05: Option<String>,
+}
+
+/// Resolve kind-0 metadata for a set of pubkeys.
+///
+/// Reports identify people by pubkey, which is unreadable in a list. This is
+/// one metadata query rather than one per pubkey: the index already holds
+/// kind 0, and the alternative -- the console fetching each profile from a
+/// relay -- means dozens of connections from a browser to render one panel.
+///
+/// Kind 0 is replaceable, so the newest event per author wins.
+async fn profiles(
+    State(state): State<SearchState>,
+    Query(p): Query<ProfilesParams>,
+) -> Result<Json<Vec<Profile>>, ApiError> {
+    let authors = split_csv(&p.pubkeys);
+    if authors.is_empty() {
+        return Ok(Json(Vec::new()));
+    }
+    // Bound the fan-out: this is a convenience lookup, not a bulk export.
+    let authors: Vec<String> = authors.into_iter().take(200).collect();
+    let want = authors.len();
+
+    let filter = SearchFilter {
+        authors,
+        kinds: vec![0],
+        // Several revisions may exist per author; ask for enough that the
+        // newest for each is in the window, then reduce.
+        limit: (want * 4).min(1000),
+        ..Default::default()
+    };
+
+    let hits = run_search(state, filter).await?.0;
+
+    // Newest wins. Metadata queries come back ordered by created_at desc, but
+    // that is a property of the collector, not a guarantee here.
+    let mut best: std::collections::HashMap<String, (u64, Profile)> =
+        std::collections::HashMap::new();
+    for h in hits {
+        if best
+            .get(&h.pubkey)
+            .is_some_and(|(ts, _)| *ts >= h.created_at)
+        {
+            continue;
+        }
+        let v: serde_json::Value = serde_json::from_str(&h.content).unwrap_or_default();
+        let field = |k: &str| {
+            v.get(k)
+                .and_then(|x| x.as_str())
+                .map(str::trim)
+                .filter(|x| !x.is_empty())
+                .map(str::to_string)
+        };
+        let prof = Profile {
+            pubkey: h.pubkey.clone(),
+            name: field("name"),
+            display_name: field("display_name").or_else(|| field("displayName")),
+            picture: field("picture"),
+            nip05: field("nip05"),
+        };
+        best.insert(h.pubkey, (h.created_at, prof));
+    }
+
+    Ok(Json(best.into_values().map(|(_, p)| p).collect()))
 }

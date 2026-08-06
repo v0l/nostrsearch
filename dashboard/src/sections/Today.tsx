@@ -7,7 +7,7 @@ import {
   type Reports as ReportsState,
   type TrustedCount,
 } from "../reports";
-import { Chip, Readout, compact, num, plural, isoDay } from "../ui";
+import { Chip, Readout, compact, num, plural, isoDay, plausibleDay } from "../ui";
 
 /** Kinds worth naming; anything else is shown as its number. */
 export const KIND_NAMES: Record<string, string> = {
@@ -39,7 +39,11 @@ export function latestDay(
   let best: { start: number; day: DailyActivity } | null = null;
   for (const [k, v] of Object.entries(byDay)) {
     const start = Number(k);
-    if (!Number.isFinite(start) || !v) continue;
+    // "Latest" is a max, so a bucket built from a broken created_at -- a
+    // millisecond value read as seconds lands in the year 564 billion -- wins
+    // outright and never stops winning. This panel then showed that bucket's
+    // single junk event as the whole of today's intake.
+    if (!plausibleDay(start) || !v) continue;
     if (!best || start > best.start) best = { start, day: v };
   }
   return best;
@@ -124,7 +128,7 @@ export function Today({ reports }: { reports: ReportsState }) {
 
   const users = (reports.data.active_users ?? {}) as Partial<ActiveUsersReport>;
   const dailyUsers = Object.values(asRecord<ActiveUsersReport["daily"][string]>(users.daily))
-    .filter((b) => b && Number.isFinite(b.start))
+    .filter((b) => b && plausibleDay(b.start))
     .sort((a, b) => b.start - a.start)[0];
 
   const clients = Object.entries(asRecord<ClientStats>(reports.data.client_tags));
