@@ -305,9 +305,28 @@ async fn hydrate_events(state: &SearchState, hits: &mut [SearchHit]) {
         return;
     }
     let ids: Vec<String> = hits.iter().map(|h| h.event_id.clone()).collect();
-    for (hit, ev) in hits.iter_mut().zip(archive.events_by_hex_ids(&ids).await) {
+    let n = ids.len();
+    let t = std::time::Instant::now();
+    let fetched = archive.events_by_hex_ids(&ids).await;
+    let fetch_ms = t.elapsed().as_millis();
+    let found = fetched.iter().filter(|e| e.is_some()).count();
+    for (hit, ev) in hits.iter_mut().zip(fetched) {
         hit.event = ev;
     }
+
+    // Measured from the caller's side, so it includes any wait to get onto the
+    // archive's read pool. Compare against the `archive hydrate` line: if this
+    // is much larger, the time is queueing behind bulk ingest reads rather
+    // than doing work for this request. `missing` is a separate concern --
+    // hits the index knows about that the archive cannot produce.
+    tracing::info!(
+        hits = n,
+        found,
+        missing = n - found,
+        fetch_ms,
+        per_hit_ms = if n > 0 { fetch_ms / n as u128 } else { 0 },
+        "search hydrate"
+    );
 }
 
 // ---------------------------------------------------------------------------
