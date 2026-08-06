@@ -627,7 +627,11 @@ pub async fn run_pass<S: Sink>(
     // connections internally, so building one per relay-day meant constructing
     // and tearing down a pool 50 at a time, continuously, for the whole run --
     // and gave up connection reuse across the days of the same relay.
-    let client = std::sync::Arc::new(nostr_sdk::Client::default());
+    //
+    // Cloned into each task rather than wrapped: Client is already a handle
+    // around shared state, so a clone is a refcount bump and every clone
+    // drives the same pool.
+    let client = nostr_sdk::Client::default();
 
     let now0 = chrono::Utc::now().timestamp() as u64;
     let today_start = now0 - (now0 % 86_400);
