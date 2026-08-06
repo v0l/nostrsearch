@@ -519,6 +519,24 @@ impl Registry {
         Some(all.into_iter().collect())
     }
 
+    /// Refresh and materialize `names` now, ignoring their schedules.
+    ///
+    /// A derived analysis reset by an operator has to rebuild immediately.
+    /// Pagerank refreshes daily, so without this a re-derive cleared the ranks
+    /// and left them empty until the next scheduled run -- up to 24 hours of
+    /// looking like the operation silently failed.
+    ///
+    /// Returns the number of analyses refreshed.
+    pub fn refresh_now(&mut self, names: &[&str], now_wall: u64, world: &mut World) -> usize {
+        let idx: Vec<usize> = names.iter().filter_map(|n| self.index_of(n)).collect();
+        for &i in &idx {
+            // Force the schedule gate in materialize_stage to fire.
+            self.entries[i].progress.last_refresh_wall = 0;
+        }
+        self.materialize_stage(&idx, now_wall, world);
+        idx.len()
+    }
+
     pub fn materialize_stage(&mut self, stage: &[usize], now_wall: u64, world: &mut World) {
         for &i in stage {
             if let Some(d) = self.entries[i].analysis.refresh_interval() {

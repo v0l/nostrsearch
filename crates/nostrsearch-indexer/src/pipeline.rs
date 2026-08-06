@@ -240,6 +240,21 @@ impl Pipeline {
         !matches!(self.registry.stage_kinds(&idx), Some(ks) if ks.is_empty())
     }
 
+    /// Rebuild derived analyses immediately, without a corpus pass.
+    ///
+    /// Their input is other analyses' materialized output, which is already on
+    /// disk, so this is the whole of their rebuild.
+    pub fn refresh_now(&mut self, names: &[&str]) -> usize {
+        let now = Self::now();
+        let n = self.registry.refresh_now(names, now, &mut self.world);
+        if let Some(store) = &self.store
+            && let Err(e) = self.registry.persist(store)
+        {
+            tracing::warn!(error = %e, "persisting refresh failed");
+        }
+        n
+    }
+
     pub fn reset_analysis(&mut self, name: &str) -> Option<Vec<&'static str>> {
         let reset = self.registry.reset(name)?;
         self.reattach_graph();

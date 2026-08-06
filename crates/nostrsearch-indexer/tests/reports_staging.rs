@@ -408,3 +408,42 @@ fn resetting_a_derived_analysis_needs_no_corpus() {
         "an unknown name must not be taken as proof a replay is unnecessary"
     );
 }
+
+/// Resetting a derived analysis takes the no-corpus path and drives a refresh.
+///
+/// Pagerank refreshes daily, so a reset that skipped the corpus replay
+/// (correctly -- it reads no events) would otherwise leave the report empty
+/// until the next scheduled run: up to 24 hours of looking like the operator's
+/// re-derive silently did nothing.
+///
+/// KNOWN GAP: the refresh runs and reports every name refreshed, but the ranks
+/// it produces are empty here. `reattach_graph` opens a *second* GraphStore
+/// handle on a path the pipeline already holds open, and RocksDB takes an
+/// exclusive lock, so the re-attach plausibly fails and leaves pagerank
+/// attached to nothing. That is the same class of bug as the reset_all graph
+/// detach, and it is unresolved -- so this asserts the wiring, not the output.
+#[test]
+fn resetting_a_derived_analysis_takes_the_no_corpus_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut p = Pipeline::new(config(dir.path())).unwrap();
+    run_all_passes(&mut p, &corpus(1_700_000_000));
+
+    assert!(
+        report(&p, "pagerank")
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "the corpus should have produced ranks to begin with"
+    );
+
+    let reset = p.reset_analysis("pagerank").expect("pagerank exists");
+    assert!(
+        !p.names_need_corpus(&reset),
+        "pagerank reads no events, so no replay may be demanded"
+    );
+    assert_eq!(
+        p.refresh_now(&reset),
+        reset.len(),
+        "the reset must drive a refresh for every name it reset, rather than \
+         leaving them for the 24h schedule"
+    );
+}

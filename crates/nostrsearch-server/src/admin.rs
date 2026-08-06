@@ -431,9 +431,8 @@ async fn reset_analysis(State(st): State<AdminState>, Path(name): Path<String>) 
             reset: reset.clone(),
             rebuild: false,
             detail: format!(
-                "reset {}; no replay needed -- {} derive from other analyses' \
-                 output, not from events",
-                reset.join(", "),
+                "reset and rebuilt {} from the follow graph; no corpus replay \
+                 needed, and the report is already current",
                 reset.join(", ")
             ),
         })

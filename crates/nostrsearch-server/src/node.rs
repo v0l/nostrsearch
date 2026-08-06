@@ -338,6 +338,21 @@ pub fn spawn_writer_with_reports(
                         let needs = ok.as_ref().is_none_or(|names| {
                             pipeline.lock().unwrap().names_need_corpus(names)
                         });
+                        // A derived analysis rebuilds from other analyses'
+                        // materialized output, which is already on disk. Do it
+                        // now rather than leaving the operator watching an
+                        // empty report until the next scheduled refresh.
+                        if let Some(names) = ok.as_ref()
+                            && !needs
+                        {
+                            let n = pipeline.lock().unwrap().refresh_now(names);
+                            tracing::info!(
+                                reset = ?names,
+                                refreshed = n,
+                                "rebuilt derived analyses without a corpus pass"
+                            );
+                            publish_reports(&pipeline.lock().unwrap(), reports.as_ref());
+                        }
                         let ok = ok.map(|names| (names, needs));
                         // Republish immediately so the dashboard reflects the
                         // now-empty report rather than the stale one.
