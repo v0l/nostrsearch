@@ -319,6 +319,7 @@ async fn run(args: Args, state: Arc<ScrapeState>, sink: Arc<PipelineSink>) -> an
         floor_secs: args.floor_secs(),
         concurrency: args.concurrency,
         empty_days_limit: args.birthday_days,
+        ..Default::default()
     };
     nostrsearch_indexer::scrape::run_pass(state, sink.clone(), cfg).await;
 

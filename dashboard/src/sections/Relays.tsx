@@ -166,7 +166,11 @@ export function Relays({
                   <td class="num" title="new to the index">{compact(r.events_new)}</td>
                   <td class="num">{num(r.cap)}</td>
                   <td class="num" style={{ color: r.fails > 0 ? "var(--rust)" : undefined }}>
-                    {num(r.fails)}
+                    {r.dead_until && r.dead_until * 1000 > Date.now() ? (
+                      <span title={`dead, retrying ${ago(r.dead_until)}`}>dead</span>
+                    ) : (
+                      num(r.fails)
+                    )}
                   </td>
                   <td>{ago(r.last_ok)}</td>
                   {authed ? (

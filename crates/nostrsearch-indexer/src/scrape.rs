@@ -41,6 +41,15 @@ pub struct RelayInfo {
     /// bandwidth forever.
     #[serde(default)]
     pub birthday: Option<u64>,
+    /// Unix secs until which this relay is considered dead and not probed.
+    ///
+    /// A relay that refuses connections fails every draw it appears in, and
+    /// with work sampled at random it keeps reappearing -- burning a slot in
+    /// batch after batch on a host that is not there. Once it has failed
+    /// enough times in a row it is set aside for a day rather than retried
+    /// immediately.
+    #[serde(default)]
+    pub dead_until: Option<u64>,
 }
 
 /// One completed (relay, day), flattened for the status page.
@@ -551,6 +560,10 @@ pub struct ScrapeConfig {
     /// Consecutive empty days before concluding we've walked past the relay's
     /// data horizon ("birthday") and stopping.
     pub empty_days_limit: u32,
+    /// Consecutive failures before a relay is set aside as dead.
+    pub dead_after_fails: u32,
+    /// How long a dead relay is left alone, in seconds.
+    pub dead_for_secs: u64,
 }
 
 impl Default for ScrapeConfig {
@@ -560,6 +573,8 @@ impl Default for ScrapeConfig {
             floor_secs: 600,
             concurrency: 50,
             empty_days_limit: 14,
+            dead_after_fails: 3,
+            dead_for_secs: 24 * 3600,
         }
     }
 }
@@ -651,6 +666,11 @@ fn plan_batch(
         }
         let (url, info) = &targets[idx];
 
+        // Set aside as dead, and not yet due for a retry.
+        if info.dead_until.is_some_and(|t| now < t) {
+            continue;
+        }
+
         // The oldest day worth asking this relay for.
         let floor = cfg.min_date.max(info.birthday.unwrap_or(0));
         if floor >= today_start {
@@ -702,7 +722,9 @@ async fn scrape_relay_day<S: Sink>(
 
     match scrape_day(&client, url, &mut info, &sink, start, end, cfg.floor_secs).await {
         Ok((seen, new)) => {
+            // Alive: clear both the failure streak and any death sentence.
             info.fails = 0;
+            info.dead_until = None;
             info.last_ok = chrono::Utc::now().timestamp() as u64;
             state.put_day(
                 date,
@@ -727,6 +749,16 @@ async fn scrape_relay_day<S: Sink>(
         }
         Err(_) => {
             info.fails = info.fails.saturating_add(1);
+            if info.fails >= cfg.dead_after_fails {
+                let now = chrono::Utc::now().timestamp() as u64;
+                info.dead_until = Some(now + cfg.dead_for_secs);
+                tracing::info!(
+                    relay = url,
+                    fails = info.fails,
+                    retry_in_secs = cfg.dead_for_secs,
+                    "relay marked dead"
+                );
+            }
         }
     }
     state.put_relay(url, &info);
@@ -922,6 +954,41 @@ mod scrape_concurrency_tests {
                 );
             }
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A dead relay is not drawn until its retry time passes.
+    ///
+    /// With work sampled at random a dead relay is not walked past once, it
+    /// reappears in batch after batch, burning a slot each time on a host that
+    /// is not answering.
+    #[test]
+    fn dead_relays_are_not_drawn_until_the_retry_time() {
+        let (st, dir) = state("dead");
+        let now = chrono::Utc::now().timestamp() as u64;
+
+        let mut dead = super::RelayInfo::default();
+        dead.dead_until = Some(now + 3600);
+        let mut alive = super::RelayInfo::default();
+        alive.dead_until = Some(now - 1); // sentence expired
+
+        let t = vec![
+            ("wss://dead.example".to_string(), dead),
+            ("wss://alive.example".to_string(), alive),
+        ];
+        let cfg = super::ScrapeConfig::default();
+        let mut rng = rand::thread_rng();
+
+        let mut saw_alive = false;
+        for _ in 0..100 {
+            for (url, ..) in super::plan_batch(&t, &st, &cfg, 10, &mut rng) {
+                assert_ne!(url, "wss://dead.example", "a dead relay must not be drawn");
+                if url == "wss://alive.example" {
+                    saw_alive = true;
+                }
+            }
+        }
+        assert!(saw_alive, "an expired sentence must let the relay back in");
         let _ = std::fs::remove_dir_all(dir);
     }
 

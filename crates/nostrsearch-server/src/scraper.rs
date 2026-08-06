@@ -109,6 +109,10 @@ pub struct ScraperOptions {
     pub floor_secs: u64,
     /// Consecutive empty days before a relay's data horizon is recorded.
     pub birthday_days: u32,
+    /// Consecutive failures before a relay is set aside as dead.
+    pub dead_after_fails: u32,
+    /// How long a dead relay is left alone, in seconds.
+    pub dead_for_secs: u64,
     /// Idle time between passes once caught up.
     pub pass_interval: std::time::Duration,
     /// How often to re-run kind-10002 relay discovery.
@@ -141,6 +145,8 @@ impl ScraperOptions {
             concurrency: u("SCRAPE_CONCURRENCY", 50) as usize,
             floor_secs: u("SCRAPE_FLOOR_MINS", 10) * 60,
             birthday_days: u("SCRAPE_BIRTHDAY_DAYS", 14) as u32,
+            dead_after_fails: u("SCRAPE_DEAD_AFTER_FAILS", 3) as u32,
+            dead_for_secs: u("SCRAPE_DEAD_FOR_HOURS", 24) * 3600,
             pass_interval: std::time::Duration::from_secs(u("SCRAPE_PASS_INTERVAL_SECS", 1800)),
             rediscover_interval: std::time::Duration::from_secs(u(
                 "SCRAPE_REDISCOVER_SECS",
@@ -254,6 +260,10 @@ pub fn spawn_scraper(
                     floor_secs: opts.floor_secs,
                     concurrency: opts.concurrency,
                     empty_days_limit: opts.birthday_days,
+                    // A relay that will not answer is set aside for a day
+                    // rather than re-drawn into every batch.
+                    dead_after_fails: opts.dead_after_fails,
+                    dead_for_secs: opts.dead_for_secs,
                 };
                 nostrsearch_indexer::scrape::run_pass(state.clone(), node_sink.clone(), cfg).await;
                 tracing::info!(

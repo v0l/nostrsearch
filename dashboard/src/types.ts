@@ -48,6 +48,8 @@ export interface SyncRelay {
   days: number;
   events_seen: number;
   events_new: number;
+  /** Set while the relay is being left alone after repeated failures. */
+  dead_until?: number;
   url: string;
   sources: number;
   negentropy: boolean | null;

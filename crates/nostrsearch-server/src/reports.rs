@@ -210,6 +210,9 @@ struct SyncRelay {
     days: u64,
     events_seen: u64,
     events_new: u64,
+    /// Set while the relay is being left alone after repeated failures.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dead_until: Option<u64>,
 }
 
 async fn sync_status(
@@ -238,6 +241,7 @@ async fn sync_status(
                     days: t.days,
                     events_seen: t.seen,
                     events_new: t.new,
+                    dead_until: i.dead_until,
                 }
             })
             .collect();
