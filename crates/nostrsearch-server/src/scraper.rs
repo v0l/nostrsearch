@@ -96,6 +96,13 @@ pub struct ScraperOptions {
     pub index_root: PathBuf,
     pub state_dir: PathBuf,
     pub min_date: u64,
+    /// Cap on how many discovered relays are ever targeted. `0` means no cap.
+    ///
+    /// This is not a rate limit: it permanently discards everything past the
+    /// cut, so a capped scraper never sees those relays' history at all. The
+    /// real throughput bounds are `concurrency` and the birthday logic that
+    /// retires a relay after enough empty days -- both of which apply however
+    /// many relays are known.
     pub max_relays: usize,
     pub min_sources: u32,
     pub concurrency: usize,
@@ -124,7 +131,9 @@ impl ScraperOptions {
                 .ok()
                 .and_then(|v| nostrsearch_indexer::scrape::parse_date(&v))
                 .unwrap_or_else(|| nostrsearch_indexer::scrape::parse_date("2022-01-01").unwrap()),
-            max_relays: u("SCRAPE_MAX_RELAYS", 200) as usize,
+            // Unlimited by default: the network has thousands of relays and
+            // discarding all but the most-advertised 200 silently caps coverage.
+            max_relays: u("SCRAPE_MAX_RELAYS", 0) as usize,
             min_sources: u("SCRAPE_MIN_SOURCES", 3) as u32,
             concurrency: u("SCRAPE_CONCURRENCY", 8) as usize,
             floor_secs: u("SCRAPE_FLOOR_MINS", 10) * 60,
@@ -218,7 +227,11 @@ pub fn spawn_scraper(
                         for (url, sources) in found
                             .iter()
                             .filter(|(_, n)| *n >= opts.min_sources as u64)
-                            .take(opts.max_relays)
+                            .take(if opts.max_relays == 0 {
+                                usize::MAX
+                            } else {
+                                opts.max_relays
+                            })
                         {
                             let mut info = existing.get(url).cloned().unwrap_or_default();
                             info.sources = *sources as u32;

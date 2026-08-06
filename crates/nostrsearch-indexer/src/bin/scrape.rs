@@ -49,8 +49,8 @@ struct Args {
           value_parser = parse_date_arg)]
     min_date: u64,
 
-    /// Scrape the top N relays by advertiser count
-    #[arg(long, value_name = "N", default_value_t = 300)]
+    /// Scrape the top N relays by advertiser count; 0 for no limit
+    #[arg(long, value_name = "N", default_value_t = 0)]
     max_relays: usize,
 
     /// Minimum distinct advertisers for a relay to qualify
@@ -205,7 +205,11 @@ fn main() -> anyhow::Result<()> {
         for (url, sources) in found
             .iter()
             .filter(|(_, n)| *n >= args.min_sources)
-            .take(args.max_relays)
+            .take(if args.max_relays == 0 {
+                usize::MAX
+            } else {
+                args.max_relays
+            })
         {
             let mut info = existing.get(url).cloned().unwrap_or_default();
             info.sources = *sources;
