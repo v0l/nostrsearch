@@ -135,7 +135,10 @@ impl ScraperOptions {
             // discarding all but the most-advertised 200 silently caps coverage.
             max_relays: u("SCRAPE_MAX_RELAYS", 0) as usize,
             min_sources: u("SCRAPE_MIN_SOURCES", 3) as u32,
-            concurrency: u("SCRAPE_CONCURRENCY", 8) as usize,
+            // Concurrent relay/day queries. Each relay walks its days serially,
+            // so this is also the number of outstanding queries, and it is the
+            // only bound on network load now that discovery is uncapped.
+            concurrency: u("SCRAPE_CONCURRENCY", 50) as usize,
             floor_secs: u("SCRAPE_FLOOR_MINS", 10) * 60,
             birthday_days: u("SCRAPE_BIRTHDAY_DAYS", 14) as u32,
             pass_interval: std::time::Duration::from_secs(u("SCRAPE_PASS_INTERVAL_SECS", 1800)),

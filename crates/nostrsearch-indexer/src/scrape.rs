@@ -518,6 +518,12 @@ pub struct ScrapeConfig {
     /// Smallest bisection window in seconds.
     pub floor_secs: u64,
     /// Relays scraped concurrently.
+    /// Concurrent relay/day queries.
+    ///
+    /// Each relay walks its days serially, so this is the number of relays
+    /// being talked to at once *and* the number of outstanding queries: one
+    /// per relay. It is the only thing bounding network load now that relay
+    /// discovery is uncapped.
     pub concurrency: usize,
     /// Consecutive empty days before concluding we've walked past the relay's
     /// data horizon ("birthday") and stopping.
@@ -529,7 +535,7 @@ impl Default for ScrapeConfig {
         Self {
             min_date: parse_date("2022-01-01").unwrap_or(0),
             floor_secs: 600,
-            concurrency: 8,
+            concurrency: 50,
             empty_days_limit: 14,
         }
     }
@@ -548,17 +554,26 @@ pub async fn run_pass<S: Sink>(
     targets.sort_by(|a, b| b.1.sources.cmp(&a.1.sources));
     tracing::info!(relays = targets.len(), "scrape pass starting");
 
+    // Acquire *before* spawning, not inside the task.
+    //
+    // Spawning first and taking the permit inside meant one live task per
+    // known relay from the moment a pass began, each holding its own clones of
+    // the state, sink and config, all parked on the semaphore. That was
+    // tolerable when discovery was capped at 200 and is not now that it is
+    // uncapped: a node that finds thousands of relays would spawn thousands of
+    // tasks to run 50 of them. Waiting for the permit here keeps the number of
+    // live tasks equal to the concurrency limit.
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(cfg.concurrency.max(1)));
     let mut handles = Vec::new();
     for (url, info) in targets {
-        let sem = sem.clone();
+        let Ok(permit) = sem.clone().acquire_owned().await else {
+            break;
+        };
         let state = state.clone();
         let sink = sink.clone();
         let cfg = cfg.clone();
         handles.push(tokio::spawn(async move {
-            let Ok(_permit) = sem.acquire_owned().await else {
-                return;
-            };
+            let _permit = permit;
             scrape_relay(&url, info, state, sink, &cfg).await;
         }));
     }
@@ -745,4 +760,48 @@ async fn scrape_day<S: Sink>(
         new += sink.process(events.into_iter().collect()).await;
     }
     Ok((seen, new))
+}
+
+#[cfg(test)]
+mod scrape_concurrency_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Permits must be taken before spawning, not inside the task.
+    ///
+    /// Spawning first parks one live task per known relay on the semaphore.
+    /// With discovery uncapped that is thousands of tasks to run `limit` of
+    /// them, each holding its own clones of the state, sink and config. This
+    /// reproduces the shape of the pass loop and asserts that the number of
+    /// tasks in flight never exceeds the limit.
+    #[tokio::test]
+    async fn live_tasks_never_exceed_the_concurrency_limit() {
+        let limit = 4usize;
+        let targets = 200usize;
+        let sem = Arc::new(tokio::sync::Semaphore::new(limit));
+        let live = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let mut handles = Vec::new();
+        for _ in 0..targets {
+            let permit = sem.clone().acquire_owned().await.unwrap();
+            let (live, peak) = (live.clone(), peak.clone());
+            handles.push(tokio::spawn(async move {
+                let _permit = permit;
+                let n = live.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(n, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                live.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+
+        let peak = peak.load(Ordering::SeqCst);
+        assert!(
+            peak <= limit,
+            "at most {limit} relay/day queries may be in flight, saw {peak}"
+        );
+    }
 }

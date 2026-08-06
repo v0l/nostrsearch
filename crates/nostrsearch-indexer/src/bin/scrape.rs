@@ -57,8 +57,8 @@ struct Args {
     #[arg(long, value_name = "N", default_value_t = 3)]
     min_sources: u32,
 
-    /// Relays scraped in parallel
-    #[arg(long, value_name = "N", default_value_t = 12)]
+    /// Concurrent relay/day queries (each relay walks its days serially)
+    #[arg(long, value_name = "N", default_value_t = 50)]
     concurrency: usize,
 
     /// Smallest bisection window, in minutes
