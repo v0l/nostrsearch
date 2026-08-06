@@ -31,7 +31,7 @@ async fn serve(admin: &Keys) -> anyhow::Result<String> {
     let root = tempdir("root");
     let registry = ShardRegistry::open(root.join("index"), ScoreWeights::default())?;
     let state = Arc::new(AppState {
-        registry: Mutex::new(registry),
+        registry,
     });
 
     let (_sink, _handle, ctl, _replay) = nostrsearch_server::node::spawn_writer_with_reports(

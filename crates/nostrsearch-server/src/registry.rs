@@ -6,7 +6,7 @@ use nostrsearch_core::scoring::{CompositeCollector, ScoreWeights, ScoredDoc};
 use nostrsearch_core::shard::ShardId;
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tantivy::collector::TopDocs;
 use tantivy::schema::Value;
 use tantivy::{Index, IndexReader, TantivyDocument};
@@ -84,13 +84,33 @@ fn max_open_readers() -> usize {
 /// that query finishes.
 pub struct ShardRegistry {
     root: PathBuf,
+    /// Open readers and their LRU bookkeeping.
+    ///
+    /// Behind one short-lived lock rather than making the whole registry
+    /// `&mut`. Searching does not mutate anything: it clones out
+    /// `Arc<ShardReader>` handles, which are `Send + Sync`, and works on those.
+    /// The only mutation is opening a reader and recording that it was used.
+    ///
+    /// Having that leak into `&mut self` on `search` forced a `Mutex` around
+    /// the entire registry at the call site, and that mutex was then held for
+    /// the whole query -- so one slow search serialised every other search,
+    /// `/stats` and `/admin/*` behind it. The writer side already scopes its
+    /// map lock to "find or open" and never holds it across the work; this is
+    /// the same rule for reads.
+    open: Mutex<OpenShards>,
+    max_open: usize,
+    /// Oldest shard seen on disk; refreshed by `discover`, read by the planner.
+    earliest: Mutex<ShardId>,
+    weights: ScoreWeights,
+}
+
+/// Reader cache plus the LRU clock that orders it.
+#[derive(Default)]
+struct OpenShards {
     shards: HashMap<ShardId, Arc<ShardReader>>,
     /// Monotonic clock for LRU ordering: shard -> tick of last use.
     used: HashMap<ShardId, u64>,
     clock: u64,
-    max_open: usize,
-    earliest: ShardId,
-    weights: ScoreWeights,
 }
 
 impl ShardRegistry {
@@ -108,13 +128,11 @@ impl ShardRegistry {
         max_open: usize,
     ) -> Result<Self, RegistryError> {
         let root = root.into();
-        let mut reg = Self {
+        let reg = Self {
             root,
-            shards: HashMap::new(),
-            used: HashMap::new(),
-            clock: 0,
+            open: Mutex::new(OpenShards::default()),
             max_open: max_open.max(1),
-            earliest: ShardId::new(2020, 11), // nostr genesis-ish default
+            earliest: Mutex::new(ShardId::new(2020, 11)), // nostr genesis-ish default
             weights,
         };
         reg.discover()?;
@@ -122,7 +140,7 @@ impl ShardRegistry {
     }
 
     /// Scan the root for shard directories and record the earliest.
-    pub fn discover(&mut self) -> Result<(), RegistryError> {
+    pub fn discover(&self) -> Result<(), RegistryError> {
         if !self.root.exists() {
             return Ok(());
         }
@@ -137,17 +155,30 @@ impl ShardRegistry {
                 });
             }
         }
-        if let Some(e) = earliest {
-            self.earliest = e;
+        if let Some(e) = earliest
+            && let Ok(mut cur) = self.earliest.lock()
+        {
+            *cur = e;
         }
         Ok(())
     }
 
-    /// Number of shard readers currently held open.
-    pub fn open_readers(&self) -> usize {
-        self.shards.len()
+    /// Oldest shard id discovered on disk.
+    fn earliest(&self) -> ShardId {
+        self.earliest
+            .lock()
+            .map(|e| *e)
+            .unwrap_or_else(|_| ShardId::new(2020, 11))
     }
 
+    /// Number of shard readers currently held open.
+    pub fn open_readers(&self) -> usize {
+        self.open.lock().map(|o| o.shards.len()).unwrap_or(0)
+    }
+
+}
+
+impl OpenShards {
     /// Note a use of `id` for LRU ordering.
     fn touch(&mut self, id: ShardId) {
         self.clock += 1;
@@ -155,8 +186,8 @@ impl ShardRegistry {
     }
 
     /// Drop least-recently-used readers until at most `max_open` remain.
-    fn evict_to_capacity(&mut self) {
-        while self.shards.len() > self.max_open {
+    fn evict_to_capacity(&mut self, max_open: usize) {
+        while self.shards.len() > max_open {
             let Some(victim) = self
                 .used
                 .iter()
@@ -171,12 +202,19 @@ impl ShardRegistry {
             tracing::debug!(shard = %victim.name(), "evicted shard reader (LRU)");
         }
     }
+}
 
+impl ShardRegistry {
     /// Open (or return cached) a shard reader.
-    fn shard(&mut self, id: ShardId) -> Option<Arc<ShardReader>> {
-        if let Some(s) = self.shards.get(&id).cloned() {
-            self.touch(id);
-            return Some(s);
+    fn shard(&self, id: ShardId) -> Option<Arc<ShardReader>> {
+        // Fast path: already open. Take the handle and release the lock -- the
+        // caller searches through the Arc, not through the registry.
+        {
+            let mut open = self.open.lock().ok()?;
+            if let Some(s) = open.shards.get(&id).cloned() {
+                open.touch(id);
+                return Some(s);
+            }
         }
         let dir = self.root.join(id.name());
         if !dir.exists() {
@@ -196,14 +234,21 @@ impl ShardRegistry {
             reader,
             schema: ns,
         });
-        self.shards.insert(id, sr.clone());
-        self.touch(id);
-        self.evict_to_capacity();
+        let mut open = self.open.lock().ok()?;
+        // Another thread may have opened the same shard while this one was
+        // building its reader; prefer theirs so the cache holds one per shard.
+        if let Some(existing) = open.shards.get(&id).cloned() {
+            open.touch(id);
+            return Some(existing);
+        }
+        open.shards.insert(id, sr.clone());
+        open.touch(id);
+        open.evict_to_capacity(self.max_open);
         Some(sr)
     }
 
     /// Execute a search filter: plan, prune shards, fan out, merge, hydrate.
-    pub fn search(&mut self, filter: &SearchFilter) -> Result<Vec<SearchHit>, RegistryError> {
+    pub fn search(&self, filter: &SearchFilter) -> Result<Vec<SearchHit>, RegistryError> {
         // Plan against any open shard's index (schema is identical across
         // shards, so the QueryParser only needs one). If no shard exists yet,
         // there is nothing to search.
@@ -212,21 +257,22 @@ impl ShardRegistry {
         // writer in this process or another) would then never be found. Re-run
         // discovery before giving up so a live node picks up the first shard
         // without a restart.
+        let earliest = self.earliest();
         let anchor = self
-            .shards
-            .values()
-            .next()
-            .cloned()
-            .or_else(|| self.shard(self.earliest))
+            .open
+            .lock()
+            .ok()
+            .and_then(|o| o.shards.values().next().cloned())
+            .or_else(|| self.shard(earliest))
             .or_else(|| {
                 let _ = self.discover();
-                self.shard(self.earliest)
+                self.shard(self.earliest())
             });
         let Some(anchor) = anchor else {
             return Ok(Vec::new());
         };
 
-        let planner = QueryPlanner::new(&anchor.schema, &anchor.index, self.earliest);
+        let planner = QueryPlanner::new(&anchor.schema, &anchor.index, self.earliest());
         let planned = planner.plan(filter)?;
 
         let now = std::time::SystemTime::now()
@@ -358,9 +404,13 @@ impl ShardRegistry {
     }
 
     /// Every shard id present on disk, plus any already-open ones.
-    pub fn all_shard_ids(&mut self) -> Vec<ShardId> {
+    pub fn all_shard_ids(&self) -> Vec<ShardId> {
         let _ = self.discover();
-        let mut ids: std::collections::BTreeSet<ShardId> = self.shards.keys().copied().collect();
+        let mut ids: std::collections::BTreeSet<ShardId> = self
+            .open
+            .lock()
+            .map(|o| o.shards.keys().copied().collect())
+            .unwrap_or_default();
         if self.root.exists() {
             if let Ok(rd) = std::fs::read_dir(&self.root) {
                 for entry in rd.flatten() {
@@ -375,7 +425,7 @@ impl ShardRegistry {
     }
 
     /// Fetch a single event by id across all shards.
-    pub fn get_event(&mut self, event_id: &str) -> Result<Option<SearchHit>, RegistryError> {
+    pub fn get_event(&self, event_id: &str) -> Result<Option<SearchHit>, RegistryError> {
         let filter = SearchFilter {
             limit: 1,
             ..Default::default()
@@ -402,7 +452,7 @@ impl ShardRegistry {
 
     /// Cluster stats. Scans the root for shard dirs (not just already-open
     /// readers) so a freshly-opened registry reports the full corpus.
-    pub fn stats(&mut self) -> RegistryStats {
+    pub fn stats(&self) -> RegistryStats {
         // (re)discover in case shards were added since open
         let _ = self.discover();
         let mut ids: Vec<ShardId> = Vec::new();
@@ -435,7 +485,7 @@ impl ShardRegistry {
         RegistryStats {
             total_docs: total,
             shard_count: per_shard.len(),
-            open_readers: self.shards.len(),
+            open_readers: self.open_readers(),
             max_open_readers: self.max_open,
             open_fds: nostrsearch_indexer::mem::open_fds(),
             nofile_soft,

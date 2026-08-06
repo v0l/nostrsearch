@@ -56,7 +56,7 @@ async fn relay_write_is_archived_and_searchable_in_one_process() -> anyhow::Resu
     // Search reader over the same index dir (auto-reloads on commit).
     let registry = ShardRegistry::open(&index_root, ScoreWeights::default())?;
     let state = Arc::new(AppState {
-        registry: Mutex::new(registry),
+        registry,
     });
 
     let app = nostrsearch_server::http::router_full(state.clone(), Some(archive), Some(relay));
@@ -95,7 +95,7 @@ async fn relay_write_is_archived_and_searchable_in_one_process() -> anyhow::Resu
         if reg.stats().total_docs > 0 {
             // Now query through the live server state (shared registry).
             let hits = {
-                let mut r = state.registry.lock().unwrap();
+                let r = &state.registry;
                 r.search(&nostrsearch_core::query::SearchFilter {
                     search: Some(unique.to_string()),
                     limit: 10,
@@ -119,7 +119,7 @@ async fn relay_write_is_archived_and_searchable_in_one_process() -> anyhow::Resu
     // get_event must also find it (it enumerates shard dirs from disk, so a
     // node started against an empty index still resolves later writes).
     let by_id = {
-        let mut r = state.registry.lock().unwrap();
+        let r = &state.registry;
         r.get_event(&event_id)?
     };
     assert!(

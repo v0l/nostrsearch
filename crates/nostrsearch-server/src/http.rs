@@ -10,14 +10,18 @@ use axum::{
 };
 use nostrsearch_core::query::SearchFilter;
 use serde::Deserialize;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Shared application state. The registry is behind a Mutex because shard
 /// readers are lazily opened on first touch; contention is low because reads
 /// dominate and the lock is held only for the fan-out, not hydration of
 /// already-cached readers. (A RwLock + eager open is a later optimization.)
 pub struct AppState {
-    pub registry: Mutex<ShardRegistry>,
+    /// No outer lock: the registry synchronises its own reader cache internally
+    /// and searches through cloned `Arc<ShardReader>` handles. Wrapping it in a
+    /// `Mutex` here meant one slow query serialised every other search, `/stats`
+    /// and `/admin/*` behind it.
+    pub registry: ShardRegistry,
 }
 
 pub type SharedState = Arc<AppState>;
@@ -281,7 +285,7 @@ async fn run_search(
     let mut hits = {
         // Scoped so the registry lock is released before the (async) archive
         // reads: a MutexGuard must not be held across an await.
-        let mut reg = state.app.registry.lock().map_err(|_| ApiError::Poisoned)?;
+        let reg = &state.app.registry;
         reg.search(&filter).map_err(ApiError::Registry)?
     };
     hydrate_events(&state, &mut hits).await;
@@ -317,7 +321,7 @@ async fn get_event(
     // folded the same way or the lookup misses.
     let id = nostrsearch_core::schema::normalize_hex(id.trim());
     let hit = {
-        let mut reg = state.app.registry.lock().map_err(|_| ApiError::Poisoned)?;
+        let reg = &state.app.registry;
         reg.get_event(&id).map_err(ApiError::Registry)?
     };
     match hit {
@@ -334,7 +338,7 @@ async fn get_event(
 // ---------------------------------------------------------------------------
 
 async fn stats(State(state): State<SharedState>) -> Result<Json<RegistryStats>, ApiError> {
-    let mut reg = state.registry.lock().map_err(|_| ApiError::Poisoned)?;
+    let reg = &state.registry;
     Ok(Json(reg.stats()))
 }
 

@@ -18,7 +18,7 @@
 use nostrsearch_core::scoring::ScoreWeights;
 use nostrsearch_indexer::{PipelineConfig, ShardWriterConfig};
 use nostrsearch_server::{AppState, ArchiveState, ShardRegistry};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 // The environment contract is defined once in nostrsearch_indexer::env so the
 // server node, `ingest` and `stats` all agree on the same variables.
@@ -90,7 +90,7 @@ async fn main() -> anyhow::Result<()> {
     };
     tracing::info!(index_root = %index_root.display(), docs, "opened index root");
     let state = Arc::new(AppState {
-        registry: Mutex::new(registry),
+        registry,
     });
 
     // ── Archive: one handle for this process (relay + firehose share it) ────

@@ -33,7 +33,7 @@ async fn signed_event_published_to_relay_lands_in_archive() -> anyhow::Result<()
     // Search state (empty index is fine; we're exercising relay + archive).
     let registry = ShardRegistry::open(&index_dir, ScoreWeights::default())?;
     let state = Arc::new(AppState {
-        registry: Mutex::new(registry),
+        registry,
     });
 
     // Relay mode: this process owns the archive index lock.

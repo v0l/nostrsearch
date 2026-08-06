@@ -29,7 +29,7 @@ async fn serve(store: ReportStore) -> anyhow::Result<String> {
     let index_root = tempdir("idx");
     let registry = ShardRegistry::open(&index_root, ScoreWeights::default())?;
     let state = Arc::new(AppState {
-        registry: Mutex::new(registry),
+        registry,
     });
     let app = nostrsearch_server::http::router_all(state, None, None, Some(store));
 
