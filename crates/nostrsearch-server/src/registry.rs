@@ -272,8 +272,10 @@ impl ShardRegistry {
             return Ok(Vec::new());
         };
 
+        let t_plan = std::time::Instant::now();
         let planner = QueryPlanner::new(&anchor.schema, &anchor.index, self.earliest());
         let planned = planner.plan(filter)?;
+        let plan_ms = t_plan.elapsed().as_millis();
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -292,11 +294,13 @@ impl ShardRegistry {
         //
         // Shards are independent indices and a `Searcher` is `Sync`, so there is
         // nothing to serialise here but the merge at the end.
+        let t_resolve = std::time::Instant::now();
         let resolved: Vec<Arc<ShardReader>> = planned
             .shards
             .iter()
             .filter_map(|id| self.shard(*id))
             .collect();
+        let resolve_ms = t_resolve.elapsed().as_millis();
 
         let weights = self.weights;
         let limit = filter.limit;
@@ -307,19 +311,28 @@ impl ShardRegistry {
             .unwrap_or(4)
             .min(resolved.len().max(1));
 
+        let t_fan = std::time::Instant::now();
+        // Per-shard wall time, so a slow tail is visible rather than averaged
+        // away: the interesting question is whether cost is spread across all
+        // shards or concentrated in a handful.
+        let shard_us = std::sync::Mutex::new(Vec::<(ShardId, u128)>::new());
         let next = std::sync::atomic::AtomicUsize::new(0);
         let mut hits: Vec<SearchHit> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..workers)
                 .map(|_| {
-                    let (next, resolved) = (&next, &resolved);
+                    let (next, resolved, shard_us) = (&next, &resolved, &shard_us);
                     scope.spawn(move || {
                         let mut local: Vec<SearchHit> = Vec::new();
                         loop {
                             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let Some(shard) = resolved.get(i) else { break };
+                            let t = std::time::Instant::now();
                             Self::search_one(
                                 shard, query, text_query, limit, weights, now, &mut local,
                             );
+                            if let Ok(mut v) = shard_us.lock() {
+                                v.push((shard.id, t.elapsed().as_micros()));
+                            }
                         }
                         local
                     })
@@ -331,7 +344,29 @@ impl ShardRegistry {
                 .flatten()
                 .collect()
         });
-        let _ = &mut hits;
+        let fan_ms = t_fan.elapsed().as_millis();
+
+        // One line with the whole shape of the query: which phase held the
+        // time, how wide the fan-out was, and how lopsided the shards are.
+        let mut per = shard_us.into_inner().unwrap_or_default();
+        per.sort_by_key(|(_, us)| std::cmp::Reverse(*us));
+        let busiest: Vec<String> = per
+            .iter()
+            .take(5)
+            .map(|(id, us)| format!("{}={}ms", id.name(), us / 1000))
+            .collect();
+        let total_shard_ms: u128 = per.iter().map(|(_, us)| us / 1000).sum();
+        tracing::info!(
+            plan_ms,
+            resolve_ms,
+            fan_ms,
+            workers,
+            shards = resolved.len(),
+            planned = planned.shards.len(),
+            shard_ms_sum = total_shard_ms,
+            busiest = busiest.join(" "),
+            "search timing"
+        );
 
         // Merge across shards: composite score for text queries, created_at
         // (encoded in score) for metadata queries.
