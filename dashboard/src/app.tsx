@@ -166,7 +166,14 @@ function Console() {
   const session = useSession(onAuthError);
 
   const stats = usePoll<RegistryStats>(api.stats, 5000);
-  const sync = usePoll<SyncStatus>(api.sync, 5000);
+  // Relay paging: the scraper can discover thousands, so the list is a window.
+  const [relayOffset, setRelayOffset] = useState(0);
+  const sync = usePoll<SyncStatus>(
+    () => api.sync(relayOffset, 50),
+    5000,
+    true,
+    relayOffset,
+  );
   const reports = useReports();
 
   const authed = session.authed;
@@ -196,7 +203,13 @@ function Console() {
         <Corpus stats={stats.data} />
         <Ingest authed={authed} gate={gate} />
         <Analyses authed={authed} gate={gate} />
-        <Relays sync={sync.data} authed={authed} gate={gate} />
+        <Relays
+          sync={sync.data}
+          authed={authed}
+          gate={gate}
+          offset={relayOffset}
+          onPage={setRelayOffset}
+        />
         <IndexPanel stats={stats.data} />
       </main>
     </div>

@@ -63,10 +63,14 @@ export function Relays({
   sync,
   authed,
   gate,
+  offset,
+  onPage,
 }: {
   sync: SyncStatus | null;
   authed: boolean;
   gate: string;
+  offset: number;
+  onPage: (next: number) => void;
 }) {
   const notify = useNotify();
   const [relay, setRelay] = useState("");
@@ -178,6 +182,29 @@ export function Relays({
           </tbody>
         </table>
       </div>
+
+      {sync && sync.relays.total > rows.length ? (
+        <div class="pager">
+          <button
+            class="btn tiny"
+            disabled={offset <= 0}
+            onClick={() => onPage(Math.max(0, offset - sync.relays.limit))}
+          >
+            &larr; Prev
+          </button>
+          <span class="pager-at">
+            {num(offset + 1)}&ndash;{num(offset + rows.length)} of{" "}
+            {num(sync.relays.total)}
+          </span>
+          <button
+            class="btn tiny"
+            disabled={offset + rows.length >= sync.relays.total}
+            onClick={() => onPage(offset + sync.relays.limit)}
+          >
+            Next &rarr;
+          </button>
+        </div>
+      ) : null}
 
       <hr class="hr" />
 

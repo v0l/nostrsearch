@@ -56,6 +56,8 @@ export interface SyncRelay {
 export interface SyncStatus {
   relays: {
     total: number;
+    offset: number;
+    limit: number;
     negentropy: number;
     no_negentropy: number;
     unprobed: number;

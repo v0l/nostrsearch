@@ -123,7 +123,19 @@ export interface Poll<T> {
 }
 
 /** Poll an endpoint on an interval. `enabled: false` parks it entirely. */
-export function usePoll<T>(fn: () => Promise<T>, ms: number, enabled = true): Poll<T> {
+/**
+ * Poll `fn` every `ms`.
+ *
+ * `key` re-runs the fetch immediately when it changes, for a poll whose target
+ * moves -- a paged list, say. Without it a page change waits out the interval
+ * before showing anything.
+ */
+export function usePoll<T>(
+  fn: () => Promise<T>,
+  ms: number,
+  enabled = true,
+  key?: string | number,
+): Poll<T> {
   const [data, setData] = useState<T | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(enabled);
@@ -152,7 +164,7 @@ export function usePoll<T>(fn: () => Promise<T>, ms: number, enabled = true): Po
       alive = false;
       clearInterval(h);
     };
-  }, [ms, enabled, tick]);
+  }, [ms, enabled, tick, key]);
 
   return { data, error, loading, refresh: useCallback(() => setTick((t) => t + 1), []) };
 }

@@ -904,3 +904,11 @@ body.page .readout .v.mute {
   font: 400 13px var(--mono);
   letter-spacing: 0;
 }
+
+/* Relay list pager. The scraper can discover thousands of relays, so the
+   table is a window onto them rather than the whole set. */
+.pager { display: flex; align-items: center; justify-content: center;
+  gap: 12px; margin-top: 10px; }
+.pager-at { font-size: 11px; letter-spacing: .08em; color: var(--slate);
+  font-variant-numeric: tabular-nums; }
+.pager .btn[disabled] { opacity: .35; cursor: default; }

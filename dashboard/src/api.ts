@@ -151,7 +151,8 @@ export const api = {
   stats: () => open<RegistryStats>("/stats"),
   // No trailing slashes: axum's nest("/sync", …) with a "/" child matches the
   // prefix exactly, and 404s on "/sync/".
-  sync: () => open<SyncStatus>("/sync"),
+  sync: (offset = 0, limit = 50) =>
+    open<SyncStatus>(`/sync?offset=${offset}&limit=${limit}`),
   archiveFiles: () => open<ArchiveFileInfo[]>("/archive/files"),
   /**
    * Archive totals. `total_events` is the count of distinct ids the archive

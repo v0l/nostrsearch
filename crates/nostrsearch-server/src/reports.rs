@@ -159,6 +159,26 @@ struct SyncStatus {
     scrape: nostrsearch_indexer::scrape::ScrapeProgress,
 }
 
+/// Page controls for the relay list.
+///
+/// The list used to be a hard-truncated top 50 with no way to see past it,
+/// which on a node that discovers thousands of relays meant most of them were
+/// simply invisible.
+#[derive(serde::Deserialize)]
+struct RelayPage {
+    #[serde(default)]
+    offset: usize,
+    limit: Option<usize>,
+}
+
+impl RelayPage {
+    /// Page size, defaulted and bounded. The cap is about response size, not
+    /// policy: a caller that wants everything pages through it.
+    fn limit(&self) -> usize {
+        self.limit.unwrap_or(50).clamp(1, 500)
+    }
+}
+
 #[derive(Serialize)]
 struct SyncRelays {
     total: usize,
@@ -170,6 +190,10 @@ struct SyncRelays {
     unprobed: usize,
     /// Currently failing (consecutive day-level failures).
     failing: usize,
+    /// Where this page starts, and how many were returned.
+    offset: usize,
+    limit: usize,
+    /// One page of relays, most-advertised first.
     top: Vec<SyncRelay>,
 }
 
@@ -186,7 +210,9 @@ struct SyncRelay {
 
 async fn sync_status(
     State(state): State<std::sync::Arc<nostrsearch_indexer::scrape::ScrapeState>>,
+    axum::extract::Query(page): axum::extract::Query<RelayPage>,
 ) -> impl IntoResponse {
+    let (offset, limit) = (page.offset, page.limit());
     // RocksDB scans are blocking work; keep them off the async worker.
     let out = tokio::task::spawn_blocking(move || {
         let relays = state.relays();
@@ -203,8 +229,9 @@ async fn sync_status(
             })
             .collect();
         // Most-advertised relays first: the ones that matter for coverage.
-        top.sort_by(|a, b| b.sources.cmp(&a.sources));
-        top.truncate(50);
+        // Sort before slicing so paging is stable across requests.
+        top.sort_by(|a, b| b.sources.cmp(&a.sources).then_with(|| a.url.cmp(&b.url)));
+        let top: Vec<SyncRelay> = top.into_iter().skip(offset).take(limit).collect();
 
         SyncStatus {
             relays: SyncRelays {
@@ -222,6 +249,8 @@ async fn sync_status(
                     .filter(|(_, i)| i.negentropy.is_none())
                     .count(),
                 failing: relays.iter().filter(|(_, i)| i.fails > 0).count(),
+                offset,
+                limit,
                 top,
             },
             scrape: state.progress(25),
@@ -377,6 +406,41 @@ mod tests {
         // No-op drains produce no traffic at all.
         s.apply_deltas(1_700_000_001, vec![]);
         assert!(rx.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod relay_page_tests {
+    use super::*;
+
+    fn page(offset: usize, limit: Option<usize>) -> RelayPage {
+        RelayPage { offset, limit }
+    }
+
+    /// The relay list was a hard top-50 with nothing behind it, so a node that
+    /// discovers thousands of relays showed 50 and hid the rest. Paging has to
+    /// default to something small, honour a caller's size, and refuse a size
+    /// that would serialise the whole set into one response.
+    #[test]
+    fn page_size_is_defaulted_and_bounded() {
+        assert_eq!(page(0, None).limit(), 50, "default stays small");
+        assert_eq!(page(0, Some(200)).limit(), 200, "caller's size is honoured");
+        assert_eq!(page(0, Some(0)).limit(), 1, "zero is not a page");
+        assert_eq!(page(0, Some(10_000)).limit(), 500, "capped for response size");
+    }
+
+    /// Paging is only coherent if the order is total. Sorting by advertiser
+    /// count alone leaves ties in arbitrary order, so a relay could appear on
+    /// two pages or none as the map rehashes between requests.
+    #[test]
+    fn ordering_breaks_ties_so_paging_is_stable() {
+        let mut v = vec![("b.example", 5u32), ("a.example", 5), ("c.example", 9)];
+        v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        assert_eq!(
+            v.iter().map(|(u, _)| *u).collect::<Vec<_>>(),
+            vec!["c.example", "a.example", "b.example"],
+            "equal advertiser counts must fall back to a stable key"
+        );
     }
 }
 
