@@ -35,10 +35,19 @@ pub struct RelayInfo {
     pub fails: u32,
     /// Unix secs of the last successful day.
     pub last_ok: u64,
-    /// Detected data horizon: day-start (unix secs) before which the relay
-    /// returned nothing. Passes never walk earlier than this — relays prune
-    /// or simply didn't exist, and hammering empty history wastes both sides'
-    /// bandwidth forever.
+    /// Oldest day-start (unix secs) this relay has actually returned events
+    /// for.
+    ///
+    /// Informational only. It must **not** bound which days are drawn: it
+    /// records where data was *found*, not where data *ends*. Using it as a
+    /// floor meant the first successful draw pinned the relay's history at
+    /// that day and everything older was never sampled again.
+    ///
+    /// Walking backwards contiguously, the old scraper could infer a real
+    /// horizon from consecutive empty days. Sampling at random cannot: an
+    /// empty day is one absent day, not a boundary. Empty days are recorded
+    /// like any other, so they are drawn at most once each and the cost of
+    /// probing below a relay's real start is bounded and paid once.
     #[serde(default)]
     pub birthday: Option<u64>,
     /// Unix secs until which this relay is considered dead and not probed.
@@ -649,10 +658,9 @@ type RelayDay = (String, RelayInfo, String, u64, u64);
 
 /// Draw up to `limit` relay-days at random.
 ///
-/// Days already recorded, days before `min_date`, and days behind a relay's
-/// known birthday are not candidates. Relays are sampled without replacement
-/// within a batch so one relay cannot take every slot and open several
-/// connections to itself.
+/// Days already recorded and days before `min_date` are not candidates.
+/// Relays are sampled without replacement within a batch so one relay cannot
+/// take every slot and open several connections to itself.
 fn plan_batch(
     targets: &[(String, RelayInfo)],
     state: &std::sync::Arc<ScrapeState>,
@@ -681,7 +689,9 @@ fn plan_batch(
         }
 
         // The oldest day worth asking this relay for.
-        let floor = cfg.min_date.max(info.birthday.unwrap_or(0));
+        // Only the configured floor. See `RelayInfo::birthday`: gating on it
+        // truncated every relay's history at its first successful draw.
+        let floor = cfg.min_date;
         if floor >= today_start {
             continue;
         }
@@ -941,9 +951,15 @@ mod scrape_concurrency_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Nothing older than the relay's horizon is worth asking for.
+    /// Finding data must not truncate the history still to be scraped.
+    ///
+    /// `birthday` records the oldest day a relay has *returned* events for.
+    /// It was also used as the floor for drawing days, so the first
+    /// successful draw pinned the relay's history there and nothing older was
+    /// ever sampled again -- a relay whose first random hit landed in 2026
+    /// would never be scraped for 2022.
     #[test]
-    fn days_behind_the_birthday_are_not_drawn() {
+    fn days_older_than_the_oldest_known_data_are_still_drawn() {
         let (st, dir) = state("bday");
         let now = chrono::Utc::now().timestamp() as u64;
         let today = now - (now % 86_400);
@@ -955,14 +971,21 @@ mod scrape_concurrency_tests {
         let cfg = super::ScrapeConfig::default();
         let mut rng = rand::thread_rng();
 
+        let mut saw_older = false;
         for _ in 0..200 {
             for (_, _, _, start, _) in super::plan_batch(&t, &st, &cfg, 10, &mut rng) {
-                assert!(
-                    start >= birthday,
-                    "drew {start}, behind the relay birthday {birthday}"
-                );
+                assert!(start >= cfg.min_date, "drew below the configured floor");
+                if start < birthday {
+                    saw_older = true;
+                }
             }
         }
+        assert!(
+            saw_older,
+            "days older than the oldest known data must still be drawn, or a \
+             relay's history is truncated at whichever day happened to be hit \
+             first"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 
