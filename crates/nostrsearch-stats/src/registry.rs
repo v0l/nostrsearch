@@ -31,6 +31,8 @@ pub trait DynAnalysis: Send + Sync {
     fn refresh_interval(&self) -> Option<Duration>;
     fn attach(&mut self, ctx: &crate::AttachCtx) -> Result<()>;
     fn wants(&self, ev: &NostrEvent) -> bool;
+    /// Kinds this analysis consumes, or `None` for "all of them".
+    fn kinds_dyn(&self) -> Option<Vec<u16>>;
     fn observe(&mut self, ev: &NostrEvent, ctx: &AnalysisCtx) -> bool;
     fn refresh(&mut self);
     fn contribute(&self, world: &mut World);
@@ -64,6 +66,9 @@ where
     }
     fn wants(&self, ev: &NostrEvent) -> bool {
         Analysis::wants(self, ev)
+    }
+    fn kinds_dyn(&self) -> Option<Vec<u16>> {
+        Analysis::kinds(self).map(|k| k.to_vec())
     }
     fn observe(&mut self, ev: &NostrEvent, ctx: &AnalysisCtx) -> bool {
         Analysis::observe(self, ev, ctx)
@@ -494,6 +499,21 @@ impl Registry {
 
     /// Run due refreshes for `stage` and materialize its producers into `world`.
     /// `now_wall` is real wall-clock unix secs (drives refresh intervals).
+    /// Union of the kinds every analysis in `stage` consumes.
+    ///
+    /// `None` means at least one of them takes everything, so nothing can be
+    /// filtered out. `Some(ks)` means a replay for this stage only has to look
+    /// at those kinds -- rebuilding pagerank walks the whole corpus to fold
+    /// kind 3, and `wants()` only saves the fold, which is the cheap half.
+    pub fn stage_kinds(&self, stage: &[usize]) -> Option<Vec<u16>> {
+        let mut all = std::collections::BTreeSet::new();
+        for &i in stage {
+            let ks = self.entries[i].analysis.kinds_dyn()?;
+            all.extend(ks);
+        }
+        Some(all.into_iter().collect())
+    }
+
     pub fn materialize_stage(&mut self, stage: &[usize], now_wall: u64, world: &mut World) {
         for &i in stage {
             if let Some(d) = self.entries[i].analysis.refresh_interval() {

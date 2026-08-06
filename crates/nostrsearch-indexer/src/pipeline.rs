@@ -467,6 +467,26 @@ impl Pipeline {
     /// its follower counts / WoT tiers), mark it backfilled, and advance.
     ///
     /// Returns `true` if another pass over the corpus is required.
+    /// Kinds this pass actually needs, or `None` for all of them.
+    ///
+    /// An indexing pass always returns `None`: the index is the product and it
+    /// holds every kind regardless of what the analyses want.
+    /// Whether this pass has to read the corpus at all.
+    ///
+    /// A stage whose analyses consume no events -- pagerank derives entirely
+    /// from `follow_graph`'s on-disk adjacency -- has nothing to read. Such a
+    /// pass only needs its refresh and materialize step.
+    pub fn pass_needs_corpus(&self) -> bool {
+        !matches!(self.pass_kinds(), Some(ks) if ks.is_empty())
+    }
+
+    pub fn pass_kinds(&self) -> Option<Vec<u16>> {
+        if self.indexes_this_pass() {
+            return None;
+        }
+        self.registry.stage_kinds(&self.stages[self.pass])
+    }
+
     pub fn advance_pass(&mut self) -> bool {
         let stage = self.stages[self.pass].clone();
         let now_wall = Self::now();

@@ -21,7 +21,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
 
-const KIND_CONTACTS: &[u16] = &[3];
 
 /// Node cap for the in-RAM power iteration (~64 bytes per node for the index
 /// alone, before adjacency). 5M nodes is roughly 1GB of index.
@@ -92,8 +91,18 @@ impl Analysis for Pagerank {
         "pagerank"
     }
 
+    /// No events at all.
+    ///
+    /// This used to declare kind 3, which is `follow_graph`'s input,
+    /// not this analysis's. `observe` discards everything it is handed -- the
+    /// ranks come from power iteration over the adjacency `follow_graph`
+    /// maintains on disk -- so routing kind 3 here only ever cost a corpus
+    /// replay to feed a function that returns false.
+    ///
+    /// An empty set means a rebuild for this analysis needs no events, which
+    /// lets the replay be skipped rather than merely filtered.
     fn kinds(&self) -> Option<&[u16]> {
-        Some(KIND_CONTACTS)
+        Some(&[])
     }
 
     fn refresh_interval(&self) -> Option<Duration> {
@@ -208,6 +217,29 @@ impl Analysis for Pagerank {
         v.truncate(1000);
         v
     }
+}
+
+#[cfg(test)]
+mod corpus_tests {
+    use super::*;
+    use crate::Analysis;
+
+    /// Pagerank must not ask for events.
+    ///
+    /// It declared kind 3 -- `follow_graph`'s input -- while `observe`
+    /// discarded everything, so re-deriving it replayed the whole corpus to
+    /// feed a function that returns false. Its ranks come from power iteration
+    /// over the adjacency `follow_graph` keeps on disk.
+    #[test]
+    fn consumes_no_events_so_a_rebuild_reads_nothing() {
+        let p = Pagerank::default();
+        assert_eq!(
+            Analysis::kinds(&p),
+            Some(&[][..]),
+            "pagerank takes its input from the follow graph, not the corpus"
+        );
+    }
+
 }
 
 #[cfg(test)]
