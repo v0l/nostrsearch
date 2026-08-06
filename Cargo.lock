@@ -1955,6 +1955,7 @@ dependencies = [
  "nostrsearch-archive",
  "nostrsearch-core",
  "nostrsearch-stats",
+ "rand 0.8.7",
  "reqwest",
  "rocksdb",
  "rustls",

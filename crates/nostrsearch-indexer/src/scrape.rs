@@ -549,44 +549,119 @@ pub async fn run_pass<S: Sink>(
     sink: std::sync::Arc<S>,
     cfg: ScrapeConfig,
 ) {
-    let mut targets = state.relays();
-    // Most-advertised relays first: they close the biggest gaps soonest.
-    targets.sort_by(|a, b| b.1.sources.cmp(&a.1.sources));
+    let targets = state.relays();
     tracing::info!(relays = targets.len(), "scrape pass starting");
 
-    // Acquire *before* spawning, not inside the task.
+    // Work is a (relay, day) pair drawn at random, run in batches of at most
+    // `concurrency`.
     //
-    // Spawning first and taking the permit inside meant one live task per
-    // known relay from the moment a pass began, each holding its own clones of
-    // the state, sink and config, all parked on the semaphore. That was
-    // tolerable when discovery was capped at 200 and is not now that it is
-    // uncapped: a node that finds thousands of relays would spawn thousands of
-    // tasks to run 50 of them. Waiting for the permit here keeps the number of
-    // live tasks equal to the concurrency limit.
-    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(cfg.concurrency.max(1)));
-    let mut handles = Vec::new();
-    for (url, info) in targets {
-        let Ok(permit) = sem.clone().acquire_owned().await else {
+    // The old shape was one task per relay walking days backwards from
+    // yesterday. That made the most-advertised relays monopolise the workers
+    // for as long as their history took, so a relay far down the list waited
+    // out everything above it, and an interrupted pass always left the same
+    // tail unscraped. Sampling relay-days spreads progress evenly: every relay
+    // advances a little on every pass, and coverage fills in uniformly rather
+    // than front to back.
+    let mut rng = rand::thread_rng();
+    let batch_size = cfg.concurrency.max(1);
+    let mut scraped = 0u64;
+
+    loop {
+        let batch = plan_batch(&targets, &state, &cfg, batch_size, &mut rng);
+        if batch.is_empty() {
             break;
-        };
-        let state = state.clone();
-        let sink = sink.clone();
-        let cfg = cfg.clone();
-        handles.push(tokio::spawn(async move {
-            let _permit = permit;
-            scrape_relay(&url, info, state, sink, &cfg).await;
-        }));
+        }
+
+        let mut handles = Vec::with_capacity(batch.len());
+        for (url, info, date, start, end) in batch {
+            let state = state.clone();
+            let sink = sink.clone();
+            let cfg = cfg.clone();
+            handles.push(tokio::spawn(async move {
+                scrape_relay_day(&url, info, &date, start, end, state, sink, &cfg).await;
+            }));
+        }
+        // Await the whole batch before drawing the next, so in-flight queries
+        // never exceed `concurrency` even briefly.
+        for h in handles {
+            let _ = h.await;
+        }
+        scraped += batch_size as u64;
+        if scraped % (batch_size as u64 * 20) == 0 {
+            tracing::info!(scraped, "scrape pass progress");
+        }
     }
-    for h in handles {
-        let _ = h.await;
-    }
-    tracing::info!("scrape pass complete");
+    tracing::info!(scraped, "scrape pass complete");
 }
 
-/// Walk one relay backwards day-by-day until `min_date` or repeated failures.
-async fn scrape_relay<S: Sink>(
+/// One unit of work: a relay and the day to fetch from it.
+type RelayDay = (String, RelayInfo, String, u64, u64);
+
+/// Draw up to `limit` relay-days at random.
+///
+/// Days already recorded, days before `min_date`, and days behind a relay's
+/// known birthday are not candidates. Relays are sampled without replacement
+/// within a batch so one relay cannot take every slot and open several
+/// connections to itself.
+fn plan_batch(
+    targets: &[(String, RelayInfo)],
+    state: &std::sync::Arc<ScrapeState>,
+    cfg: &ScrapeConfig,
+    limit: usize,
+    rng: &mut impl rand::Rng,
+) -> Vec<RelayDay> {
+    use rand::seq::SliceRandom;
+
+    let now = chrono::Utc::now().timestamp() as u64;
+    let today_start = now - (now % 86_400);
+
+    let mut order: Vec<usize> = (0..targets.len()).collect();
+    order.shuffle(rng);
+
+    let mut out = Vec::with_capacity(limit);
+    for idx in order {
+        if out.len() >= limit {
+            break;
+        }
+        let (url, info) = &targets[idx];
+
+        // The oldest day worth asking this relay for.
+        let floor = cfg.min_date.max(info.birthday.unwrap_or(0));
+        if floor >= today_start {
+            continue;
+        }
+        let span_days = (today_start - floor) / 86_400;
+        if span_days == 0 {
+            continue;
+        }
+
+        // Sample a few days for this relay rather than scanning its whole
+        // history: with years of days a linear scan for an unfinished one
+        // costs more than the query it schedules.
+        for _ in 0..8 {
+            let back = rng.gen_range(1..=span_days);
+            let (date, start, end) = day_bounds(back);
+            if start < floor {
+                continue;
+            }
+            if state.day_done(&date, url) {
+                continue;
+            }
+            out.push((url.clone(), info.clone(), date, start, end));
+            break;
+        }
+    }
+    out
+}
+
+/// Fetch one day from one relay and record the outcome.
+#[allow(clippy::too_many_arguments)]
+async fn scrape_relay_day<S: Sink>(
     url: &str,
     mut info: RelayInfo,
+    date: &str,
+    start: u64,
+    end: u64,
     state: std::sync::Arc<ScrapeState>,
     sink: std::sync::Arc<S>,
     cfg: &ScrapeConfig,
@@ -599,76 +674,39 @@ async fn scrape_relay<S: Sink>(
     }
     client.connect().await;
 
-    let mut days_back = 1u64;
-    let mut consecutive_fails = 0u32;
-    let mut consecutive_empty = 0u32;
-    loop {
-        let (date, start, end) = day_bounds(days_back);
-        if start < cfg.min_date {
-            break;
-        }
-        // Past the relay's known data horizon: nothing exists back there.
-        if info.birthday.is_some_and(|b| start < b) {
-            break;
-        }
-        days_back += 1;
-        if state.day_done(&date, url) {
-            continue;
-        }
-
-        match scrape_day(&client, url, &mut info, &sink, start, end, cfg.floor_secs).await {
-            Ok((seen, new)) => {
-                consecutive_fails = 0;
-                info.fails = 0;
-                info.last_ok = chrono::Utc::now().timestamp() as u64;
-                state.put_day(
-                    &date,
-                    url,
-                    &DayDone {
-                        seen,
-                        new,
-                        at: info.last_ok,
-                    },
-                );
-                if seen == 0 {
-                    consecutive_empty += 1;
-                    if consecutive_empty >= cfg.empty_days_limit {
-                        // The horizon is where data was last seen, not where
-                        // we noticed: the whole empty streak is before it.
-                        info.birthday = Some(start + u64::from(cfg.empty_days_limit) * 86_400);
-                        tracing::info!(
-                            relay = url,
-                            empty_days = consecutive_empty,
-                            horizon = date,
-                            "relay data horizon detected; stopping backward walk"
-                        );
-                        state.put_relay(url, &info);
-                        break;
-                    }
-                } else {
-                    consecutive_empty = 0;
-                }
-                state.put_relay(url, &info);
-                if new > 0 {
-                    tracing::info!(relay = url, date, seen, new, "day scraped");
-                }
-            }
-            Err(e) => {
-                consecutive_fails += 1;
-                info.fails += 1;
-                state.put_relay(url, &info);
-                tracing::debug!(relay = url, date, error = %e, "day failed");
-                if consecutive_fails >= 3 {
-                    tracing::info!(relay = url, date, "giving up on relay this pass");
-                    break;
-                }
+    match scrape_day(&client, url, &mut info, &sink, start, end, cfg.floor_secs).await {
+        Ok((seen, new)) => {
+            info.fails = 0;
+            info.last_ok = chrono::Utc::now().timestamp() as u64;
+            state.put_day(
+                date,
+                url,
+                &DayDone {
+                    seen,
+                    new,
+                    at: info.last_ok,
+                },
+            );
+            // An empty day at or below the relay's oldest known data is
+            // evidence of its horizon. Days arrive out of order now, so the
+            // old "N consecutive empties" rule cannot apply; instead the
+            // birthday only ever moves forward to the oldest day that did
+            // return something.
+            if seen > 0 {
+                info.birthday = Some(match info.birthday {
+                    Some(b) => b.min(start),
+                    None => start,
+                });
             }
         }
-        // Politeness between days.
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        Err(_) => {
+            info.fails = info.fails.saturating_add(1);
+        }
     }
-    client.disconnect().await;
+    state.put_relay(url, &info);
+    let _ = client.shutdown().await;
 }
+
 
 /// Scrape one (relay, day): negentropy id-reconciliation with gap fetch when
 /// supported, adaptive since/until bisection otherwise.
@@ -766,6 +804,100 @@ async fn scrape_day<S: Sink>(
 mod scrape_concurrency_tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn state(tag: &str) -> (std::sync::Arc<super::ScrapeState>, std::path::PathBuf) {
+        let mut p = std::env::temp_dir();
+        p.push(format!(
+            "nsscrape-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let st = std::sync::Arc::new(super::ScrapeState::open(&p).unwrap());
+        (st, p)
+    }
+
+    fn targets(n: usize) -> Vec<(String, super::RelayInfo)> {
+        (0..n)
+            .map(|i| (format!("wss://r{i}.example"), super::RelayInfo::default()))
+            .collect()
+    }
+
+    /// A batch is the concurrency limit, and no more.
+    #[test]
+    fn batch_is_bounded_and_spread_across_relays() {
+        let (st, dir) = state("bounded");
+        let t = targets(200);
+        let cfg = super::ScrapeConfig::default();
+        let mut rng = rand::thread_rng();
+
+        let batch = super::plan_batch(&t, &st, &cfg, 50, &mut rng);
+        assert!(batch.len() <= 50, "batch must not exceed the limit");
+        assert!(batch.len() > 40, "should fill a batch from 200 fresh relays");
+
+        // One relay must not take several slots: that would open several
+        // connections to the same host in one batch.
+        let mut urls: Vec<&str> = batch.iter().map(|(u, ..)| u.as_str()).collect();
+        urls.sort_unstable();
+        let before = urls.len();
+        urls.dedup();
+        assert_eq!(before, urls.len(), "a relay may appear at most once per batch");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Days already recorded are not candidates, or a pass would redo work
+    /// forever and never reach the days it has not seen.
+    #[test]
+    fn finished_days_are_never_redrawn() {
+        let (st, dir) = state("done");
+        let t = targets(1);
+        let cfg = super::ScrapeConfig::default();
+        let mut rng = rand::thread_rng();
+
+        // Record every day this relay could be asked for.
+        let now = chrono::Utc::now().timestamp() as u64;
+        let today = now - (now % 86_400);
+        let span = (today - cfg.min_date) / 86_400;
+        for back in 1..=span {
+            let (date, ..) = super::day_bounds(back);
+            st.put_day(&date, &t[0].0, &super::DayDone { seen: 1, new: 0, at: now });
+        }
+
+        for _ in 0..20 {
+            assert!(
+                super::plan_batch(&t, &st, &cfg, 50, &mut rng).is_empty(),
+                "a fully-scraped relay must yield no work"
+            );
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Nothing older than the relay's horizon is worth asking for.
+    #[test]
+    fn days_behind_the_birthday_are_not_drawn() {
+        let (st, dir) = state("bday");
+        let now = chrono::Utc::now().timestamp() as u64;
+        let today = now - (now % 86_400);
+        let birthday = today - 3 * 86_400;
+
+        let mut info = super::RelayInfo::default();
+        info.birthday = Some(birthday);
+        let t = vec![("wss://r.example".to_string(), info)];
+        let cfg = super::ScrapeConfig::default();
+        let mut rng = rand::thread_rng();
+
+        for _ in 0..200 {
+            for (_, _, _, start, _) in super::plan_batch(&t, &st, &cfg, 10, &mut rng) {
+                assert!(
+                    start >= birthday,
+                    "drew {start}, behind the relay birthday {birthday}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
 
     /// Permits must be taken before spawning, not inside the task.
     ///
