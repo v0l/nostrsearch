@@ -1,6 +1,6 @@
 import { api } from "../api";
 import type { AnalysisStatus } from "../types";
-import { Chip, ConfirmButton, Panel, ago, num, useNotify, usePoll } from "../ui";
+import { Chip, ConfirmButton, Panel, ago, num, useNotify, usePoll, isoDay } from "../ui";
 
 export function Analyses({ authed, gate }: { authed: boolean; gate: string }) {
   const notify = useNotify();
@@ -107,7 +107,7 @@ export function Analyses({ authed, gate }: { authed: boolean; gate: string }) {
                   <td class="num">{num(a.observed)}</td>
                   <td class="num">{num(a.consumed)}</td>
                   <td class="num">{num(a.filtered)}</td>
-                  <td title={a.watermark ? new Date(a.watermark * 1000).toISOString() : "none"}>
+                  <td title={a.watermark ? isoDay(a.watermark) : "none"}>
                     {ago(a.watermark)}
                   </td>
                   <td style={{ color: "var(--slate)" }}>{a.deps.length ? a.deps.join(", ") : "—"}</td>

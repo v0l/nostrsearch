@@ -28,6 +28,38 @@ export function bytes(b: number): string {
   return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)} ${u[i]}`;
 }
 
+
+/** Earliest timestamp worth plotting: Nostr predates nothing before this. */
+export const NOSTR_EPOCH = 1577836800; // 2020-01-01
+
+/**
+ * Is `unix` a timestamp we can believe?
+ *
+ * The corpus contains events whose `created_at` is a millisecond value, a zero,
+ * or plain garbage, and the analyses bucket by whatever they are given. Those
+ * buckets sort *after* every real day, so a naive "last 90" window shows 90
+ * junk buckets from the year 564 billion and the chart appears frozen -- and
+ * formatting one throws `RangeError: Invalid time value` and takes the page
+ * down with it.
+ */
+export function plausibleDay(unix: number): boolean {
+  return (
+    Number.isFinite(unix) &&
+    unix >= NOSTR_EPOCH &&
+    unix <= Date.now() / 1000 + 86400
+  );
+}
+
+/** `YYYY-MM-DD`, or an em dash when the timestamp cannot be one. */
+export function isoDay(unix: number): string {
+  if (!plausibleDay(unix)) return "—";
+  try {
+    return new Date(unix * 1000).toISOString().slice(0, 10);
+  } catch {
+    return "—";
+  }
+}
+
 export function ago(unix: number | null | undefined): string {
   if (!unix) return "never";
   const s = Math.max(0, Math.floor(Date.now() / 1000) - unix);

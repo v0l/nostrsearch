@@ -10,9 +10,21 @@ import {
   type TrustedCount,
 } from "../reports";
 import { dayEvents, dayTrusted, kindLabel } from "./Today";
-import { Bars, Meter, Panel, ago, compact, num, plural, shortKey } from "../ui";
+import {
+  Bars,
+  Meter,
+  Panel,
+  ago,
+  compact,
+  isoDay,
+  num,
+  plural,
+  plausibleDay,
+  shortKey,
+} from "../ui";
 
-const day = (unix: number) => new Date(unix * 1000).toISOString().slice(0, 10);
+// Junk buckets are filtered out before display; isoDay still guards the rest.
+const day = isoDay;
 
 /** Trusted share of a count, as a percentage. */
 function trustPct(c: TrustedCount): string {
@@ -45,7 +57,9 @@ function Activity({ raw }: { raw: unknown }) {
       zaps: total(d.zaps_sent_sats ?? { trusted: 0, untrusted: 0 }),
       zapCount: d.zap_count ?? 0,
     }))
-    .filter((d) => Number.isFinite(d.start))
+    // Drop buckets built from broken created_at values: they sort after every
+    // real day, so without this the "last 90" window is entirely junk.
+    .filter((d) => plausibleDay(d.start))
     .sort((a, b) => a.start - b.start)
     .slice(-90);
 
@@ -96,11 +110,13 @@ function Activity({ raw }: { raw: unknown }) {
 function ActiveUsers({ raw }: { raw: unknown }) {
   const rep = (raw ?? {}) as Partial<ActiveUsersReport>;
   const daily = Object.values(asRecord<ActiveUsersReport["daily"][string]>(rep.daily))
-    .filter((b) => b && Number.isFinite(b.start))
+    // Same trap as Activity: junk buckets sort last, so an unfiltered
+    // "last 90" window shows none of the real days.
+    .filter((b) => b && plausibleDay(b.start))
     .sort((a, b) => a.start - b.start)
     .slice(-90);
   const weekly = Object.values(asRecord<ActiveUsersReport["weekly"][string]>(rep.weekly))
-    .filter((b) => b && Number.isFinite(b.start))
+    .filter((b) => b && plausibleDay(b.start))
     .sort((a, b) => a.start - b.start);
 
   const peak = Math.max(1, ...daily.map((b) => total(b.users)));

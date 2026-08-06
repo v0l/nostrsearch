@@ -7,7 +7,7 @@ import {
   type Reports as ReportsState,
   type TrustedCount,
 } from "../reports";
-import { Chip, Readout, compact, num, plural } from "../ui";
+import { Chip, Readout, compact, num, plural, isoDay } from "../ui";
 
 /** Kinds worth naming; anything else is shown as its number. */
 export const KIND_NAMES: Record<string, string> = {
@@ -133,7 +133,7 @@ export function Today({ reports }: { reports: ReportsState }) {
   ).length;
 
   const date = latest
-    ? new Date(latest.start * 1000).toISOString().slice(0, 10)
+    ? isoDay(latest.start)
     : "no day recorded";
 
   return (
