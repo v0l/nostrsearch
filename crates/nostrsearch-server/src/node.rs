@@ -117,7 +117,7 @@ pub enum WriterCmd {
     ResetAnalysis {
         name: String,
         /// Reset names, and whether rebuilding them needs a corpus replay.
-        reply: tokio::sync::oneshot::Sender<Option<(Vec<&'static str>, bool)>>,
+        reply: tokio::sync::oneshot::Sender<Result<Option<(Vec<&'static str>, bool)>, String>>,
     },
     /// Per-analysis progress.
     Status {
@@ -125,7 +125,7 @@ pub enum WriterCmd {
     },
     /// Discard every analysis and rebuild from the archive.
     ResetAll {
-        reply: tokio::sync::oneshot::Sender<Vec<&'static str>>,
+        reply: tokio::sync::oneshot::Sender<Result<Vec<&'static str>, String>>,
     },
     /// Relay targets for the scraper, ranked by advertiser count.
     RelayTargets {
@@ -139,7 +139,7 @@ pub struct WriterCtl(mpsc::Sender<WriterCmd>);
 
 impl WriterCtl {
     /// Discard every analysis so they rebuild from the archive.
-    pub async fn reset_all(&self) -> Result<Vec<&'static str>, &'static str> {
+    pub async fn reset_all(&self) -> Result<Result<Vec<&'static str>, String>, &'static str> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.0
             .send(WriterCmd::ResetAll { reply: tx })
@@ -170,7 +170,7 @@ impl WriterCtl {
     pub async fn reset_analysis(
         &self,
         name: &str,
-    ) -> Result<Option<(Vec<&'static str>, bool)>, &'static str> {
+    ) -> Result<Result<Option<(Vec<&'static str>, bool)>, String>, &'static str> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.0
             .send(WriterCmd::ResetAnalysis {
@@ -323,15 +323,27 @@ pub fn spawn_writer_with_reports(
                 }
                 Some(cmd) = cmd_rx.recv() => match cmd {
                     WriterCmd::ResetAll { reply } => {
-                        let names = pipeline.lock().unwrap().reset_all_analyses();
+                        // A failed re-attach leaves the graph unreachable, so
+                        // the reset is reported as the failure it is rather
+                        // than as an empty success.
+                        let res = pipeline.lock().unwrap().reset_all_analyses();
                         publish_reports(&pipeline.lock().unwrap(), reports.as_ref());
-                        let _ = reply.send(names);
+                        let _ = reply.send(res.map_err(|e| e.to_string()));
                     }
                     WriterCmd::RelayTargets { reply } => {
                         let _ = reply.send(pipeline.lock().unwrap().relay_targets());
                     }
                     WriterCmd::ResetAnalysis { name, reply } => {
-                        let ok = pipeline.lock().unwrap().reset_analysis(&name);
+                        let reset = pipeline.lock().unwrap().reset_analysis(&name);
+                        let ok = match reset {
+                            Ok(v) => v,
+                            // Re-attach failed: the graph is unreachable and a
+                            // rebuild now would write tier 0 across the corpus.
+                            Err(e) => {
+                                let _ = reply.send(Err(e.to_string()));
+                                continue;
+                            }
+                        };
                         // Whether rebuilding what was reset actually requires
                         // reading the corpus, decided while the names are in
                         // hand rather than assumed by the caller.
@@ -357,7 +369,7 @@ pub fn spawn_writer_with_reports(
                         // Republish immediately so the dashboard reflects the
                         // now-empty report rather than the stale one.
                         publish_reports(&pipeline.lock().unwrap(), reports.as_ref());
-                        let _ = reply.send(ok);
+                        let _ = reply.send(Ok(ok));
                     }
                     WriterCmd::Status { reply } => {
                         let _ = reply.send(pipeline.lock().unwrap().analyses_status());

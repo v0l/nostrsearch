@@ -350,7 +350,22 @@ async fn reset_all(State(st): State<AdminState>) -> Response {
     }
 
     let reset = match st.ctl.reset_all().await {
-        Ok(names) => names,
+        Ok(Ok(names)) => names,
+        // The reset left the node unable to work -- typically a failed graph
+        // re-attach, after which every pubkey resolves to tier 0. Starting the
+        // rebuild anyway would write that across the whole corpus, so refuse.
+        Ok(Err(e)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": e,
+                    "detail": "reset aborted before rebuilding; the graph is \
+                               unreachable and a rebuild would index every \
+                               event at tier 0",
+                })),
+            )
+                .into_response();
+        }
         Err(e) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -397,8 +412,19 @@ async fn reset_all(State(st): State<AdminState>) -> Response {
 /// longer exists.
 async fn reset_analysis(State(st): State<AdminState>, Path(name): Path<String>) -> Response {
     let (reset, needs_corpus) = match st.ctl.reset_analysis(&name).await {
-        Ok(Some(v)) => v,
-        Ok(None) => {
+        Ok(Ok(Some(v))) => v,
+        // The reset could not leave the node in a working state -- typically a
+        // failed graph re-attach, after which every pubkey resolves to tier 0
+        // and a rebuild would write that across the corpus. Report the failure
+        // rather than an empty success.
+        Ok(Err(e)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": e })),
+            )
+                .into_response();
+        }
+        Ok(Ok(None)) => {
             return (
                 StatusCode::NOT_FOUND,
                 Json(serde_json::json!({ "error": format!("no analysis named {name}") })),

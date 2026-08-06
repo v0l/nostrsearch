@@ -125,7 +125,7 @@ fn resetting_analyses_keeps_the_graph_store_attached() {
     let mut p = Pipeline::new(config(dir.path())).unwrap();
 
     // What `ingest --reindex` does before the replay.
-    p.reset_all_analyses();
+    p.reset_all_analyses().expect("the graph must re-attach");
 
     run_all_passes(&mut p, &corpus(day0));
 
@@ -433,7 +433,10 @@ fn resetting_a_derived_analysis_rebuilds_it_immediately() {
         "the corpus should have produced ranks to begin with, got {before}"
     );
 
-    let reset = p.reset_analysis("pagerank").expect("pagerank exists");
+    let reset = p
+        .reset_analysis("pagerank")
+        .expect("the graph must re-attach")
+        .expect("pagerank exists");
     assert!(
         !p.names_need_corpus(&reset),
         "pagerank reads no events, so no replay may be demanded"
@@ -449,5 +452,43 @@ fn resetting_a_derived_analysis_rebuilds_it_immediately() {
         after.as_array().is_some_and(|a| !a.is_empty()),
         "ranks must be rebuilt from the follow graph without a corpus pass; \
          an empty result means the graph handle was lost on reset, got {after}"
+    );
+}
+
+/// A reset cannot lose the graph, even if its directory is destroyed.
+///
+/// Two defences, and this pins the stronger one. attach_all keeps the handle
+/// it opened rather than reopening -- RocksDB locks the path, and the
+/// analyses that were not reset still hold it -- so a re-attach after a reset
+/// cannot fail once startup succeeded. The error is also propagated now
+/// rather than logged and swallowed, but that path should be unreachable
+/// after startup, and this is what makes it so.
+///
+/// It matters because the caller starts a rebuild on success: a reset that
+/// silently lost the graph would index the entire corpus at tier 0, which
+/// cannot be undone without reindexing.
+#[test]
+fn a_reset_keeps_the_graph_even_if_its_directory_is_destroyed() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut p = Pipeline::new(config(dir.path())).unwrap();
+    run_all_passes(&mut p, &corpus(1_700_000_000));
+
+    // Make the path unopenable for anything that tried to open it afresh.
+    let stats = dir.path().join("stats");
+    let _ = std::fs::remove_dir_all(&stats);
+    std::fs::write(&stats, b"not a directory").unwrap();
+
+    let reset = p
+        .reset_analysis("pagerank")
+        .expect("the held handle must survive its directory being replaced")
+        .expect("pagerank exists");
+
+    // And the rebuild still works, which is the thing tier 0 would have broken.
+    assert_eq!(p.refresh_now(&reset), reset.len());
+    assert!(
+        report(&p, "pagerank")
+            .as_array()
+            .is_some_and(|a| !a.is_empty()),
+        "ranks must rebuild from the still-attached graph"
     );
 }

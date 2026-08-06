@@ -178,9 +178,9 @@ impl Pipeline {
     }
     /// Analyses with a rebuild still in progress, so one can be resumed at    /// Reset every analysis, external storage included, and persist
     /// immediately so a restart cannot resurrect the old state.
-    pub fn reset_all_analyses(&mut self) -> Vec<&'static str> {
+    pub fn reset_all_analyses(&mut self) -> anyhow::Result<Vec<&'static str>> {
         let names = self.registry.reset_all();
-        self.reattach_graph();
+        self.reattach_graph()?;
         // The world is derived from analyses that now hold nothing, so leaving
         // it in place would keep labelling events with a web of trust that has
         // been discarded.
@@ -191,7 +191,7 @@ impl Pipeline {
             tracing::warn!(error = %e, "persisting reset failed");
         }
         tracing::info!(reset = ?names, "all analyses reset");
-        names
+        Ok(names)
     }
 
     /// Relay targets from the `relays` report, most advertised first.
@@ -255,9 +255,11 @@ impl Pipeline {
         n
     }
 
-    pub fn reset_analysis(&mut self, name: &str) -> Option<Vec<&'static str>> {
-        let reset = self.registry.reset(name)?;
-        self.reattach_graph();
+    pub fn reset_analysis(&mut self, name: &str) -> anyhow::Result<Option<Vec<&'static str>>> {
+        let Some(reset) = self.registry.reset(name) else {
+            return Ok(None);
+        };
+        self.reattach_graph()?;
         if let Some(store) = &self.store
             && let Err(e) = self.registry.persist(store)
         {
@@ -268,7 +270,7 @@ impl Pipeline {
             reset = ?reset,
             "analyses reset; they will re-derive from the corpus"
         );
-        Some(reset)
+        Ok(Some(reset))
     }
 
     /// Drain each analysis's partial changes since the last call, for streaming
@@ -294,17 +296,25 @@ impl Pipeline {
     /// and folds every event into nothing, so the web of trust rebuilds empty
     /// and every document is indexed at tier 0 -- a silent ranking regression
     /// that only shows up as "search results look wrong" hours later.
-    fn reattach_graph(&mut self) {
+    /// Re-attach the shared graph after a reset.
+    ///
+    /// Returns the failure rather than logging it. A reset whose re-attach
+    /// failed has not left the node in a working state -- the follow graph is
+    /// unreachable, every pubkey resolves to tier 0, and the rebuild that
+    /// follows writes that into the index. Reporting success for that is how
+    /// the condition survived long enough to be indexed.
+    fn reattach_graph(&mut self) -> anyhow::Result<()> {
         let Some(dir) = self.cfg.state_dir.as_deref() else {
-            return;
+            return Ok(());
         };
-        if let Err(e) = self.registry.attach_all(dir) {
+        self.registry.attach_all(dir).map_err(|e| {
             tracing::error!(
                 error = %e,
                 "re-attaching the graph store after reset failed; the follow \
-                 graph will stay empty and everything will index at tier 0"
+                 graph is unreachable and everything would index at tier 0"
             );
-        }
+            e
+        })
     }
     /// Fold one event into the analyses only, without indexing it.
     ///
