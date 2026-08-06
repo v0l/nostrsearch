@@ -615,16 +615,18 @@ pub async fn run_pass<S: Sink>(
     let batch_size = cfg.concurrency.max(1);
     let mut scraped = 0u64;
 
-    // Fill newest-first, a month at a time.
+    // Fill newest-first, one fixed block of days at a time.
     //
     // Within a month days are still drawn at random, which is what keeps every
     // relay advancing together instead of one relay monopolising the workers.
-    // Across months the order is deliberate: a window is finished before the
+    // Across blocks the order is deliberate: a window is finished before the
     // next one back is opened, so recent history -- the part anyone is
     // actually searching -- completes first and coverage has a definite edge
     // rather than being uniformly sparse over four years.
     let now0 = chrono::Utc::now().timestamp() as u64;
-    let mut window = month_window(now0);
+    let today_start = now0 - (now0 % 86_400);
+    let mut block = 0u64;
+    let mut window = block_window(today_start, block);
 
     loop {
         // Re-read between batches rather than working from one snapshot taken
@@ -645,12 +647,14 @@ pub async fn run_pass<S: Sink>(
             if window.0 <= cfg.min_date {
                 break;
             }
-            let prev = prev_month(window.0);
-            window = (prev, window.0);
+            block += 1;
+            window = block_window(today_start, block);
             tracing::info!(
+                block,
                 window_start = window.0,
+                window_end = window.1,
                 scraped,
-                "scrape window complete; moving back a month"
+                "scrape window complete; moving back a block"
             );
             batch = plan_batch(&targets, &state, &cfg, batch_size, &mut rng, window);
         }
@@ -680,31 +684,22 @@ pub async fn run_pass<S: Sink>(
     tracing::info!(scraped, "scrape pass complete");
 }
 
-/// The calendar month containing `ts`, as (start, end) day-aligned bounds.
-pub fn month_window(ts: u64) -> (u64, u64) {
-    use chrono::Datelike;
-    let dt = Utc.timestamp_opt(ts as i64, 0).single().unwrap_or_default();
-    let start = Utc
-        .with_ymd_and_hms(dt.year(), dt.month(), 1, 0, 0, 0)
-        .single()
-        .map(|d| d.timestamp() as u64)
-        .unwrap_or(0);
-    let (ny, nm) = if dt.month() == 12 {
-        (dt.year() + 1, 1)
-    } else {
-        (dt.year(), dt.month() + 1)
-    };
-    let end = Utc
-        .with_ymd_and_hms(ny, nm, 1, 0, 0, 0)
-        .single()
-        .map(|d| d.timestamp() as u64)
-        .unwrap_or(u64::MAX);
-    (start, end)
-}
+/// Days in one backfill window.
+pub const BLOCK_DAYS: u64 = 30;
 
-/// Start of the month before the one beginning at `start`.
-pub fn prev_month(start: u64) -> u64 {
-    month_window(start.saturating_sub(1)).0
+/// Window `k` counting back from yesterday, as day-aligned `[start, end)`.
+///
+/// Fixed-width blocks anchored on yesterday, not calendar months: every window
+/// is the same size regardless of where it lands, so progress through one says
+/// the same thing as progress through any other, and there is no month
+/// arithmetic to get wrong. Yesterday is the anchor because today is still
+/// being written -- scraping a partial day records it as done and the rest of
+/// it is never fetched.
+pub fn block_window(today_start: u64, k: u64) -> (u64, u64) {
+    // Exclusive end of window 0 is the start of today, i.e. yesterday's end.
+    let end = today_start.saturating_sub(k * BLOCK_DAYS * 86_400);
+    let start = end.saturating_sub(BLOCK_DAYS * 86_400);
+    (start, end)
 }
 
 /// One unit of work: a relay and the day to fetch from it.
@@ -1100,7 +1095,7 @@ mod scrape_concurrency_tests {
         let mut rng = rand::thread_rng();
 
         let now = chrono::Utc::now().timestamp() as u64;
-        let win = super::month_window(now);
+        let win = super::block_window(now - (now % 86_400), 0);
         for _ in 0..40 {
             for (_, _, _, start, _) in super::plan_batch(&t, &st, &cfg, 20, &mut rng, win) {
                 assert!(
@@ -1112,26 +1107,29 @@ mod scrape_concurrency_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Stepping back a month reaches strictly older days, and terminates.
+    /// Blocks are contiguous, uniform, and walk strictly backwards.
     #[test]
-    fn windows_walk_backwards_a_month_at_a_time() {
+    fn blocks_tile_backwards_from_yesterday_without_gaps() {
         let now = chrono::Utc::now().timestamp() as u64;
-        let (start, end) = super::month_window(now);
-        assert!(start < end, "a month must be a non-empty range");
-        assert!(start <= now && now < end, "the window must contain its anchor");
+        let today = now - (now % 86_400);
 
-        let mut w = start;
-        let mut seen = Vec::new();
-        for _ in 0..14 {
-            let p = super::prev_month(w);
-            assert!(p < w, "each step must reach strictly older days");
-            seen.push(p);
-            w = p;
+        let (s0, e0) = super::block_window(today, 0);
+        // Today is still being written; window 0 must end where today begins.
+        assert_eq!(e0, today, "window 0 must end at yesterday, not include today");
+        assert_eq!(
+            (e0 - s0) / 86_400,
+            super::BLOCK_DAYS,
+            "every window is the same width"
+        );
+
+        let mut prev_start = s0;
+        for k in 1..24 {
+            let (s, e) = super::block_window(today, k);
+            assert_eq!(e, prev_start, "block {k} must abut the previous, no gap");
+            assert_eq!((e - s) / 86_400, super::BLOCK_DAYS, "uniform width");
+            assert!(s < prev_start, "each block must reach strictly older days");
+            prev_start = s;
         }
-        // A year and a bit of stepping back must not repeat a month.
-        let mut sorted = seen.clone();
-        sorted.dedup();
-        assert_eq!(sorted.len(), seen.len(), "months must not repeat");
     }
 
     /// Permits must be taken before spawning, not inside the task.
