@@ -110,6 +110,18 @@ pub fn writer_threads() -> usize {
     u64_or("WRITER_THREADS", 1) as usize
 }
 
+/// Tantivy writer heap per open shard, in MB (`SHARD_HEAP_MB`, 64).
+///
+/// Charged *per open shard*, so this multiplies by [`max_open_shards`]: the two
+/// knobs together are the writer memory budget, and raising the shard cap
+/// without lowering this raises memory in proportion. Holding a whole corpus
+/// open only makes sense alongside a small per-shard heap.
+///
+/// Floored at 15 MB because Tantivy refuses smaller arenas.
+pub fn shard_heap_mb() -> usize {
+    (u64_or("SHARD_HEAP_MB", 64) as usize).max(15)
+}
+
 pub fn wot_refresh_every() -> u64 {
     u64_or("WOT_REFRESH_EVERY", 100_000)
 }

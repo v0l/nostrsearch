@@ -138,12 +138,39 @@ async fn main() -> anyhow::Result<()> {
 
     let mut writer_pipeline = None;
     let sink = if is_writer {
+        // Writer heap is charged per *open* shard, so these two multiply.
+        // Holding a whole corpus open is only affordable with a small
+        // per-shard heap -- 400 shards at the 64 MB default would be 25.6 GB.
+        let mut shard = ShardWriterConfig {
+            max_open_shards: env::max_open_shards(),
+            heap_bytes: env::shard_heap_mb() * 1_000_000,
+            ..Default::default()
+        };
+        // Keep the writer arena to half the cgroup budget, as ingest does. The
+        // server has to fit the Tantivy readers, the stats engine and the page
+        // cache alongside it, so a writer heap sized purely from the shard
+        // count is how a config change becomes an OOM.
+        if let Some(limit_mb) = nostrsearch_indexer::mem::cgroup_limit_mb() {
+            let budget = (limit_mb as usize * 1_000_000) / 2;
+            if let Some(was) = shard.fit_to_budget(budget) {
+                tracing::warn!(
+                    requested_heap_mb = was / 1_000_000,
+                    using_heap_mb = shard.heap_bytes / 1_000_000,
+                    max_open_shards = shard.max_open_shards,
+                    cgroup_limit_mb = limit_mb,
+                    "writer heap would exceed half the cgroup limit; reduced per-shard heap"
+                );
+            }
+        }
+        tracing::info!(
+            max_open_shards = shard.max_open_shards,
+            heap_mb = shard.heap_bytes / 1_000_000,
+            total_writer_heap_gb = format!("{:.1}", shard.total_heap_bytes() as f64 / 1e9),
+            "writer heap budget"
+        );
         let cfg = PipelineConfig {
             index_root: index_root.clone(),
-            shard: ShardWriterConfig {
-                max_open_shards: env::max_open_shards(),
-                ..Default::default()
-            },
+            shard,
             state_dir: Some(env::state_dir()),
             wot_refresh_every: env::wot_refresh_every(),
             min_refresh_interval: env::min_refresh_interval(),

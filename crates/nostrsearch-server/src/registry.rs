@@ -234,46 +234,58 @@ impl ShardRegistry {
             .unwrap_or_default()
             .as_secs();
 
-        let mut hits: Vec<SearchHit> = Vec::new();
-        for shard_id in planned.shards {
-            let Some(shard) = self.shard(shard_id) else {
-                continue; // shard has no data on this node
-            };
-            let searcher = shard.reader.searcher();
+        // Resolve the readers first -- that needs `&mut self` because a shard
+        // is opened and cached on first touch -- then query them concurrently.
+        //
+        // This loop used to run the shards one at a time. Each one is a full
+        // Tantivy search, and a text query with no date bound plans across every
+        // shard on the node: 374 of them here, ~70ms each, so a single query
+        // took 25-40 seconds. Worse, the caller holds one global registry mutex
+        // for the whole call, so that query also blocked /stats, /admin/* and
+        // every other search -- a 401 took seven seconds to come back.
+        //
+        // Shards are independent indices and a `Searcher` is `Sync`, so there is
+        // nothing to serialise here but the merge at the end.
+        let resolved: Vec<Arc<ShardReader>> = planned
+            .shards
+            .iter()
+            .filter_map(|id| self.shard(*id))
+            .collect();
 
-            // Full-text query → composite score; metadata-only → recent first.
-            let scored: Vec<ScoredDoc> = if filter.search.is_some() {
-                let collector = CompositeCollector {
-                    limit: filter.limit,
-                    weights: self.weights,
-                    now_ts: now,
-                    created_at_field: "created_at".to_string(),
-                    wot_tier_field: "wot_tier".to_string(),
-                };
-                searcher.search(&planned.query, &collector)?
-            } else {
-                searcher
-                    .search(
-                        &planned.query,
-                        &TopDocs::with_limit(filter.limit)
-                            .order_by_fast_field::<u64>("created_at", tantivy::Order::Desc),
-                    )?
-                    .into_iter()
-                    .map(|(ts, addr): (u64, tantivy::DocAddress)| ScoredDoc {
-                        segment_ord: addr.segment_ord,
-                        doc_id: addr.doc_id,
-                        score: ts as f32,
+        let weights = self.weights;
+        let limit = filter.limit;
+        let text_query = filter.search.is_some();
+        let query = &planned.query;
+        let workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .min(resolved.len().max(1));
+
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        let mut hits: Vec<SearchHit> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..workers)
+                .map(|_| {
+                    let (next, resolved) = (&next, &resolved);
+                    scope.spawn(move || {
+                        let mut local: Vec<SearchHit> = Vec::new();
+                        loop {
+                            let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(shard) = resolved.get(i) else { break };
+                            Self::search_one(
+                                shard, query, text_query, limit, weights, now, &mut local,
+                            );
+                        }
+                        local
                     })
-                    .collect()
-            };
-
-            // Hydrate from stored fields.
-            for sd in scored.into_iter().take(filter.limit) {
-                if let Ok(h) = hydrate(&searcher, &shard.schema, sd.address(), sd.score, shard.id) {
-                    hits.push(h);
-                }
-            }
-        }
+                })
+                .collect();
+            handles
+                .into_iter()
+                .filter_map(|h| h.join().ok())
+                .flatten()
+                .collect()
+        });
+        let _ = &mut hits;
 
         // Merge across shards: composite score for text queries, created_at
         // (encoded in score) for metadata queries.
@@ -284,6 +296,65 @@ impl ShardRegistry {
         });
         hits.truncate(filter.limit);
         Ok(hits)
+    }
+
+    /// Query one shard, appending its hits. Runs on a worker thread.
+    fn search_one(
+        shard: &Arc<ShardReader>,
+        query: &dyn tantivy::query::Query,
+        text_query: bool,
+        limit: usize,
+        weights: ScoreWeights,
+        now: u64,
+        out: &mut Vec<SearchHit>,
+    ) {
+        {
+            let searcher = shard.reader.searcher();
+
+            // Full-text query → composite score; metadata-only → recent first.
+            let scored: Vec<ScoredDoc> = if text_query {
+                let collector = CompositeCollector {
+                    limit,
+                    weights,
+                    now_ts: now,
+                    created_at_field: "created_at".to_string(),
+                    wot_tier_field: "wot_tier".to_string(),
+                };
+                match searcher.search(query, &collector) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        tracing::warn!(shard = %shard.id, error = %e, "shard search failed");
+                        return;
+                    }
+                }
+            } else {
+                match searcher.search(
+                    query,
+                    &TopDocs::with_limit(limit)
+                        .order_by_fast_field::<u64>("created_at", tantivy::Order::Desc),
+                ) {
+                    Ok(v) => v
+                        .into_iter()
+                        .map(|(ts, addr): (u64, tantivy::DocAddress)| ScoredDoc {
+                            segment_ord: addr.segment_ord,
+                            doc_id: addr.doc_id,
+                            score: ts as f32,
+                        })
+                        .collect(),
+                    Err(e) => {
+                        tracing::warn!(shard = %shard.id, error = %e, "shard search failed");
+                        return;
+                    }
+                }
+            };
+
+            // Hydrate from stored fields.
+            for sd in scored.into_iter().take(limit) {
+                if let Ok(h) = hydrate(&searcher, &shard.schema, sd.address(), sd.score, shard.id) {
+                    out.push(h);
+                }
+            }
+        }
     }
 
     /// Every shard id present on disk, plus any already-open ones.

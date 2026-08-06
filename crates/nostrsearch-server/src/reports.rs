@@ -123,6 +123,18 @@ impl ReportStore {
             .map(|r| r.data.keys().cloned().collect())
             .unwrap_or_default()
     }
+
+    /// Publication time and the available names, without touching the payloads.
+    ///
+    /// The index endpoint needs exactly this much and nothing more; reading it
+    /// through [`get`](Self::get) clones every report to answer a question
+    /// about their keys.
+    pub fn summary(&self) -> (u64, Vec<String>) {
+        self.inner
+            .read()
+            .map(|r| (r.generated_at, r.data.keys().cloned().collect()))
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Serialize)]
@@ -268,10 +280,17 @@ async fn stream(
 }
 
 async fn index(State(store): State<ReportStore>) -> impl IntoResponse {
-    let r = store.get();
+    // Names and a timestamp only -- deliberately not `get()`, which deep-clones
+    // every report to build the reply and then discards all of it.
+    //
+    // The payloads are `serde_json::Value` trees with a node per day bucket per
+    // kind; on the production corpus that is ~10 MB of nested maps, and cloning
+    // it took 22 seconds to return 114 bytes of names. The console calls this
+    // endpoint first, so every page load paid for it.
+    let (generated_at, reports) = store.summary();
     Json(ReportIndex {
-        generated_at: r.generated_at,
-        reports: r.data.keys().cloned().collect(),
+        generated_at,
+        reports,
     })
 }
 
@@ -358,5 +377,53 @@ mod tests {
         // No-op drains produce no traffic at all.
         s.apply_deltas(1_700_000_001, vec![]);
         assert!(rx.try_recv().is_err());
+    }
+}
+
+#[cfg(test)]
+mod index_cost_tests {
+    use super::*;
+
+    /// The index endpoint must not touch report payloads.
+    ///
+    /// It answers a question about keys, but was reading the store through
+    /// `get()`, which deep-clones every report. On the production corpus the
+    /// payloads are ~10 MB of nested `serde_json::Value` maps -- a node per day
+    /// bucket per kind -- and cloning them took 22 seconds to produce 114 bytes
+    /// of names. The console fetches this first, so it stalled every page load.
+    ///
+    /// Guards the cost by shape rather than by clock: build a store whose
+    /// payloads are far larger than the reply, and assert `summary()` is
+    /// unaffected by their size.
+    #[test]
+    fn index_summary_does_not_read_payloads() {
+        let store = ReportStore::new();
+
+        // A payload much larger than the index reply will ever be.
+        let big: serde_json::Value = serde_json::Value::Object(
+            (0..50_000u64)
+                .map(|i| (i.to_string(), serde_json::json!({"n": i, "kinds": {"1": i}})))
+                .collect(),
+        );
+        store.publish(
+            1_700_000_000,
+            vec![("activity", big.clone()), ("active_users", big)],
+        );
+
+        let (generated_at, names) = store.summary();
+        assert_eq!(generated_at, 1_700_000_000);
+        assert_eq!(names, vec!["active_users", "activity"]);
+
+        // The whole point: summary() is cheap enough to call repeatedly, which
+        // it cannot be if it clones the payloads.
+        let t = std::time::Instant::now();
+        for _ in 0..200 {
+            let _ = store.summary();
+        }
+        let per_call = t.elapsed() / 200;
+        assert!(
+            per_call < std::time::Duration::from_millis(2),
+            "summary() cost {per_call:?} per call; it is cloning payloads"
+        );
     }
 }
