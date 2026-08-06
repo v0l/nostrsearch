@@ -186,6 +186,22 @@ pub async fn ingest(
         let pass = pipeline.lock().unwrap().current_pass();
         let indexing_pass = pass == 0;
         progress.pass.store(pass as u64, Ordering::Relaxed);
+
+        // A stage whose analyses consume no events has nothing to read.
+        //
+        // Pagerank is the case this exists for: it derives entirely from the
+        // adjacency follow_graph leaves on disk, so its pass was reading the
+        // whole corpus to hand every event to an observe() that discards them.
+        // Skipping straight to advance_pass still runs the refresh and
+        // materialize that actually produce its output.
+        if !pipeline.lock().unwrap().pass_needs_corpus() {
+            tracing::info!(pass, "pass needs no corpus; skipping read");
+            if !pipeline.lock().unwrap().advance_pass() {
+                break;
+            }
+            continue;
+        }
+
         tracing::info!(
             pass,
             passes,

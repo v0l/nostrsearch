@@ -334,3 +334,48 @@ fn events_fold_against_an_already_materialized_world() {
         "zap attribution must survive the replay path too"
     );
 }
+
+/// A pass skips the corpus only if *every* analysis in its stage takes no
+/// events.
+///
+/// Pagerank consumes nothing -- it derives from the adjacency `follow_graph`
+/// leaves on disk -- so its own stage could be read-free. It is not, and this
+/// records why: staging is by dependency depth, and activity, active_users and
+/// kind_breakdown also depend on follow_graph while consuming every kind. One
+/// such analysis in the stage makes the union "all kinds" and the whole pass
+/// has to read.
+///
+/// So the skip is wired and correct but does not fire in the default set. It
+/// pays off for a rebuild whose stages contain only derived analyses. This
+/// test pins both halves, so it fails if the indexing pass ever stops reading,
+/// or if a stage of purely derived analyses ever starts.
+#[test]
+fn only_a_stage_that_consumes_nothing_can_skip_the_corpus() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut p = Pipeline::new(config(dir.path())).unwrap();
+    let events = corpus(1_700_000_000);
+
+    let mut read: Vec<bool> = Vec::new();
+    loop {
+        let needs = p.pass_needs_corpus();
+        read.push(needs);
+        if needs {
+            for e in &events {
+                p.process(e);
+            }
+        }
+        if !p.advance_pass() {
+            break;
+        }
+    }
+
+    assert!(read[0], "the indexing pass always reads: it builds the index");
+    // Every later stage currently carries an all-kinds analysis alongside the
+    // derived ones. If that changes, the skip starts paying off and this
+    // expectation should be updated deliberately rather than by accident.
+    assert!(
+        read.iter().all(|r| *r),
+        "a stage became read-free -- pass_needs_corpus now fires, which is the \
+         intended win; update this test to assert the skip"
+    );
+}
