@@ -161,6 +161,9 @@ export function Relays({
                   </td>
                   <td>{negentropy(r.negentropy)}</td>
                   <td class="num">{num(r.sources)}</td>
+                  <td class="num">{num(r.days)}</td>
+                  <td class="num">{compact(r.events_seen)}</td>
+                  <td class="num" title="new to the index">{compact(r.events_new)}</td>
                   <td class="num">{num(r.cap)}</td>
                   <td class="num" style={{ color: r.fails > 0 ? "var(--rust)" : undefined }}>
                     {num(r.fails)}

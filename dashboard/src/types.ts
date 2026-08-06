@@ -44,6 +44,10 @@ export interface ScrapeProgress {
 }
 
 export interface SyncRelay {
+  /** Days scraped from this relay, and what they yielded. */
+  days: number;
+  events_seen: number;
+  events_new: number;
   url: string;
   sources: number;
   negentropy: boolean | null;

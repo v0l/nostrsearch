@@ -206,6 +206,10 @@ struct SyncRelay {
     fails: u32,
     last_ok: u64,
     birthday: Option<u64>,
+    /// Days scraped from this relay, and what they yielded.
+    days: u64,
+    events_seen: u64,
+    events_new: u64,
 }
 
 async fn sync_status(
@@ -216,16 +220,25 @@ async fn sync_status(
     // RocksDB scans are blocking work; keep them off the async worker.
     let out = tokio::task::spawn_blocking(move || {
         let relays = state.relays();
+        // One scan, reused: `progress` already walks every recorded day, and
+        // accumulates per-relay totals while it is there.
+        let progress = state.progress(25);
         let mut top: Vec<SyncRelay> = relays
             .iter()
-            .map(|(url, i)| SyncRelay {
-                url: url.clone(),
-                sources: i.sources,
-                negentropy: i.negentropy,
-                cap: i.cap,
-                fails: i.fails,
-                last_ok: i.last_ok,
-                birthday: i.birthday,
+            .map(|(url, i)| {
+                let t = progress.by_relay.get(url).copied().unwrap_or_default();
+                SyncRelay {
+                    url: url.clone(),
+                    sources: i.sources,
+                    negentropy: i.negentropy,
+                    cap: i.cap,
+                    fails: i.fails,
+                    last_ok: i.last_ok,
+                    birthday: i.birthday,
+                    days: t.days,
+                    events_seen: t.seen,
+                    events_new: t.new,
+                }
             })
             .collect();
         // Most-advertised relays first: the ones that matter for coverage.
@@ -253,7 +266,7 @@ async fn sync_status(
                 limit,
                 top,
             },
-            scrape: state.progress(25),
+            scrape: progress,
         }
     })
     .await;

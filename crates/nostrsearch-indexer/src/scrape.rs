@@ -67,6 +67,24 @@ pub struct ScrapeProgress {
     pub newest_day: Option<String>,
     /// Most recently completed (relay, day) results, newest first.
     pub recent: Vec<DayEntry>,
+    /// Per-relay totals, keyed by url.
+    ///
+    /// Accumulated during the scan this struct already does, so it costs
+    /// nothing extra. Not serialized: `/sync` folds it into each relay row
+    /// rather than shipping a second copy of the same numbers.
+    #[serde(skip)]
+    pub by_relay: std::collections::HashMap<String, RelayTotals>,
+}
+
+/// What one relay has produced across every day scraped from it.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct RelayTotals {
+    /// Days completed for this relay.
+    pub days: u64,
+    /// Events it returned.
+    pub seen: u64,
+    /// Of those, events new to the index.
+    pub new: u64,
 }
 
 /// Outcome of one fully-scraped (relay, day).
@@ -182,6 +200,11 @@ impl ScrapeState {
             p.events_seen += done.seen;
             p.events_new += done.new;
             dates.insert(date.to_string());
+
+            let t = p.by_relay.entry(url.to_string()).or_default();
+            t.days += 1;
+            t.seen += done.seen;
+            t.new += done.new;
 
             recent.push(DayEntry {
                 date: date.to_string(),
