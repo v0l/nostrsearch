@@ -930,13 +930,18 @@ body.page .readout .v.mute {
 .feed { list-style: none; margin: 0; padding: 0;
   font-variant-numeric: tabular-nums; }
 .feed li { display: flex; align-items: baseline; gap: 10px; padding: 3px 0;
-  font-size: 12px; border-bottom: 1px solid var(--rule); }
+  font-size: 12px; border-bottom: 1px solid var(--rule);
+  flex-wrap: nowrap; }
 .feed li:last-child { border-bottom: 0; }
-.feed-when { flex: 0 0 68px; color: var(--slate); font-size: 11px; }
+.feed-when { flex: 0 0 68px; color: var(--slate); font-size: 11px;
+  white-space: nowrap; }
 .feed-what { flex: 1 1 auto; min-width: 0; overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; }
-.feed-day { flex: 0 0 auto; color: var(--slate); font-size: 11px; }
-.feed-num { flex: 0 0 72px; text-align: right; }
+.feed-day { flex: 0 0 auto; color: var(--slate); font-size: 11px;
+  white-space: nowrap; }
+/* Wide enough for "seen +new" together (e.g. 8.4k +2.1k); nowrap so a busy
+   relay-day cannot push the count onto a second line. */
+.feed-num { flex: 0 0 104px; text-align: right; white-space: nowrap; }
 .feed-new { font-style: normal; color: var(--patina); }
 .sub-note { font-weight: 400; font-size: 11px; color: var(--slate);
   margin-left: 8px; letter-spacing: 0; }
