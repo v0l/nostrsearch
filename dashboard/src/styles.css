@@ -924,3 +924,19 @@ body.page .readout .v.mute {
 .who-sub { font-size: 10px; color: var(--slate); overflow: hidden;
   text-overflow: ellipsis; white-space: nowrap; }
 .ranks li { display: flex; align-items: center; gap: 8px; }
+
+/* Live feed of recently scraped relay-days. Work is sampled at random, so
+   this is how you see which relay is actually being hit. */
+.feed { list-style: none; margin: 0; padding: 0;
+  font-variant-numeric: tabular-nums; }
+.feed li { display: flex; align-items: baseline; gap: 10px; padding: 3px 0;
+  font-size: 12px; border-bottom: 1px solid var(--rule); }
+.feed li:last-child { border-bottom: 0; }
+.feed-when { flex: 0 0 68px; color: var(--slate); font-size: 11px; }
+.feed-what { flex: 1 1 auto; min-width: 0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.feed-day { flex: 0 0 auto; color: var(--slate); font-size: 11px; }
+.feed-num { flex: 0 0 72px; text-align: right; }
+.feed-new { font-style: normal; color: var(--patina); }
+.sub-note { font-weight: 400; font-size: 11px; color: var(--slate);
+  margin-left: 8px; letter-spacing: 0; }

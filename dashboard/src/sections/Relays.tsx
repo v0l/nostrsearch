@@ -53,6 +53,57 @@ function Backfill({ sync }: { sync: SyncStatus | null }) {
   );
 }
 
+/**
+ * The most recent relay-days, individually.
+ *
+ * `recent` was only ever aggregated into the bars above, which shows how much
+ * arrived but not where from. Work is drawn at random now, so the useful
+ * question while watching a pass is which relay is being hit right now and
+ * whether it is returning anything -- a relay quietly returning zero looks
+ * identical to a busy one in a per-date total.
+ */
+function RecentDays({ sync }: { sync: SyncStatus | null }) {
+  const rows = (sync?.scrape.recent ?? []).slice(0, 12);
+  if (rows.length === 0) return null;
+
+  return (
+    <>
+      <hr class="hr" />
+      <h3
+        style={{
+          font: "600 10px/1 var(--mono)",
+          letterSpacing: "0.16em",
+          textTransform: "uppercase",
+          color: "var(--slate)",
+          margin: "0 0 12px",
+        }}
+      >
+        Recently scraped
+        <span class="sub-note">newest first, updates as the pass runs</span>
+      </h3>
+      <ul class="feed">
+        {rows.map((d) => (
+          <li key={`${d.relay}|${d.date}`}>
+            <span class="feed-when">{ago(d.at)}</span>
+            <span class="feed-what" title={d.relay}>
+              {d.relay.replace(/^wss?:\/\//, "").replace(/\/$/, "")}
+            </span>
+            <span class="feed-day">{d.date}</span>
+            <span
+              class="feed-num"
+              title={`${num(d.seen)} returned, ${num(d.new)} new to the index`}
+              style={{ color: d.seen === 0 ? "var(--slate)" : undefined }}
+            >
+              {compact(d.seen)}
+              {d.new > 0 ? <em class="feed-new"> +{compact(d.new)}</em> : null}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </>
+  );
+}
+
 function negentropy(v: boolean | null) {
   if (v === true) return <Chip tone="ok">Negentropy</Chip>;
   if (v === false) return <Chip tone="mute">Windowed REQ</Chip>;
@@ -122,6 +173,7 @@ export function Relays({
       note="Relays discovered from published relay lists, ranked by how many people advertise them. Forgetting a relay clears what the scraper learned about it — horizon, failures and page size — and it starts over."
     >
       <Backfill sync={sync} />
+      <RecentDays sync={sync} />
 
       <hr class="hr" />
 
