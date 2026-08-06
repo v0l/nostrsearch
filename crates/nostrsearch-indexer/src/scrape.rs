@@ -764,21 +764,34 @@ fn plan_batch(
             continue;
         }
 
-        // Sample a few days rather than scanning the window for an unfinished
-        // one: the scan costs more than the query it schedules.
-        for _ in 0..8 {
-            let off = rng.gen_range(0..span_days);
+        // Enumerate the window's unfinished days, then pick one at random.
+        //
+        // This used to take 8 random draws and give up. Once a window was
+        // mostly complete those draws kept landing on finished days, the relay
+        // yielded nothing, and if that held for every relay the batch came
+        // back empty -- which the caller reads as "window exhausted" and steps
+        // past, permanently, with days still unscraped. Enough windows falsely
+        // exhausted and the pass ends and the scraper goes idle.
+        //
+        // A window is BLOCK_DAYS wide, so this is at most 30 `day_done`
+        // lookups against RocksDB: cheaper than the relay query it schedules,
+        // and it cannot report exhaustion that is not real.
+        let mut open_days: Vec<(String, u64, u64)> = Vec::new();
+        for off in 0..span_days {
             let start = lo + off * 86_400;
             let back = (today_start - start) / 86_400;
             let (date, start, end) = day_bounds(back);
             if start < lo || start >= hi {
                 continue;
             }
-            if state.day_done(&date, url) {
-                continue;
+            if !state.day_done(&date, url) {
+                open_days.push((date, start, end));
             }
+        }
+        // Random *within* the window still, so relays stay interleaved rather
+        // than every one of them marching the same day in lockstep.
+        if let Some((date, start, end)) = open_days.choose(rng).cloned() {
             out.push((url.clone(), info.clone(), date, start, end));
-            break;
         }
     }
     out
@@ -1149,6 +1162,51 @@ mod scrape_concurrency_tests {
             assert!(s < prev_start, "each block must reach strictly older days");
             prev_start = s;
         }
+    }
+
+    /// A window with one day left must still yield it.
+    ///
+    /// The sampler took 8 random draws and gave up. On a nearly-complete
+    /// window those draws almost always land on finished days, so the relay
+    /// yields nothing, the batch comes back empty, and the caller reads that
+    /// as "window exhausted" and steps past it -- permanently, with days still
+    /// unscraped. This is the case that must never report exhaustion falsely.
+    #[test]
+    fn a_single_remaining_day_is_always_found() {
+        let (st, dir) = state("lastday");
+        let t = targets(1);
+        let cfg = super::ScrapeConfig::default();
+        let mut rng = rand::thread_rng();
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        let today = now - (now % 86_400);
+        let win = super::block_window(today, 0);
+
+        // Finish every day in the window except one.
+        let mut keep_open: Option<String> = None;
+        for off in 0..super::BLOCK_DAYS {
+            let start = win.0 + off * 86_400;
+            if start >= win.1 {
+                break;
+            }
+            let back = (today - start) / 86_400;
+            let (date, ..) = super::day_bounds(back);
+            if keep_open.is_none() {
+                keep_open = Some(date);
+                continue;
+            }
+            st.put_day(&date, &t[0].0, &super::DayDone { seen: 1, new: 0, at: now });
+        }
+        let open = keep_open.expect("the window must contain at least one day");
+
+        // Every attempt must find it. A sampler that gives up would miss it
+        // most of the time.
+        for _ in 0..25 {
+            let b = super::plan_batch(&t, &st, &cfg, 50, &mut rng, win);
+            assert_eq!(b.len(), 1, "the one unfinished day must be scheduled");
+            assert_eq!(b[0].2, open, "and it must be that day");
+        }
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// Permits must be taken before spawning, not inside the task.
