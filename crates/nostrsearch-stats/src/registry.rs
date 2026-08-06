@@ -162,6 +162,13 @@ pub struct Registry {
     total_events: u64,
     rate: RateMeter,
     observer: Option<Arc<dyn MetricsObserver>>,
+    /// The shared follow-graph handle, kept so re-attaching does not reopen it.
+    ///
+    /// RocksDB holds an exclusive lock per path. Opening a second handle while
+    /// this process already has one fails, so a re-attach after a reset --
+    /// which is exactly when an analysis has lost its store -- would error out
+    /// and leave that analysis attached to nothing.
+    graph: Option<Arc<crate::graph::GraphStore>>,
 }
 
 impl Registry {
@@ -286,7 +293,17 @@ impl Registry {
     /// duplicated per analysis. [`load`](Registry::load) calls this; call it
     /// directly when running without a [`StatStore`].
     pub fn attach_all(&mut self, dir: &std::path::Path) -> Result<()> {
-        let graph = std::sync::Arc::new(crate::graph::GraphStore::open(dir.join("graph"))?);
+        // Reuse the handle if this registry has already opened one. Reopening
+        // races the lock held by the analyses that were *not* reset and still
+        // hold their Arc.
+        let graph = match self.graph.clone() {
+            Some(g) => g,
+            None => {
+                let g = std::sync::Arc::new(crate::graph::GraphStore::open(dir.join("graph"))?);
+                self.graph = Some(g.clone());
+                g
+            }
+        };
         let ctx = crate::AttachCtx { graph };
         for e in &mut self.entries {
             e.analysis.attach(&ctx)?;

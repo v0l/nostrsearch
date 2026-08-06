@@ -409,30 +409,28 @@ fn resetting_a_derived_analysis_needs_no_corpus() {
     );
 }
 
-/// Resetting a derived analysis takes the no-corpus path and drives a refresh.
+/// Resetting a derived analysis must leave it rebuilt, not empty.
 ///
 /// Pagerank refreshes daily, so a reset that skipped the corpus replay
 /// (correctly -- it reads no events) would otherwise leave the report empty
 /// until the next scheduled run: up to 24 hours of looking like the operator's
 /// re-derive silently did nothing.
 ///
-/// KNOWN GAP: the refresh runs and reports every name refreshed, but the ranks
-/// it produces are empty here. `reattach_graph` opens a *second* GraphStore
-/// handle on a path the pipeline already holds open, and RocksDB takes an
-/// exclusive lock, so the re-attach plausibly fails and leaves pagerank
-/// attached to nothing. That is the same class of bug as the reset_all graph
-/// detach, and it is unresolved -- so this asserts the wiring, not the output.
+/// This also covers the re-attach. Resetting replaces pagerank with a default
+/// instance whose graph handle is gone, and re-attaching used to reopen the
+/// GraphStore -- which cannot work, because RocksDB locks the path and the
+/// analyses that were not reset still hold it open. The refresh then ran over
+/// nothing and produced no ranks at all.
 #[test]
-fn resetting_a_derived_analysis_takes_the_no_corpus_path() {
+fn resetting_a_derived_analysis_rebuilds_it_immediately() {
     let dir = tempfile::tempdir().unwrap();
     let mut p = Pipeline::new(config(dir.path())).unwrap();
     run_all_passes(&mut p, &corpus(1_700_000_000));
 
+    let before = report(&p, "pagerank");
     assert!(
-        report(&p, "pagerank")
-            .as_array()
-            .is_some_and(|a| !a.is_empty()),
-        "the corpus should have produced ranks to begin with"
+        before.as_array().is_some_and(|a| !a.is_empty()),
+        "the corpus should have produced ranks to begin with, got {before}"
     );
 
     let reset = p.reset_analysis("pagerank").expect("pagerank exists");
@@ -443,7 +441,13 @@ fn resetting_a_derived_analysis_takes_the_no_corpus_path() {
     assert_eq!(
         p.refresh_now(&reset),
         reset.len(),
-        "the reset must drive a refresh for every name it reset, rather than \
-         leaving them for the 24h schedule"
+        "the reset must drive a refresh for every name it reset"
+    );
+
+    let after = report(&p, "pagerank");
+    assert!(
+        after.as_array().is_some_and(|a| !a.is_empty()),
+        "ranks must be rebuilt from the follow graph without a corpus pass; \
+         an empty result means the graph handle was lost on reset, got {after}"
     );
 }
