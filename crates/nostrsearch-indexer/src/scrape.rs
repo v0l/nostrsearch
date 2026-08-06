@@ -562,7 +562,10 @@ pub async fn run_pass<S: Sink>(
     // tail unscraped. Sampling relay-days spreads progress evenly: every relay
     // advances a little on every pass, and coverage fills in uniformly rather
     // than front to back.
-    let mut rng = rand::thread_rng();
+    // StdRng, not thread_rng: the rng is held across await points here, and
+    // ThreadRng is !Send, which would make this whole future !Send and break
+    // every caller that spawns it.
+    let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::from_entropy();
     let batch_size = cfg.concurrency.max(1);
     let mut scraped = 0u64;
 
