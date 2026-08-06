@@ -573,6 +573,9 @@ pub struct ScrapeConfig {
     pub dead_after_fails: u32,
     /// How long a dead relay is left alone, in seconds.
     pub dead_for_secs: u64,
+    /// Hard cap on one relay-day, in seconds. A relay that connects and then
+    /// stalls would otherwise hold a worker slot for the rest of the pass.
+    pub unit_timeout_secs: u64,
 }
 
 impl Default for ScrapeConfig {
@@ -584,6 +587,7 @@ impl Default for ScrapeConfig {
             empty_days_limit: 14,
             dead_after_fails: 3,
             dead_for_secs: 24 * 3600,
+            unit_timeout_secs: 180,
         }
     }
 }
@@ -614,6 +618,20 @@ pub async fn run_pass<S: Sink>(
     let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::from_entropy();
     let batch_size = cfg.concurrency.max(1);
     let mut scraped = 0u64;
+
+    // Slots are held per unit, not per batch.
+    //
+    // Awaiting a whole batch before drawing the next meant every batch ran at
+    // the speed of its slowest member, and among 8000+ relays there is always
+    // one that accepts a connection and then stalls. 49 workers idled waiting
+    // for it, so throughput collapsed to a few relay-days a minute with fifty
+    // workers configured. A slot now frees the moment its own unit finishes.
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(batch_size));
+    // Units handed out but not yet recorded as done. Without this the planner
+    // would redraw them -- day_done is only true after completion.
+    let in_flight: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>> =
+        Default::default();
+    let unit_timeout = std::time::Duration::from_secs(cfg.unit_timeout_secs);
 
     // Fill newest-first, one fixed block of days at a time.
     //
@@ -649,7 +667,9 @@ pub async fn run_pass<S: Sink>(
         // visible to later batches, so a dead relay kept being drawn for the
         // whole pass -- the retirement did nothing.
         let targets = state.relays();
-        let mut batch = plan_batch(&targets, &state, &cfg, batch_size, &mut rng, window);
+        let mut batch = plan_batch(
+            &targets, &state, &cfg, batch_size, &mut rng, window, &in_flight,
+        );
 
         // This month is done for every relay: step back and keep going, until
         // the window falls off the configured floor.
@@ -666,28 +686,42 @@ pub async fn run_pass<S: Sink>(
                 scraped,
                 "scrape window complete; moving back a block"
             );
-            batch = plan_batch(&targets, &state, &cfg, batch_size, &mut rng, window);
+            batch = plan_batch(
+                &targets, &state, &cfg, batch_size, &mut rng, window, &in_flight,
+            );
         }
         if batch.is_empty() {
             break;
         }
 
-        let mut handles = Vec::with_capacity(batch.len());
         for (url, info, date, start, end) in batch {
+            // Take a slot first, so no more than `concurrency` units are ever
+            // in flight. This blocks until some *individual* unit finishes --
+            // not until a whole batch does.
+            let Ok(permit) = sem.clone().acquire_owned().await else {
+                break;
+            };
+            let key = format!("{url}|{date}");
+            in_flight.lock().unwrap().insert(key.clone());
+
             let state = state.clone();
             let sink = sink.clone();
             let cfg = cfg.clone();
             let client = client.clone();
-            handles.push(tokio::spawn(async move {
-                scrape_relay_day(&client, &url, info, &date, start, end, state, sink, &cfg).await;
-            }));
+            let in_flight_t = in_flight.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                // A relay that accepts a connection and then never answers
+                // would otherwise hold its slot for the rest of the pass.
+                let work =
+                    scrape_relay_day(&client, &url, info, &date, start, end, state, sink, &cfg);
+                if tokio::time::timeout(unit_timeout, work).await.is_err() {
+                    tracing::warn!(relay = %url, date = %date, "relay-day timed out");
+                }
+                in_flight_t.lock().unwrap().remove(&key);
+            });
+            scraped += 1;
         }
-        // Await the whole batch before drawing the next, so in-flight queries
-        // never exceed `concurrency` even briefly.
-        for h in handles {
-            let _ = h.await;
-        }
-        scraped += batch_size as u64;
         if scraped % (batch_size as u64 * 20) == 0 {
             tracing::info!(scraped, "scrape pass progress");
         }
@@ -728,6 +762,7 @@ fn plan_batch(
     limit: usize,
     rng: &mut impl rand::Rng,
     window: (u64, u64),
+    in_flight: &std::sync::Mutex<std::collections::HashSet<String>>,
 ) -> Vec<RelayDay> {
     use rand::seq::SliceRandom;
 
@@ -784,7 +819,11 @@ fn plan_batch(
             if start < lo || start >= hi {
                 continue;
             }
-            if !state.day_done(&date, url) {
+            // Skip both finished days and ones already handed to a worker:
+            // day_done only becomes true once a unit completes.
+            if !state.day_done(&date, url)
+                && !in_flight.lock().unwrap().contains(&format!("{url}|{date}"))
+            {
                 open_days.push((date, start, end));
             }
         }
@@ -996,8 +1035,9 @@ mod scrape_concurrency_tests {
         let cfg = super::ScrapeConfig::default();
         let mut rng = rand::thread_rng();
         let win = (0u64, u64::MAX); // whole corpus, for tests about other rules
+        let inflight = std::sync::Mutex::new(std::collections::HashSet::new());
 
-        let batch = super::plan_batch(&t, &st, &cfg, 50, &mut rng, win);
+        let batch = super::plan_batch(&t, &st, &cfg, 50, &mut rng, win, &inflight);
         assert!(batch.len() <= 50, "batch must not exceed the limit");
         assert!(batch.len() > 40, "should fill a batch from 200 fresh relays");
 
@@ -1020,6 +1060,7 @@ mod scrape_concurrency_tests {
         let cfg = super::ScrapeConfig::default();
         let mut rng = rand::thread_rng();
         let win = (0u64, u64::MAX); // whole corpus, for tests about other rules
+        let inflight = std::sync::Mutex::new(std::collections::HashSet::new());
 
         // Record every day this relay could be asked for.
         let now = chrono::Utc::now().timestamp() as u64;
@@ -1032,7 +1073,7 @@ mod scrape_concurrency_tests {
 
         for _ in 0..20 {
             assert!(
-                super::plan_batch(&t, &st, &cfg, 50, &mut rng, win).is_empty(),
+                super::plan_batch(&t, &st, &cfg, 50, &mut rng, win, &inflight).is_empty(),
                 "a fully-scraped relay must yield no work"
             );
         }
@@ -1059,10 +1100,11 @@ mod scrape_concurrency_tests {
         let cfg = super::ScrapeConfig::default();
         let mut rng = rand::thread_rng();
         let win = (0u64, u64::MAX); // whole corpus, for tests about other rules
+        let inflight = std::sync::Mutex::new(std::collections::HashSet::new());
 
         let mut saw_older = false;
         for _ in 0..200 {
-            for (_, _, _, start, _) in super::plan_batch(&t, &st, &cfg, 10, &mut rng, win) {
+            for (_, _, _, start, _) in super::plan_batch(&t, &st, &cfg, 10, &mut rng, win, &inflight) {
                 assert!(start >= cfg.min_date, "drew below the configured floor");
                 if start < birthday {
                     saw_older = true;
@@ -1100,10 +1142,11 @@ mod scrape_concurrency_tests {
         let cfg = super::ScrapeConfig::default();
         let mut rng = rand::thread_rng();
         let win = (0u64, u64::MAX); // whole corpus, for tests about other rules
+        let inflight = std::sync::Mutex::new(std::collections::HashSet::new());
 
         let mut saw_alive = false;
         for _ in 0..100 {
-            for (url, ..) in super::plan_batch(&t, &st, &cfg, 10, &mut rng, win) {
+            for (url, ..) in super::plan_batch(&t, &st, &cfg, 10, &mut rng, win, &inflight) {
                 assert_ne!(url, "wss://dead.example", "a dead relay must not be drawn");
                 if url == "wss://alive.example" {
                     saw_alive = true;
@@ -1128,8 +1171,9 @@ mod scrape_concurrency_tests {
 
         let now = chrono::Utc::now().timestamp() as u64;
         let win = super::block_window(now - (now % 86_400), 0);
+        let inflight = std::sync::Mutex::new(std::collections::HashSet::new());
         for _ in 0..40 {
-            for (_, _, _, start, _) in super::plan_batch(&t, &st, &cfg, 20, &mut rng, win) {
+            for (_, _, _, start, _) in super::plan_batch(&t, &st, &cfg, 20, &mut rng, win, &inflight) {
                 assert!(
                     start >= win.0 && start < win.1,
                     "drew {start} outside the window {win:?}"
@@ -1181,6 +1225,7 @@ mod scrape_concurrency_tests {
         let now = chrono::Utc::now().timestamp() as u64;
         let today = now - (now % 86_400);
         let win = super::block_window(today, 0);
+        let inflight = std::sync::Mutex::new(std::collections::HashSet::new());
 
         // Finish every day in the window except one.
         let mut keep_open: Option<String> = None;
@@ -1202,11 +1247,78 @@ mod scrape_concurrency_tests {
         // Every attempt must find it. A sampler that gives up would miss it
         // most of the time.
         for _ in 0..25 {
-            let b = super::plan_batch(&t, &st, &cfg, 50, &mut rng, win);
+            let b = super::plan_batch(&t, &st, &cfg, 50, &mut rng, win, &inflight);
             assert_eq!(b.len(), 1, "the one unfinished day must be scheduled");
             assert_eq!(b[0].2, open, "and it must be that day");
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A unit already handed to a worker must not be drawn again.
+    ///
+    /// day_done only becomes true once a unit completes, so without an
+    /// in-flight guard the planner reissues work that is already running --
+    /// two connections to the same relay for the same day.
+    #[test]
+    fn work_in_flight_is_not_redrawn() {
+        let (st, dir) = state("inflight");
+        let t = targets(1);
+        let cfg = super::ScrapeConfig::default();
+        let mut rng = rand::thread_rng();
+        let now = chrono::Utc::now().timestamp() as u64;
+        let win = super::block_window(now - (now % 86_400), 0);
+        let inflight = std::sync::Mutex::new(std::collections::HashSet::new());
+
+        let first = super::plan_batch(&t, &st, &cfg, 1, &mut rng, win, &inflight);
+        assert_eq!(first.len(), 1, "a fresh relay must yield work");
+        let (url, _, date, ..) = first[0].clone();
+        inflight.lock().unwrap().insert(format!("{url}|{date}"));
+
+        for _ in 0..50 {
+            for (u, _, d, ..) in super::plan_batch(&t, &st, &cfg, 5, &mut rng, win, &inflight) {
+                assert!(
+                    !(u == url && d == date),
+                    "{u} {d} is already running and must not be reissued"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// One stalled unit must not stop the others finishing.
+    ///
+    /// The pass used to await a whole batch before drawing the next, so every
+    /// batch ran at the speed of its slowest member. Among 8000+ relays there
+    /// is always one that connects and then stalls, and 49 workers idled
+    /// waiting for it -- a few relay-days a minute with fifty configured.
+    #[tokio::test]
+    async fn a_stalled_unit_does_not_block_the_others() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let limit = 4usize;
+        let sem = Arc::new(tokio::sync::Semaphore::new(limit));
+        let done = Arc::new(AtomicUsize::new(0));
+
+        // One unit stalls far longer than the rest. With a batch barrier
+        // nothing after it could start until it finished.
+        for i in 0..40usize {
+            let permit = sem.clone().acquire_owned().await.unwrap();
+            let done = done.clone();
+            tokio::spawn(async move {
+                let _permit = permit;
+                let ms = if i == 0 { 60_000 } else { 5 };
+                tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                done.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+        let n = done.load(Ordering::SeqCst);
+        assert!(
+            n >= 39,
+            "every unit but the stalled one should have finished; only {n} did"
+        );
     }
 
     /// Permits must be taken before spawning, not inside the task.
