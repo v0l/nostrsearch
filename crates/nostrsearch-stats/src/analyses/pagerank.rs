@@ -91,6 +91,19 @@ impl Analysis for Pagerank {
         "pagerank"
     }
 
+    /// Ranks are power iteration over `follow_graph`'s adjacency, so the graph
+    /// has to be complete before this runs.
+    ///
+    /// This declared nothing, which put it in stage 0 -- the same pass that
+    /// builds the graph. The iteration therefore ran over a half-built (on a
+    /// fresh index, empty) adjacency, and since `refresh` is scheduled daily
+    /// the wrong answer then persisted. Every other consumer of the graph
+    /// (activity, active_users, kind_breakdown) already declared this; the one
+    /// analysis defined entirely by the graph did not.
+    fn deps(&self) -> &'static [&'static str] {
+        &["follow_graph"]
+    }
+
     /// No events at all.
     ///
     /// This used to declare kind 3, which is `follow_graph`'s input,
@@ -223,6 +236,18 @@ impl Analysis for Pagerank {
 mod corpus_tests {
     use super::*;
     use crate::Analysis;
+
+    /// The graph must be finished before the iteration runs.
+    #[test]
+    fn depends_on_the_graph_it_is_derived_from() {
+        let p = Pagerank::default();
+        assert!(
+            Analysis::deps(&p).contains(&"follow_graph"),
+            "pagerank is staged from follow_graph's adjacency; without the \
+             dependency it runs in stage 0 and iterates over a graph that is \
+             still being built"
+        );
+    }
 
     /// Pagerank must not ask for events.
     ///
