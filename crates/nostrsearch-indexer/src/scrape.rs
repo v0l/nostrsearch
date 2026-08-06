@@ -623,6 +623,12 @@ pub async fn run_pass<S: Sink>(
     // next one back is opened, so recent history -- the part anyone is
     // actually searching -- completes first and coverage has a definite edge
     // rather than being uniformly sparse over four years.
+    // One client for the pass. `Client` owns a relay pool and manages its
+    // connections internally, so building one per relay-day meant constructing
+    // and tearing down a pool 50 at a time, continuously, for the whole run --
+    // and gave up connection reuse across the days of the same relay.
+    let client = std::sync::Arc::new(nostr_sdk::Client::default());
+
     let now0 = chrono::Utc::now().timestamp() as u64;
     let today_start = now0 - (now0 % 86_400);
     let mut block = 0u64;
@@ -667,8 +673,9 @@ pub async fn run_pass<S: Sink>(
             let state = state.clone();
             let sink = sink.clone();
             let cfg = cfg.clone();
+            let client = client.clone();
             handles.push(tokio::spawn(async move {
-                scrape_relay_day(&url, info, &date, start, end, state, sink, &cfg).await;
+                scrape_relay_day(&client, &url, info, &date, start, end, state, sink, &cfg).await;
             }));
         }
         // Await the whole batch before drawing the next, so in-flight queries
@@ -776,6 +783,7 @@ fn plan_batch(
 /// Fetch one day from one relay and record the outcome.
 #[allow(clippy::too_many_arguments)]
 async fn scrape_relay_day<S: Sink>(
+    client: &nostr_sdk::Client,
     url: &str,
     mut info: RelayInfo,
     date: &str,
@@ -787,13 +795,17 @@ async fn scrape_relay_day<S: Sink>(
 ) {
     use nostr_sdk::prelude::*;
 
-    let client = Client::default();
+    // Added to the shared pool on demand. add_relay is idempotent, so a relay
+    // touched again in a later batch reuses the existing connection instead of
+    // handshaking afresh.
     if client.add_relay(url).await.is_err() {
         return;
     }
-    client.connect().await;
+    if client.connect_relay(url).await.is_err() {
+        return;
+    }
 
-    match scrape_day(&client, url, &mut info, &sink, start, end, cfg.floor_secs).await {
+    match scrape_day(client, url, &mut info, &sink, start, end, cfg.floor_secs).await {
         Ok((seen, new)) => {
             // Alive: clear both the failure streak and any death sentence.
             info.fails = 0;
@@ -835,7 +847,10 @@ async fn scrape_relay_day<S: Sink>(
         }
     }
     state.put_relay(url, &info);
-    let _ = client.shutdown().await;
+    // Drop the connection but keep the client: leaving every relay attached
+    // would accumulate thousands of open sockets across a pass over 8000+
+    // relays. The pool keeps whatever the next batch re-adds.
+    let _ = client.remove_relay(url).await;
 }
 
 
