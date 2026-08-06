@@ -615,6 +615,17 @@ pub async fn run_pass<S: Sink>(
     let batch_size = cfg.concurrency.max(1);
     let mut scraped = 0u64;
 
+    // Fill newest-first, a month at a time.
+    //
+    // Within a month days are still drawn at random, which is what keeps every
+    // relay advancing together instead of one relay monopolising the workers.
+    // Across months the order is deliberate: a window is finished before the
+    // next one back is opened, so recent history -- the part anyone is
+    // actually searching -- completes first and coverage has a definite edge
+    // rather than being uniformly sparse over four years.
+    let now0 = chrono::Utc::now().timestamp() as u64;
+    let mut window = month_window(now0);
+
     loop {
         // Re-read between batches rather than working from one snapshot taken
         // at pass start.
@@ -626,7 +637,23 @@ pub async fn run_pass<S: Sink>(
         // visible to later batches, so a dead relay kept being drawn for the
         // whole pass -- the retirement did nothing.
         let targets = state.relays();
-        let batch = plan_batch(&targets, &state, &cfg, batch_size, &mut rng);
+        let mut batch = plan_batch(&targets, &state, &cfg, batch_size, &mut rng, window);
+
+        // This month is done for every relay: step back and keep going, until
+        // the window falls off the configured floor.
+        while batch.is_empty() {
+            if window.0 <= cfg.min_date {
+                break;
+            }
+            let prev = prev_month(window.0);
+            window = (prev, window.0);
+            tracing::info!(
+                window_start = window.0,
+                scraped,
+                "scrape window complete; moving back a month"
+            );
+            batch = plan_batch(&targets, &state, &cfg, batch_size, &mut rng, window);
+        }
         if batch.is_empty() {
             break;
         }
@@ -653,6 +680,33 @@ pub async fn run_pass<S: Sink>(
     tracing::info!(scraped, "scrape pass complete");
 }
 
+/// The calendar month containing `ts`, as (start, end) day-aligned bounds.
+pub fn month_window(ts: u64) -> (u64, u64) {
+    use chrono::Datelike;
+    let dt = Utc.timestamp_opt(ts as i64, 0).single().unwrap_or_default();
+    let start = Utc
+        .with_ymd_and_hms(dt.year(), dt.month(), 1, 0, 0, 0)
+        .single()
+        .map(|d| d.timestamp() as u64)
+        .unwrap_or(0);
+    let (ny, nm) = if dt.month() == 12 {
+        (dt.year() + 1, 1)
+    } else {
+        (dt.year(), dt.month() + 1)
+    };
+    let end = Utc
+        .with_ymd_and_hms(ny, nm, 1, 0, 0, 0)
+        .single()
+        .map(|d| d.timestamp() as u64)
+        .unwrap_or(u64::MAX);
+    (start, end)
+}
+
+/// Start of the month before the one beginning at `start`.
+pub fn prev_month(start: u64) -> u64 {
+    month_window(start.saturating_sub(1)).0
+}
+
 /// One unit of work: a relay and the day to fetch from it.
 type RelayDay = (String, RelayInfo, String, u64, u64);
 
@@ -667,6 +721,7 @@ fn plan_batch(
     cfg: &ScrapeConfig,
     limit: usize,
     rng: &mut impl rand::Rng,
+    window: (u64, u64),
 ) -> Vec<RelayDay> {
     use rand::seq::SliceRandom;
 
@@ -688,25 +743,29 @@ fn plan_batch(
             continue;
         }
 
-        // The oldest day worth asking this relay for.
-        // Only the configured floor. See `RelayInfo::birthday`: gating on it
-        // truncated every relay's history at its first successful draw.
-        let floor = cfg.min_date;
-        if floor >= today_start {
+        // Days are drawn from the current window only, newest window first.
+        // Complete randomness across the whole corpus spread every relay
+        // thinly over four years, so nothing was ever finished and recent
+        // history -- the part anyone is actually searching -- filled at the
+        // same glacial rate as 2022.
+        let lo = window.0.max(cfg.min_date);
+        let hi = window.1.min(today_start);
+        if lo >= hi {
             continue;
         }
-        let span_days = (today_start - floor) / 86_400;
+        let span_days = (hi - lo) / 86_400;
         if span_days == 0 {
             continue;
         }
 
-        // Sample a few days for this relay rather than scanning its whole
-        // history: with years of days a linear scan for an unfinished one
-        // costs more than the query it schedules.
+        // Sample a few days rather than scanning the window for an unfinished
+        // one: the scan costs more than the query it schedules.
         for _ in 0..8 {
-            let back = rng.gen_range(1..=span_days);
+            let off = rng.gen_range(0..span_days);
+            let start = lo + off * 86_400;
+            let back = (today_start - start) / 86_400;
             let (date, start, end) = day_bounds(back);
-            if start < floor {
+            if start < lo || start >= hi {
                 continue;
             }
             if state.day_done(&date, url) {
@@ -909,8 +968,9 @@ mod scrape_concurrency_tests {
         let t = targets(200);
         let cfg = super::ScrapeConfig::default();
         let mut rng = rand::thread_rng();
+        let win = (0u64, u64::MAX); // whole corpus, for tests about other rules
 
-        let batch = super::plan_batch(&t, &st, &cfg, 50, &mut rng);
+        let batch = super::plan_batch(&t, &st, &cfg, 50, &mut rng, win);
         assert!(batch.len() <= 50, "batch must not exceed the limit");
         assert!(batch.len() > 40, "should fill a batch from 200 fresh relays");
 
@@ -932,6 +992,7 @@ mod scrape_concurrency_tests {
         let t = targets(1);
         let cfg = super::ScrapeConfig::default();
         let mut rng = rand::thread_rng();
+        let win = (0u64, u64::MAX); // whole corpus, for tests about other rules
 
         // Record every day this relay could be asked for.
         let now = chrono::Utc::now().timestamp() as u64;
@@ -944,7 +1005,7 @@ mod scrape_concurrency_tests {
 
         for _ in 0..20 {
             assert!(
-                super::plan_batch(&t, &st, &cfg, 50, &mut rng).is_empty(),
+                super::plan_batch(&t, &st, &cfg, 50, &mut rng, win).is_empty(),
                 "a fully-scraped relay must yield no work"
             );
         }
@@ -970,10 +1031,11 @@ mod scrape_concurrency_tests {
         let t = vec![("wss://r.example".to_string(), info)];
         let cfg = super::ScrapeConfig::default();
         let mut rng = rand::thread_rng();
+        let win = (0u64, u64::MAX); // whole corpus, for tests about other rules
 
         let mut saw_older = false;
         for _ in 0..200 {
-            for (_, _, _, start, _) in super::plan_batch(&t, &st, &cfg, 10, &mut rng) {
+            for (_, _, _, start, _) in super::plan_batch(&t, &st, &cfg, 10, &mut rng, win) {
                 assert!(start >= cfg.min_date, "drew below the configured floor");
                 if start < birthday {
                     saw_older = true;
@@ -1010,10 +1072,11 @@ mod scrape_concurrency_tests {
         ];
         let cfg = super::ScrapeConfig::default();
         let mut rng = rand::thread_rng();
+        let win = (0u64, u64::MAX); // whole corpus, for tests about other rules
 
         let mut saw_alive = false;
         for _ in 0..100 {
-            for (url, ..) in super::plan_batch(&t, &st, &cfg, 10, &mut rng) {
+            for (url, ..) in super::plan_batch(&t, &st, &cfg, 10, &mut rng, win) {
                 assert_ne!(url, "wss://dead.example", "a dead relay must not be drawn");
                 if url == "wss://alive.example" {
                     saw_alive = true;
@@ -1022,6 +1085,53 @@ mod scrape_concurrency_tests {
         }
         assert!(saw_alive, "an expired sentence must let the relay back in");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Draws stay inside the window they are given.
+    ///
+    /// Filling newest-first is the whole point: complete randomness across
+    /// four years spread every relay thinly over the corpus, so nothing
+    /// finished and recent history filled no faster than 2022.
+    #[test]
+    fn draws_are_confined_to_the_window() {
+        let (st, dir) = state("window");
+        let t = targets(40);
+        let cfg = super::ScrapeConfig::default();
+        let mut rng = rand::thread_rng();
+
+        let now = chrono::Utc::now().timestamp() as u64;
+        let win = super::month_window(now);
+        for _ in 0..40 {
+            for (_, _, _, start, _) in super::plan_batch(&t, &st, &cfg, 20, &mut rng, win) {
+                assert!(
+                    start >= win.0 && start < win.1,
+                    "drew {start} outside the window {win:?}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Stepping back a month reaches strictly older days, and terminates.
+    #[test]
+    fn windows_walk_backwards_a_month_at_a_time() {
+        let now = chrono::Utc::now().timestamp() as u64;
+        let (start, end) = super::month_window(now);
+        assert!(start < end, "a month must be a non-empty range");
+        assert!(start <= now && now < end, "the window must contain its anchor");
+
+        let mut w = start;
+        let mut seen = Vec::new();
+        for _ in 0..14 {
+            let p = super::prev_month(w);
+            assert!(p < w, "each step must reach strictly older days");
+            seen.push(p);
+            w = p;
+        }
+        // A year and a bit of stepping back must not repeat a month.
+        let mut sorted = seen.clone();
+        sorted.dedup();
+        assert_eq!(sorted.len(), seen.len(), "months must not repeat");
     }
 
     /// Permits must be taken before spawning, not inside the task.
