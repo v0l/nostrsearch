@@ -144,6 +144,21 @@ fn deny(msg: &str) -> Response {
 
 /// NIP-98 gate for every admin route.
 async fn auth(State(st): State<AdminState>, req: Request, next: Next) -> Response {
+    // Reading state is not an admin action.
+    //
+    // These routes are how the console shows ingest progress, analysis
+    // watermarks and scrape coverage, and gating them behind a signature meant
+    // an operator had to sign in to see whether anything was happening at all.
+    // An unauthenticated console rendered empty panels rather than the data it
+    // was already serving openly elsewhere -- /stats and /reports expose the
+    // same picture without a key.
+    //
+    // Everything that changes something still needs a signed, fresh,
+    // single-use event; only the safe methods pass through.
+    if req.method().is_safe() {
+        return next.run(req).await;
+    }
+
     let Some(header) = req
         .headers()
         .get(axum::http::header::AUTHORIZATION)

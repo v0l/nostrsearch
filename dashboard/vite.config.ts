@@ -18,7 +18,7 @@ export default defineConfig(({ mode }) => ({
     proxy: Object.fromEntries(
       ["/stats", "/sync", "/reports", "/archive", "/admin"].map((p) => [
         p,
-        { target: loadEnv(mode, process.cwd(), "").NODE_URL || "http://127.0.0.1:8080", ws: true },
+        { target: loadEnv(mode, process.cwd(), "").NODE_URL || "http://127.0.0.1:8080", ws: true, rewriteWsOrigin: true },
       ]),
     ),
   },

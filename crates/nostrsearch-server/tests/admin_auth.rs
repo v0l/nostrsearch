@@ -105,11 +105,12 @@ async fn admin_key_is_accepted_and_everything_else_is_not() -> anyhow::Result<()
     let admin = Keys::generate();
     let stranger = Keys::generate();
     let base = serve(&admin).await?;
-    let url = format!("{base}/admin/analyses");
+    // Reads are open; the key check lives on a route that changes something.
+    let url = format!("{base}/admin/analyses/activity/reset");
     let http = reqwest::Client::new();
 
     // No header at all.
-    let r = http.get(&url).send().await?;
+    let r = http.post(&url).send().await?;
     assert_eq!(r.status(), 401, "unauthenticated request must be refused");
     assert!(
         r.headers().contains_key("www-authenticate"),
@@ -118,21 +119,33 @@ async fn admin_key_is_accepted_and_everything_else_is_not() -> anyhow::Result<()
 
     // A valid signature from a key that is not an admin.
     let r = http
-        .get(&url)
-        .header("Authorization", nip98(&stranger, &url, "GET", None).await?)
+        .post(&url)
+        .header("Authorization", nip98(&stranger, &url, "POST", None).await?)
         .send()
         .await?;
     assert_eq!(r.status(), 401, "non-admin key must be refused");
 
     // The configured admin.
     let r = http
-        .get(&url)
-        .header("Authorization", nip98(&admin, &url, "GET", None).await?)
+        .post(&url)
+        .header("Authorization", nip98(&admin, &url, "POST", None).await?)
         .send()
         .await?;
     assert_eq!(r.status(), 200, "admin key must be accepted");
     let body: serde_json::Value = r.json().await?;
-    assert!(body.is_array(), "expected the analyses list, got {body}");
+    assert_eq!(
+        body["reset"][0], "activity",
+        "expected the reset result, got {body}"
+    );
+
+    // And the read-only view is open to anyone, no key at all.
+    let list = format!("{base}/admin/analyses");
+    let r = http.get(&list).send().await?;
+    assert_eq!(r.status(), 200, "reading the analyses list must be open");
+    assert!(
+        r.json::<serde_json::Value>().await?.is_array(),
+        "expected the analyses list"
+    );
 
     Ok(())
 }
@@ -141,15 +154,15 @@ async fn admin_key_is_accepted_and_everything_else_is_not() -> anyhow::Result<()
 async fn stale_replayed_and_mismatched_headers_are_refused() -> anyhow::Result<()> {
     let admin = Keys::generate();
     let base = serve(&admin).await?;
-    let url = format!("{base}/admin/analyses");
+    let url = format!("{base}/admin/analyses/activity/reset");
     let http = reqwest::Client::new();
 
     // Too old.
     let r = http
-        .get(&url)
+        .post(&url)
         .header(
             "Authorization",
-            nip98(&admin, &url, "GET", Some(now() - 3600)).await?,
+            nip98(&admin, &url, "POST", Some(now() - 3600)).await?,
         )
         .send()
         .await?;
@@ -157,52 +170,41 @@ async fn stale_replayed_and_mismatched_headers_are_refused() -> anyhow::Result<(
 
     // Far-future timestamps must not buy an indefinitely valid header.
     let r = http
-        .get(&url)
+        .post(&url)
         .header(
             "Authorization",
-            nip98(&admin, &url, "GET", Some(now() + 86_400)).await?,
+            nip98(&admin, &url, "POST", Some(now() + 86_400)).await?,
         )
         .send()
         .await?;
     assert_eq!(r.status(), 401, "future auth event must be refused");
 
     // Signed for a different path: must not work on this one.
-    let other = format!("{base}/admin/analyses/activity/reset");
+    let other = format!("{base}/admin/analyses/reset-all");
     let r = http
-        .get(&url)
-        .header("Authorization", nip98(&admin, &other, "GET", None).await?)
+        .post(&url)
+        .header("Authorization", nip98(&admin, &other, "POST", None).await?)
         .send()
         .await?;
     assert_eq!(r.status(), 401, "u tag for another path must be refused");
 
     // Signed for a different method.
     let r = http
-        .get(&url)
-        .header("Authorization", nip98(&admin, &url, "POST", None).await?)
+        .post(&url)
+        .header("Authorization", nip98(&admin, &url, "GET", None).await?)
         .send()
         .await?;
     assert_eq!(r.status(), 401, "method mismatch must be refused");
 
-    // Replay: the same header twice.
-    let header = nip98(&admin, &url, "GET", None).await?;
-    let first = http
-        .get(&url)
-        .header("Authorization", &header)
-        .send()
-        .await?;
-    assert_eq!(first.status(), 200);
-    let second = http
-        .get(&url)
-        .header("Authorization", &header)
-        .send()
-        .await?;
-    // A repeated GET is allowed. Proxies transparently retry idempotent
-    // requests against a slow upstream, and rejecting the retry made the
-    // status endpoints 401 exactly when the node was busy enough to need them.
+    // A read is open and idempotent: a proxy retrying it against a slow
+    // upstream must never turn into a 401, which is what made the status
+    // endpoints fail exactly when the node was busy enough to need them.
+    let list = format!("{base}/admin/analyses");
+    assert_eq!(http.get(&list).send().await?.status(), 200);
     assert_eq!(
-        second.status(),
+        http.get(&list).send().await?.status(),
         200,
-        "a retried GET must not be rejected as a replay"
+        "a retried read must not be rejected"
     );
 
     // State-changing requests keep strict single-use: running a reset twice
@@ -224,7 +226,7 @@ async fn stale_replayed_and_mismatched_headers_are_refused() -> anyhow::Result<(
 
     // Garbage.
     for bad in ["Nostr not-base64!!", "Bearer hunter2", "Nostr "] {
-        let r = http.get(&url).header("Authorization", bad).send().await?;
+        let r = http.post(&url).header("Authorization", bad).send().await?;
         assert_eq!(r.status(), 401, "malformed header accepted: {bad}");
     }
 
@@ -233,26 +235,28 @@ async fn stale_replayed_and_mismatched_headers_are_refused() -> anyhow::Result<(
 
 /// Every admin route must sit behind the gate -- including ones added later.
 #[tokio::test]
-async fn listing_scrape_state_is_authenticated() -> anyhow::Result<()> {
+async fn listing_scrape_state_is_open_but_resetting_it_is_not() -> anyhow::Result<()> {
     let admin = Keys::generate();
     let base = serve(&admin).await?;
     let http = reqwest::Client::new();
     let url = format!("{base}/admin/scrape");
 
-    // Unauthenticated.
-    assert_eq!(http.get(&url).send().await?.status(), 401);
-
-    // Authenticated: this node has no scraper, so 503 rather than 401 -- which
-    // is what proves the request got past the auth layer.
-    let r = http
-        .get(&url)
-        .header("Authorization", nip98(&admin, &url, "GET", None).await?)
-        .send()
-        .await?;
+    // Reading scrape coverage needs no key: the console shows it on every
+    // panel, and gating it meant an unauthenticated operator saw empty panels
+    // rather than data the node already serves openly elsewhere. 503 here
+    // (this node has no scraper) is what proves the request was not refused.
     assert_eq!(
-        r.status(),
+        http.get(&url).send().await?.status(),
         503,
-        "expected to pass auth and then report no scraper"
+        "reading scrape state must not require a key"
+    );
+
+    // Changing it still does.
+    let reset = format!("{base}/admin/scrape/reset");
+    assert_eq!(
+        http.post(&reset).send().await?.status(),
+        401,
+        "resetting the scraper must still require a key"
     );
     Ok(())
 }
