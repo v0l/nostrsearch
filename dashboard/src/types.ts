@@ -74,6 +74,8 @@ export interface SyncStatus {
 }
 
 export interface AnalysisStatus {
+  /** Set when the analysis could not derive a real answer from its input. */
+  unhealthy?: string;
   name: string;
   epoch: number;
   backfilled: boolean;

@@ -107,8 +107,21 @@ export function Analyses({ authed, gate }: { authed: boolean; gate: string }) {
                   <td class="num">{num(a.observed)}</td>
                   <td class="num">{num(a.consumed)}</td>
                   <td class="num">{num(a.filtered)}</td>
-                  <td title={a.watermark ? isoDay(a.watermark) : "none"}>
-                    {ago(a.watermark)}
+                  <td
+                    title={
+                      a.unhealthy ?? (a.watermark ? isoDay(a.watermark) : "none")
+                    }
+                  >
+                    {/* A report whose producer could not derive an answer is
+                        not evidence of anything; say so rather than showing a
+                        confident timestamp over hollow output. */}
+                    {a.unhealthy ? (
+                      <span style={{ color: "var(--rust)", fontWeight: 600 }}>
+                        unhealthy
+                      </span>
+                    ) : (
+                      ago(a.watermark)
+                    )}
                   </td>
                   <td style={{ color: "var(--slate)" }}>{a.deps.length ? a.deps.join(", ") : "—"}</td>
                   <td>

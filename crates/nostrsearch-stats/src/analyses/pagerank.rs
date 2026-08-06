@@ -43,6 +43,14 @@ pub struct Pagerank {
     /// maintains; pagerank keeps no copy of its own.
     #[serde(skip)]
     store: Option<SharedGraph>,
+    /// Why the last refresh could not produce a real ranking.
+    ///
+    /// Every path out of `refresh` that yields no ranking sets this. Without
+    /// it, "the graph is empty", "we were never attached to a graph" and "this
+    /// network genuinely has flat authority" are the same observable: an empty
+    /// rank set that downstream analyses read as fact.
+    #[serde(skip)]
+    unhealthy: Option<String>,
 }
 
 impl Default for Pagerank {
@@ -52,6 +60,7 @@ impl Default for Pagerank {
             interval_secs: 24 * 3600,
             max_nodes: default_max_nodes(),
             store: None,
+            unhealthy: Some("never refreshed".into()),
         }
     }
 }
@@ -127,6 +136,10 @@ impl Analysis for Pagerank {
         Ok(())
     }
 
+    fn health(&self) -> Option<String> {
+        self.unhealthy.clone()
+    }
+
     /// No per-event work: `follow_graph` already writes every contact list to
     /// the shared store, so pagerank reads it at refresh time instead of
     /// keeping a second copy of the adjacency.
@@ -145,6 +158,11 @@ impl Analysis for Pagerank {
     /// edges); the edges themselves stay in RocksDB.
     fn refresh(&mut self) {
         let Some(store) = self.store.clone() else {
+            // Not attached to a graph. Ranks are left as they were rather than
+            // cleared: stale authority beats publishing zeroes as fact.
+            let why = "no graph attached; ranks not recomputed";
+            tracing::error!("pagerank refresh skipped: {why}");
+            self.unhealthy = Some(why.into());
             return;
         };
 
@@ -165,17 +183,27 @@ impl Analysis for Pagerank {
         });
 
         if idx.len() > self.max_nodes {
-            tracing::warn!(
-                nodes = idx.len(),
-                max_nodes = self.max_nodes,
-                "pagerank graph exceeds max_nodes; skipping refresh (raise PAGERANK_MAX_NODES \
-                 or leave pagerank disabled — follow_graph still provides WoT tiers)"
+            let why = format!(
+                "graph has {} nodes, over the {} cap; ranks not recomputed",
+                idx.len(),
+                self.max_nodes
             );
+            tracing::error!(
+                "pagerank refresh skipped: {why} (raise PAGERANK_MAX_NODES, or leave \
+                 pagerank disabled — follow_graph still provides WoT tiers)"
+            );
+            self.unhealthy = Some(why);
             return;
         }
         let n = idx.len();
         if n == 0 {
-            self.ranks.clear();
+            // Do NOT clear. An empty graph is a statement about the graph, not
+            // about authority in the network, and clearing here meant a single
+            // failed attach or an unbuilt graph silently replaced real ranks
+            // with zeroes that every downstream consumer read as fact.
+            let why = "graph is empty; ranks left as they were";
+            tracing::error!("pagerank refresh produced nothing: {why}");
+            self.unhealthy = Some(why.into());
             return;
         }
         for (i, v) in idx.values_mut().enumerate() {
@@ -214,6 +242,8 @@ impl Analysis for Pagerank {
         }
 
         self.ranks = idx.into_iter().map(|(pk, i)| (pk, rank[i])).collect();
+        // Derived from a real graph: this output stands on its own.
+        self.unhealthy = None;
     }
 
     fn contribute(&self, world: &mut World) {
@@ -272,6 +302,50 @@ mod tests {
     use super::*;
     use crate::graph::GraphStore;
     use std::sync::Arc;
+
+    /// An empty graph must not erase a real ranking.
+    ///
+    /// refresh() cleared self.ranks when the graph had no nodes, so a failed
+    /// attach or an unbuilt graph silently replaced real authority with zeroes
+    /// -- and every consumer of wot_tier read those zeroes as fact. The ranks
+    /// are now left alone and the analysis reports itself unhealthy.
+    #[test]
+    fn an_empty_graph_leaves_existing_ranks_alone_and_flags_itself() {
+        let mut p = Pagerank::default();
+        p.ranks.insert(pk(1), 0.9);
+        p.ranks.insert(pk(2), 0.1);
+
+        // No store attached at all: the case a failed re-attach produces.
+        Analysis::refresh(&mut p);
+        assert_eq!(p.ranks.len(), 2, "ranks must survive a refresh with no graph");
+        assert!(
+            Analysis::health(&p).is_some(),
+            "an analysis that could not derive an answer must say so"
+        );
+    }
+
+    /// A healthy refresh clears the flag, so staleness cannot look permanent.
+    #[test]
+    fn a_real_refresh_reports_healthy() {
+        let dir = std::env::temp_dir().join(format!("pr-health-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(GraphStore::open(&dir).unwrap());
+        store.put(&pk(1), 10, &[pk(2), pk(3)]).unwrap();
+        store.put(&pk(2), 10, &[pk(3)]).unwrap();
+
+        let mut p = Pagerank::default();
+        assert!(Analysis::health(&p).is_some(), "starts unrefreshed");
+        p.attach(&AttachCtx { graph: store }).unwrap();
+        Analysis::refresh(&mut p);
+
+        assert!(!p.ranks.is_empty(), "a real graph must produce ranks");
+        assert!(
+            Analysis::health(&p).is_none(),
+            "a refresh over a real graph is trustworthy output"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 
     fn pk(seed: u8) -> Pubkey {
         crate::types::Hash32([seed; 32])

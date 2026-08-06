@@ -106,6 +106,21 @@ pub trait Analysis: Send + Sync {
         &[]
     }
 
+    /// Why this analysis's last output is not trustworthy, if it is not.
+    ///
+    /// `None` means the output reflects the input it was derived from. `Some`
+    /// means the analysis ran but could not produce a real answer -- its
+    /// dependency was empty, absent, or refused -- and whatever it is
+    /// currently publishing should not be read as fact.
+    ///
+    /// This exists because an empty result and an empty *input* are different
+    /// facts, and every silent-failure bug in this system so far has come from
+    /// conflating them: pagerank iterating over a graph it was never attached
+    /// to published zeroes that looked exactly like a genuinely flat ranking.
+    fn health(&self) -> Option<String> {
+        None
+    }
+
     /// How often the expensive [`refresh`](Analysis::refresh) should run.
     ///
     /// `None` (default) = the analysis is incremental; its `contribute` already

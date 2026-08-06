@@ -33,6 +33,7 @@ pub trait DynAnalysis: Send + Sync {
     fn wants(&self, ev: &NostrEvent) -> bool;
     /// Kinds this analysis consumes, or `None` for "all of them".
     fn kinds_dyn(&self) -> Option<Vec<u16>>;
+    fn health_dyn(&self) -> Option<String>;
     fn observe(&mut self, ev: &NostrEvent, ctx: &AnalysisCtx) -> bool;
     fn refresh(&mut self);
     fn contribute(&self, world: &mut World);
@@ -69,6 +70,9 @@ where
     }
     fn kinds_dyn(&self) -> Option<Vec<u16>> {
         Analysis::kinds(self).map(|k| k.to_vec())
+    }
+    fn health_dyn(&self) -> Option<String> {
+        Analysis::health(self)
     }
     fn observe(&mut self, ev: &NostrEvent, ctx: &AnalysisCtx) -> bool {
         Analysis::observe(self, ev, ctx)
@@ -126,6 +130,10 @@ pub struct AnalysisStatus {
     pub consumed: u64,
     pub filtered: u64,
     pub deps: &'static [&'static str],
+    /// Set when the analysis could not derive a real answer. A report whose
+    /// producer is unhealthy is not evidence of anything.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unhealthy: Option<String>,
 }
 
 /// One registered analysis plus its resumable progress (which carries the
@@ -591,6 +599,7 @@ impl Registry {
                 consumed: e.progress.counters.consumed,
                 filtered: e.progress.counters.filtered,
                 deps: e.analysis.deps(),
+                unhealthy: e.analysis.health_dyn(),
             })
             .collect()
     }
