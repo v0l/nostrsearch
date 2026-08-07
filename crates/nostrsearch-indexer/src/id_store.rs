@@ -25,6 +25,13 @@ impl IdStore {
         // first run cheap, a modest cache keeps hot index blocks resident.
         bb.set_bloom_filter(10.0, false);
         bb.set_block_cache(&Cache::new_lru_cache(64 * 1024 * 1024));
+        // Without this the bloom filters and index blocks this store depends
+        // on sit outside the 64 MB cache, one set per open SST, unbounded --
+        // so the cache size described what was bounded rather than what was
+        // resident. The dedupe set is corpus-sized, so that is the difference
+        // between 64 MB and gigabytes.
+        bb.set_cache_index_and_filter_blocks(true);
+        bb.set_pin_l0_filter_and_index_blocks_in_cache(true);
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.set_block_based_table_factory(&bb);

@@ -44,8 +44,23 @@ impl std::fmt::Debug for GraphStore {
 impl GraphStore {
     /// Open (or create) the store at `path`.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        // Bound what RocksDB keeps resident.
+        //
+        // Index and filter blocks default to living *outside* the block cache,
+        // held per open SST file with no cap. With max_open_files at 256 and
+        // 128 MB SSTs that is a large, unbounded anonymous allocation -- and
+        // this process runs several RocksDB instances, each doing the same.
+        // Putting them under the cache makes the cache size the actual bound.
+        let mut bb = rocksdb::BlockBasedOptions::default();
+        bb.set_block_cache(&rocksdb::Cache::new_lru_cache(256 * 1024 * 1024));
+        bb.set_cache_index_and_filter_blocks(true);
+        // Keep L0's index/filter pinned so the hot path does not thrash the
+        // cache it now shares with data blocks.
+        bb.set_pin_l0_filter_and_index_blocks_in_cache(true);
+
         let mut opts = Options::default();
         opts.create_if_missing(true);
+        opts.set_block_based_table_factory(&bb);
         // Bound resident memory: the graph is far larger than RAM, so cap the
         // write buffers and let the block cache do the rest.
         opts.set_write_buffer_size(64 * 1024 * 1024);

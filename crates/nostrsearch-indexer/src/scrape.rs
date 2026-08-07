@@ -127,8 +127,19 @@ pub struct ScrapeState {
 
 impl ScrapeState {
     pub fn open(path: &Path) -> anyhow::Result<Self> {
+        // Small store, but it holds a record per (relay, day) -- 8000+ relays
+        // times years of days -- so it grows like the others and gets the same
+        // treatment: index and filter blocks under a bounded cache rather than
+        // resident per open SST.
+        let mut bb = rocksdb::BlockBasedOptions::default();
+        bb.set_block_cache(&rocksdb::Cache::new_lru_cache(64 * 1024 * 1024));
+        bb.set_cache_index_and_filter_blocks(true);
+        bb.set_pin_l0_filter_and_index_blocks_in_cache(true);
+
         let mut opts = Options::default();
         opts.create_if_missing(true);
+        opts.set_block_based_table_factory(&bb);
+        opts.set_write_buffer_size(32 * 1024 * 1024);
         // Bounded descriptor use; the default (-1) keeps an fd per SST.
         opts.set_max_open_files(256);
         Ok(Self {
