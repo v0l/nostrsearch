@@ -57,9 +57,9 @@ struct Args {
     #[arg(long, value_name = "N", default_value_t = 3)]
     min_sources: u32,
 
-    /// Percentage of relays to scrape, most-advertised first (100 = all)
-    #[arg(long, value_name = "PCT", default_value_t = 50)]
-    top_percent: u32,
+    /// Cover this share of total advertisement weight (100 = every relay)
+    #[arg(long, value_name = "PCT", default_value_t = 80)]
+    usage_percentile: u32,
 
     /// Concurrent relay/day queries (each relay walks its days serially)
     #[arg(long, value_name = "N", default_value_t = 50)]
@@ -323,7 +323,7 @@ async fn run(args: Args, state: Arc<ScrapeState>, sink: Arc<PipelineSink>) -> an
         floor_secs: args.floor_secs(),
         concurrency: args.concurrency,
         empty_days_limit: args.birthday_days,
-        top_percent: args.top_percent,
+        usage_percentile: args.usage_percentile,
         ..Default::default()
     };
     nostrsearch_indexer::scrape::run_pass(state, sink.clone(), cfg).await;

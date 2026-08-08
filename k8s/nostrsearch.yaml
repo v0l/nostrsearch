@@ -141,7 +141,13 @@ spec:
             # kind-10002, negentropy-syncs day-by-day backwards, records each
             # relay's data horizon after 14 empty days. SCRAPE=0 disables;
             # tune with SCRAPE_MIN_DATE, SCRAPE_MAX_RELAYS (0 = no cap;
-            # ~8000 relays are discovered in practice), SCRAPE_CONCURRENCY
+            # ~8000 relays are discovered in practice, but see
+            # SCRAPE_USAGE_PERCENTILE (80): relays are scraped in order of how
+            # many people advertise them, until that share of total
+            # advertisement weight is covered. Anyone can mint relay URLs by
+            # publishing kind-10002 entries with invented paths on someone
+            # else's host, so the relay *count* is attacker-controlled and the
+            # weight is not), SCRAPE_CONCURRENCY
             # (50 concurrent relay-day queries), SCRAPE_UNIT_TIMEOUT_SECS
             # (180), SCRAPE_DEAD_AFTER_FAILS (3), SCRAPE_DEAD_FOR_HOURS (24),
             # SCRAPE_FLOOR_MINS (10), SCRAPE_PASS_INTERVAL_SECS (1800),

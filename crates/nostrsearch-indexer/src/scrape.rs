@@ -587,16 +587,23 @@ pub struct ScrapeConfig {
     /// Hard cap on one relay-day, in seconds. A relay that connects and then
     /// stalls would otherwise hold a worker slot for the rest of the pass.
     pub unit_timeout_secs: u64,
-    /// Percentage of relays to scrape, most-advertised first.
+    /// Share of total advertisement weight to cover, as a percentage.
     ///
-    /// Discovery is uncapped and finds ~8000 relays, but advertisement is
-    /// heavily skewed: the tail is largely dead hosts, personal relays and
-    /// one-off test instances that cost a connection, a sync and a timeout
-    /// each to learn nothing. Scraping the top half spends the same worker
-    /// slots on the relays people actually publish to.
+    /// Relays are ranked by how many distinct people advertise them and kept
+    /// until they account for this share of all advertisements. At 80 that is
+    /// the relays carrying 80% of real usage.
+    ///
+    /// A cut on relay *count* assumes the count means something. It does not:
+    /// discovery is uncapped, anyone can mint relay URLs by publishing
+    /// kind-10002 entries with invented paths on someone else's host, and each
+    /// invention inflates the denominator. A count-based cut therefore lets
+    /// fabricated entries push real relays out of scope simply by existing. A
+    /// weight-based cut cannot -- an entry nobody advertises carries no
+    /// weight, so the set adapts to the distribution rather than to its
+    /// length.
     ///
     /// 100 disables the cut.
-    pub top_percent: u32,
+    pub usage_percentile: u32,
 }
 
 impl Default for ScrapeConfig {
@@ -609,7 +616,7 @@ impl Default for ScrapeConfig {
             dead_after_fails: 3,
             dead_for_secs: 24 * 3600,
             unit_timeout_secs: 180,
-            top_percent: 50,
+            usage_percentile: 80,
         }
     }
 }
@@ -623,11 +630,11 @@ pub async fn run_pass<S: Sink>(
     cfg: ScrapeConfig,
 ) {
     let all_relays = state.relays().len();
-    let scraped_relays = top_by_sources(state.relays(), cfg.top_percent).len();
+    let scraped_relays = top_by_usage_weight(state.relays(), cfg.usage_percentile).len();
     tracing::info!(
         relays = scraped_relays,
         discovered = all_relays,
-        top_percent = cfg.top_percent,
+        usage_percentile = cfg.usage_percentile,
         "scrape pass starting"
     );
 
@@ -695,7 +702,7 @@ pub async fn run_pass<S: Sink>(
         // the relay reverted to unprobed. It also meant `dead_until` was never
         // visible to later batches, so a dead relay kept being drawn for the
         // whole pass -- the retirement did nothing.
-        let targets = top_by_sources(state.relays(), cfg.top_percent);
+        let targets = top_by_usage_weight(state.relays(), cfg.usage_percentile);
         let mut batch = plan_batch(
             &targets, &state, &cfg, batch_size, &mut rng, window, &in_flight,
         );
@@ -776,24 +783,47 @@ pub fn block_window(today_start: u64, k: u64) -> (u64, u64) {
     (start, end)
 }
 
-/// Keep the most-advertised `percent` of relays.
+/// Keep the relays carrying `percentile`% of all advertisement weight.
 ///
-/// Sorted by advertiser count, ties broken on url so the cut is deterministic
-/// -- an unstable boundary would move relays in and out of scope between
-/// passes and leave their history permanently half-scraped.
+/// Ranked by advertiser count, accumulated until the running share reaches the
+/// target. What is kept is therefore decided by the shape of the distribution,
+/// not by how many entries happen to exist -- which matters because the entry
+/// count is attacker-controlled: relay URLs can be minted by publishing
+/// kind-10002 entries with invented paths on any host, and a count-based cut
+/// lets those inventions displace real relays just by existing.
 ///
-/// Never returns empty for a non-empty input: a rounding-down cut on a small
-/// relay set would otherwise stop the scraper entirely.
-pub fn top_by_sources(
+/// Ties break on url so the boundary is deterministic. An unstable cut would
+/// move relays in and out of scope between passes and leave the ones either
+/// side of it permanently half-scraped.
+///
+/// Never returns empty for a non-empty input.
+pub fn top_by_usage_weight(
     mut targets: Vec<(String, RelayInfo)>,
-    percent: u32,
+    percentile: u32,
 ) -> Vec<(String, RelayInfo)> {
-    if percent >= 100 || targets.is_empty() {
+    if percentile >= 100 || targets.is_empty() {
         return targets;
     }
     targets.sort_by(|a, b| b.1.sources.cmp(&a.1.sources).then_with(|| a.0.cmp(&b.0)));
-    let keep = ((targets.len() * percent as usize) / 100).max(1);
-    targets.truncate(keep);
+
+    let total: u64 = targets.iter().map(|(_, i)| i.sources as u64).sum();
+    if total == 0 {
+        // Nothing is advertised yet (a fresh node): weight cannot rank them,
+        // so keep the set rather than silently scraping one relay.
+        return targets;
+    }
+    let want = total.saturating_mul(percentile as u64) / 100;
+
+    let mut acc = 0u64;
+    let mut keep = 0usize;
+    for (_, i) in &targets {
+        acc += i.sources as u64;
+        keep += 1;
+        if acc >= want {
+            break;
+        }
+    }
+    targets.truncate(keep.max(1));
     targets
 }
 
@@ -1304,48 +1334,63 @@ mod scrape_concurrency_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// The cut keeps the most-advertised relays and is stable across passes.
+    /// The cut covers a share of usage, not a share of the relay list.
     #[test]
-    fn the_relay_cut_keeps_the_most_advertised_and_is_deterministic() {
+    fn the_cut_follows_usage_weight_not_relay_count() {
         let mk = |url: &str, n: u32| {
             let mut i = super::RelayInfo::default();
             i.sources = n;
             (url.to_string(), i)
         };
-        let all = vec![
-            mk("wss://d.example", 1),
-            mk("wss://a.example", 900),
-            mk("wss://c.example", 5),
-            mk("wss://b.example", 100),
-        ];
-
-        let kept = super::top_by_sources(all.clone(), 50);
-        let urls: Vec<&str> = kept.iter().map(|(u, _)| u.as_str()).collect();
-        assert_eq!(
-            urls,
-            vec!["wss://a.example", "wss://b.example"],
-            "the cut must keep the most-advertised half"
-        );
-
-        // Stability matters: a boundary that moves between passes leaves the
-        // relays either side of it permanently half-scraped.
-        for _ in 0..20 {
-            let again = super::top_by_sources(all.clone(), 50);
-            assert_eq!(
-                again.iter().map(|(u, _)| u.clone()).collect::<Vec<_>>(),
-                kept.iter().map(|(u, _)| u.clone()).collect::<Vec<_>>(),
-                "the same input must always yield the same cut"
-            );
+        // Realistic shape: a few relays carry nearly all advertisement, with a
+        // long tail of near-zero entries.
+        let mut all = vec![mk("wss://a.example", 900), mk("wss://b.example", 80)];
+        for i in 0..200 {
+            all.push(mk(&format!("wss://spam{i:03}.example/quebec-zulu"), 1));
         }
 
-        // 100 disables it; a tiny set must never cut to nothing.
-        assert_eq!(super::top_by_sources(all.clone(), 100).len(), 4);
-        assert_eq!(
-            super::top_by_sources(vec![mk("wss://only.example", 3)], 50).len(),
-            1,
-            "rounding down must not stop the scraper on a small relay set"
+        let kept = super::top_by_usage_weight(all.clone(), 80);
+        assert!(
+            kept.len() < 10,
+            "80% of weight sits in a handful of relays; kept {}",
+            kept.len()
         );
-        assert!(super::top_by_sources(vec![], 50).is_empty());
+        assert_eq!(kept[0].0, "wss://a.example", "heaviest relay must be kept");
+
+        // The kept set must actually carry the share it claims.
+        let total: u64 = all.iter().map(|(_, i)| i.sources as u64).sum();
+        let got: u64 = kept.iter().map(|(_, i)| i.sources as u64).sum();
+        assert!(
+            got * 100 >= total * 80,
+            "kept {got} of {total}, under the 80% target"
+        );
+
+        // The attack this defends against: minting entries must not displace
+        // real relays. Adding 2000 more one-advertiser URLs must not change
+        // which relays are scraped.
+        let mut flooded = all.clone();
+        for i in 0..2000 {
+            flooded.push(mk(&format!("wss://flood{i:04}.example/tango-victor"), 1));
+        }
+        let after = super::top_by_usage_weight(flooded, 80);
+        assert!(
+            after.iter().any(|(u, _)| u == "wss://a.example")
+                && after.iter().any(|(u, _)| u == "wss://b.example"),
+            "flooding the list with unadvertised URLs must not push out real relays"
+        );
+
+        // Determinism, and the degenerate cases.
+        let again = super::top_by_usage_weight(all.clone(), 80);
+        assert_eq!(
+            again.iter().map(|(u, _)| u.clone()).collect::<Vec<_>>(),
+            kept.iter().map(|(u, _)| u.clone()).collect::<Vec<_>>(),
+            "the same input must always yield the same cut"
+        );
+        assert_eq!(super::top_by_usage_weight(all.clone(), 100).len(), all.len());
+        assert!(super::top_by_usage_weight(vec![], 80).is_empty());
+        // A fresh node where nothing is advertised yet must not cut to one.
+        let fresh = vec![mk("wss://x.example", 0), mk("wss://y.example", 0)];
+        assert_eq!(super::top_by_usage_weight(fresh, 80).len(), 2);
     }
 
     /// A unit already handed to a worker must not be drawn again.
