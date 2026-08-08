@@ -184,6 +184,10 @@ struct SyncStatus {
     relays: SyncRelays,
     /// Day-by-day backfill coverage.
     scrape: nostrsearch_indexer::scrape::ScrapeProgress,
+    /// Relay-days being worked right now, with sub-day (hourly window)
+    /// position. A busy relay-day runs for many minutes; without this the
+    /// dashboard cannot distinguish a long unit from a stall.
+    active: Vec<nostrsearch_indexer::scrape::UnitProgress>,
     /// How much scraping is left.
     horizon: Horizon,
 }
@@ -362,6 +366,7 @@ async fn sync_status(
 
         SyncStatus {
             horizon,
+            active: state.live_units(),
             relays: SyncRelays {
                 total: relays.len(),
                 negentropy: relays

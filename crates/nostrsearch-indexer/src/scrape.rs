@@ -289,13 +289,45 @@ pub fn decode_day_done(v: &[u8]) -> Option<DayDone> {
     })
 }
 
+/// Live, in-memory progress of one in-flight relay-day.
+///
+/// A relay-day is the unit of persisted completion, but on a busy relay it
+/// runs for up to fifteen minutes and walks 24+ hourly windows internally.
+/// Nothing of that was visible: the dashboard showed a unit only once its
+/// whole day landed, so a long unit was indistinguishable from a stall.
+/// This is the sub-day view -- which hour of which day each worker is on,
+/// and what it has yielded so far. Never persisted; it describes the
+/// process, not the corpus.
+#[derive(Debug, Clone, Serialize)]
+pub struct UnitProgress {
+    pub relay: String,
+    pub date: String,
+    /// What the unit is doing: `connect`, `negentropy` or `req`.
+    pub phase: &'static str,
+    /// Windows finished within this day.
+    pub windows_done: u32,
+    /// Windows currently planned (grows when a capped window is split).
+    pub windows_total: u32,
+    /// Unix secs of the window being worked now -- the "hour hand".
+    pub window_start: u64,
+    /// Ids/events this day has yielded so far.
+    pub seen: u64,
+    pub new: u64,
+    pub started_at: u64,
+    pub updated_at: u64,
+}
+
 /// Persistent scrape state: relay targets and per-(relay, day) completion.
 ///
 /// Layout (single RocksDB, prefix-keyed):
 /// - `r|<url>`              → bincode [`RelayInfo`]
 /// - `d|<YYYY-MM-DD>|<url>` → bincode [`DayDone`]
+///
+/// Also carries the in-memory [`UnitProgress`] map, because this is the one
+/// handle both the pass and the HTTP status endpoints already share.
 pub struct ScrapeState {
     db: DB,
+    live: std::sync::Mutex<std::collections::HashMap<String, UnitProgress>>,
 }
 
 impl ScrapeState {
@@ -317,7 +349,49 @@ impl ScrapeState {
         opts.set_max_open_files(256);
         Ok(Self {
             db: DB::open(&opts, path)?,
+            live: std::sync::Mutex::new(std::collections::HashMap::new()),
         })
+    }
+
+    /// Begin tracking an in-flight relay-day. Keyed by relay: the planner
+    /// guarantees one unit per relay at a time.
+    pub fn live_start(&self, relay: &str, date: &str) {
+        let now = chrono::Utc::now().timestamp() as u64;
+        self.live.lock().unwrap().insert(
+            relay.to_string(),
+            UnitProgress {
+                relay: relay.to_string(),
+                date: date.to_string(),
+                phase: "connect",
+                windows_done: 0,
+                windows_total: 0,
+                window_start: 0,
+                seen: 0,
+                new: 0,
+                started_at: now,
+                updated_at: now,
+            },
+        );
+    }
+
+    /// Mutate a unit's progress in place, stamping `updated_at`.
+    pub fn live_update(&self, relay: &str, f: impl FnOnce(&mut UnitProgress)) {
+        if let Some(u) = self.live.lock().unwrap().get_mut(relay) {
+            f(u);
+            u.updated_at = chrono::Utc::now().timestamp() as u64;
+        }
+    }
+
+    /// Stop tracking a unit (finished, failed, or cancelled).
+    pub fn live_end(&self, relay: &str) {
+        self.live.lock().unwrap().remove(relay);
+    }
+
+    /// Snapshot of every in-flight unit, most recently active first.
+    pub fn live_units(&self) -> Vec<UnitProgress> {
+        let mut v: Vec<UnitProgress> = self.live.lock().unwrap().values().cloned().collect();
+        v.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        v
     }
 
     pub fn relays(&self) -> Vec<(String, RelayInfo)> {
@@ -1504,6 +1578,19 @@ async fn scrape_relay_day<S: Sink>(
     sink: std::sync::Arc<S>,
     cfg: &ScrapeConfig,
 ) {
+    // Track this unit for the live status view, and guarantee the entry is
+    // dropped however the unit ends -- including the backstop timeout, which
+    // cancels this future outright. A plain remove at the end would leak a
+    // phantom "in flight" row on every cancelled unit.
+    struct LiveGuard<'a>(&'a ScrapeState, &'a str);
+    impl Drop for LiveGuard<'_> {
+        fn drop(&mut self) {
+            self.0.live_end(self.1);
+        }
+    }
+    state.live_start(url, date);
+    let _live = LiveGuard(&state, url);
+
     // Verify this is a relay before spending a websocket on it.
     //
     // The check is cheap, cached on the relay record, and only redone after
@@ -1584,7 +1671,16 @@ async fn scrape_relay_day<S: Sink>(
     let outcome = if connected {
         match tokio::time::timeout(
             std::time::Duration::from_secs(cfg.unit_timeout_secs),
-            scrape_day(client, url, &mut info, &sink, start, end, cfg.floor_secs),
+            scrape_day(
+                client,
+                url,
+                &mut info,
+                &sink,
+                &state,
+                start,
+                end,
+                cfg.floor_secs,
+            ),
         )
         .await
         {
@@ -1681,11 +1777,13 @@ async fn scrape_relay_day<S: Sink>(
 
 /// Scrape one (relay, day): negentropy id-reconciliation with gap fetch when
 /// supported, adaptive since/until bisection otherwise.
+#[allow(clippy::too_many_arguments)]
 async fn scrape_day<S: Sink>(
     client: &nostr_sdk::Client,
     url: &str,
     info: &mut RelayInfo,
     sink: &std::sync::Arc<S>,
+    state: &ScrapeState,
     start: u64,
     end: u64,
     floor_secs: u64,
@@ -1724,9 +1822,14 @@ async fn scrape_day<S: Sink>(
             stack.push((s, e));
             s = e;
         }
+        state.live_update(url, |u| {
+            u.phase = "negentropy";
+            u.windows_total = stack.len() as u32;
+        });
         let mut synced_any = false;
         let mut abandon = false;
         while let Some((s, e)) = stack.pop() {
+            state.live_update(url, |u| u.window_start = s);
             let filter = Filter::new()
                 .since(Timestamp::from(s))
                 .until(Timestamp::from(e - 1));
@@ -1756,6 +1859,7 @@ async fn scrape_day<S: Sink>(
                         let mid = s + (e - s) / 2;
                         stack.push((s, mid));
                         stack.push((mid, e));
+                        state.live_update(url, |u| u.windows_total += 1);
                         continue;
                     }
                     seen += n;
@@ -1774,6 +1878,11 @@ async fn scrape_day<S: Sink>(
                         new += sink.process(events.into_iter().collect()).await;
                     }
                     synced_any = true;
+                    state.live_update(url, |u| {
+                        u.windows_done += 1;
+                        u.seen = seen;
+                        u.new = new;
+                    });
                 }
                 Err(e) => {
                     let msg = e.to_string().to_lowercase();
@@ -1820,7 +1929,13 @@ async fn scrape_day<S: Sink>(
     // counts silently, so a window that returns >= the relay's observed
     // ceiling is assumed truncated and split, down to the floor window.
     let mut stack = vec![(start, end)];
+    state.live_update(url, |u| {
+        u.phase = "req";
+        u.windows_done = 0;
+        u.windows_total = stack.len() as u32;
+    });
     while let Some((s, e)) = stack.pop() {
+        state.live_update(url, |u| u.window_start = s);
         let filter = Filter::new()
             .since(Timestamp::from(s))
             .until(Timestamp::from(e - 1))
@@ -1835,10 +1950,16 @@ async fn scrape_day<S: Sink>(
             let mid = s + (e - s) / 2;
             stack.push((s, mid));
             stack.push((mid, e));
+            state.live_update(url, |u| u.windows_total += 1);
             continue;
         }
         seen += n;
         new += sink.process(events.into_iter().collect()).await;
+        state.live_update(url, |u| {
+            u.windows_done += 1;
+            u.seen = seen;
+            u.new = new;
+        });
     }
     Ok((seen, new))
 }

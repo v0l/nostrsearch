@@ -1,6 +1,6 @@
 import { useState } from "preact/hooks";
 import { api } from "../api";
-import type { SyncStatus } from "../types";
+import type { ActiveUnit, SyncStatus } from "../types";
 import { Bars, Chip, ConfirmButton, Panel, ago, compact, num, useNotify } from "../ui";
 
 /**
@@ -109,6 +109,72 @@ function Backfill({ sync }: { sync: SyncStatus | null }) {
  * whether it is returning anything -- a relay quietly returning zero looks
  * identical to a busy one in a per-date total.
  */
+/** UTC hour of the window being reconciled right now, e.g. "14:00Z". */
+function hourOf(u: ActiveUnit): string {
+  if (u.window_start === 0) return "—";
+  const h = new Date(u.window_start * 1000).getUTCHours();
+  return `${String(h).padStart(2, "0")}:00Z`;
+}
+
+/**
+ * The relay-days being worked *right now*, with their position inside the
+ * day.
+ *
+ * Negentropy walks a day in hourly windows and a busy relay-day runs for
+ * many minutes, but completion records are per-day — so while a unit runs,
+ * nothing moved on the dashboard and a long unit was indistinguishable from
+ * a stall. This shows the hour hand: which window each worker is on, how
+ * many of the day's windows are done, and what the day has yielded so far.
+ */
+function ScrapingNow({ sync }: { sync: SyncStatus | null }) {
+  const rows = (sync?.active ?? []).slice(0, 12);
+  if (rows.length === 0) return null;
+
+  return (
+    <>
+      <hr class="hr" />
+      <h3
+        style={{
+          font: "600 10px/1 var(--mono)",
+          letterSpacing: "0.16em",
+          textTransform: "uppercase",
+          color: "var(--slate)",
+          margin: "0 0 12px",
+        }}
+      >
+        Scraping now
+        <span class="sub-note">live units · hour within the day · windows done</span>
+      </h3>
+      <ul class="feed">
+        {rows.map((u) => (
+          <li key={u.relay}>
+            <span class="feed-when" title={`started ${ago(u.started_at)}`}>
+              {u.phase === "connect" ? "dialling" : u.phase === "negentropy" ? "neg" : "req"}
+            </span>
+            <span class="feed-what" title={u.relay}>
+              {u.relay.replace(/^wss?:\/\//, "").replace(/\/$/, "")}
+            </span>
+            <span class="feed-day" title={`window starting ${hourOf(u)} UTC`}>
+              {u.date} {hourOf(u)}
+            </span>
+            <span class="feed-day">
+              {u.windows_total > 0 ? `${u.windows_done}/${u.windows_total}` : "—"}
+            </span>
+            <span
+              class="feed-num"
+              title={`${num(u.seen)} ids so far, ${num(u.new)} new to the index`}
+              style={{ color: u.seen === 0 ? "var(--slate)" : undefined }}
+            >
+              {compact(u.seen)}
+              {u.new > 0 ? <em class="feed-new"> +{compact(u.new)}</em> : null}
+            </span>
+          </li>
+        ))}
+      </ul>
+    </>
+  );
+}
+
 function RecentDays({ sync }: { sync: SyncStatus | null }) {
   const rows = (sync?.scrape.recent ?? []).slice(0, 12);
   if (rows.length === 0) return null;
@@ -221,6 +287,7 @@ export function Relays({
     >
       <HorizonPanel sync={sync} />
       <Backfill sync={sync} />
+      <ScrapingNow sync={sync} />
       <RecentDays sync={sync} />
 
       <hr class="hr" />

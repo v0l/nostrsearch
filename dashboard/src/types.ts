@@ -74,6 +74,21 @@ export interface SyncRelay {
   birthday: number | null;
 }
 
+/** One in-flight relay-day, with sub-day (hourly window) position. */
+export interface ActiveUnit {
+  relay: string;
+  date: string;
+  phase: "connect" | "negentropy" | "req";
+  windows_done: number;
+  windows_total: number;
+  /** Unix secs of the window being worked now — the hour hand. */
+  window_start: number;
+  seen: number;
+  new: number;
+  started_at: number;
+  updated_at: number;
+}
+
 export interface SyncStatus {
   relays: {
     total: number;
@@ -86,6 +101,7 @@ export interface SyncStatus {
     top: SyncRelay[];
   };
   scrape: ScrapeProgress;
+  active: ActiveUnit[];
   horizon: Horizon;
 }
 
