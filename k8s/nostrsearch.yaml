@@ -1,3 +1,15 @@
+# NOTE ON DRIFT (2026-08-08)
+#
+# This manifest targets namespace `nostrsearch`. The deployment actually
+# serving traffic runs in namespace `v0l` and has been maintained with
+# `kubectl set env` / `set resources` rather than from this file. Applying
+# this as-is creates a second deployment in a namespace that does not exist;
+# it does not update the live one.
+#
+# The values below have been reconciled with what is live, so this is an
+# accurate record of the working configuration -- particularly the allocator
+# settings, without which the process is OOM-killed within minutes. Before
+# using this file to deploy, reconcile the namespace with the live one.
 # nostrsearch — single deployment manifest.
 #
 #   kubectl apply -f k8s/nostrsearch.yaml
@@ -128,12 +140,19 @@ spec:
             # node is the writer and has an archive). Discovers relays from
             # kind-10002, negentropy-syncs day-by-day backwards, records each
             # relay's data horizon after 14 empty days. SCRAPE=0 disables;
-            # tune with SCRAPE_MIN_DATE, SCRAPE_MAX_RELAYS (200),
-            # SCRAPE_CONCURRENCY (8), SCRAPE_FLOOR_MINS (10),
-            # SCRAPE_BIRTHDAY_DAYS (14), SCRAPE_PASS_INTERVAL_SECS (1800),
+            # tune with SCRAPE_MIN_DATE, SCRAPE_MAX_RELAYS (0 = no cap;
+            # ~8000 relays are discovered in practice), SCRAPE_CONCURRENCY
+            # (50 concurrent relay-day queries), SCRAPE_UNIT_TIMEOUT_SECS
+            # (180), SCRAPE_DEAD_AFTER_FAILS (3), SCRAPE_DEAD_FOR_HOURS (24),
+            # SCRAPE_FLOOR_MINS (10), SCRAPE_PASS_INTERVAL_SECS (1800),
             # SCRAPE_REDISCOVER_SECS (86400).
-            # - name: SCRAPE
-            #   value: "0"
+            # Currently disabled. The scraper is functional -- the batch
+            # barrier that limited it to a few relay-days a minute is fixed --
+            # but it has not been run since the allocator fix landed, and it
+            # was the largest consumer of the memory that used to kill this
+            # process. Re-enable and watch RssAnon before leaving it on.
+            - name: SCRAPE
+              value: "0"
             # Shard writers held open at once; total writer heap is roughly
             # this x the per-shard heap (~4GB at 64 x 64MB). Keep it at or
             # above the number of months the corpus spans — dumps are often
@@ -163,6 +182,29 @@ spec:
             # bound descriptors and reload-watcher threads, not memory.
             - name: MAX_OPEN_SHARD_READERS
               value: "48"
+            # ── Allocator ──────────────────────────────────────────────────
+            # This is load-bearing. Without it the process is OOM-killed.
+            #
+            # glibc allows 8 x ncores arenas (64 here) and returns freed memory
+            # to the OS only from the top of a heap, so a high-churn workload
+            # spreads across every arena and retains what it frees. Measured on
+            # this node: 33.6 GB resident across ~900 anonymous mappings of
+            # 1-64 MB each, matching no data structure in the process, climbing
+            # to the 56 GiB limit and OOM-killing every ~5 minutes -- 115
+            # restarts in 25 hours.
+            #
+            # Capping arenas at 2 took steady state to ~11 GB, oscillating
+            # 8-14 GB, with zero restarts over 22 hours. Nothing else changed.
+            #
+            # Do not remove either of these without watching RssAnon for a day.
+            # Four plausible structural explanations (client churn, reader
+            # cache, RocksDB index blocks, writer heap) were each measured and
+            # each was wrong; the allocator was the whole of it.
+            - name: MALLOC_ARENA_MAX
+              value: "2"
+            # Return freed memory above 128 MB rather than holding it.
+            - name: MALLOC_TRIM_THRESHOLD_
+              value: "134217728"
             # ── Admin endpoints (NIP-98 authenticated) ─────────────────────
             # Comma-separated npub/hex allowed to call /admin/*. Unset (the
             # default) means the routes are never mounted, so a misconfigured
@@ -194,7 +236,11 @@ spec:
               cpu: "500m"
               memory: 4Gi
             limits:
-              # Search is mmap-heavy; give the page cache room.
+              # Measured steady state is ~11 GB anonymous, peaking near 14 GB,
+              # with MALLOC_ARENA_MAX set above. Note this is *not* page cache:
+              # RssFile is around 24 MB, so the limit is bounding heap, and a
+              # limit below the real working set is an immediate OOM loop
+              # rather than slower search.
               memory: 24Gi
           readinessProbe:
             httpGet:
