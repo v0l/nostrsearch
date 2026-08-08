@@ -1126,12 +1126,20 @@ async fn scrape_relay_day<S: Sink>(
             info.nip11 = Some(ok);
             info.nip11_at = now_probe;
             if !ok {
-                // Retire it the same way a failing relay is retired, so every
+                // Retired the same way a failing relay is retired, so every
                 // path that already respects dead_until respects this too.
-                // The record is kept rather than deleted: discovery re-adds
-                // whatever kind-10002 advertises, so deleting would mean
-                // re-probing the same invented URL on every pass. The
-                // tombstone is what makes the check cost one request, ever.
+                // The verdict expires after nip11_recheck_secs, so a relay
+                // that comes back is picked up again rather than condemned
+                // permanently.
+                //
+                // A working relay does serve this. The two that first tripped
+                // this check looked like false positives and were not:
+                // relay.nostrati.com answers 502 on both the document and the
+                // websocket, and nostr.lol serves a 16 KB HTML page and
+                // returns 200 rather than 101 to an upgrade request -- it is
+                // a website at a hostname that used to be a relay. Neither can
+                // be scraped, and probing them costs a connection and a
+                // timeout on every draw.
                 info.dead_until = Some(now_probe + cfg.nip11_recheck_secs);
                 tracing::info!(relay = %url, "no NIP-11 document; not a relay, retired");
             }
@@ -1546,6 +1554,34 @@ mod scrape_concurrency_tests {
             assert_eq!(b[0].2, open, "and it must be that day");
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A relay that serves no NIP-11 document is not scrapeable.
+    ///
+    /// The first two hosts this retired looked like false positives and were
+    /// checked directly. Neither is a working relay:
+    ///
+    /// - relay.nostrati.com answers 502 to both the document request and a
+    ///   websocket upgrade -- the relay is down.
+    /// - nostr.lol serves a 16 KB HTML page and answers an upgrade request
+    ///   with 200 rather than 101. It is a website at a hostname that used to
+    ///   be a relay.
+    ///
+    /// Both hold advertisers from when they worked, so usage weight keeps them
+    /// in scope indefinitely and each draw spends a connection and a timeout
+    /// on a host that cannot answer. The verdict expires after
+    /// nip11_recheck_secs so a relay that returns is picked up again.
+    #[test]
+    fn hosts_that_serve_no_relay_document_are_retired() {
+        // Shape alone cannot condemn a bare host, so the retirement has to
+        // come from the probe rather than from the URL.
+        assert!(!super::looks_like_generated_path("wss://relay.nostrati.com"));
+        assert!(!super::looks_like_generated_path("wss://nostr.lol"));
+        // And a live relay is not condemned by shape either -- it is confirmed
+        // by the document it serves.
+        assert!(!super::looks_like_generated_path("wss://relay.damus.io"));
+        // An invented path is condemned without needing the probe at all.
+        assert!(super::looks_like_generated_path("wss://relay.primal.net/sierra-ivory"));
     }
 
     /// Machine-minted paths are rejected; chosen ones are not.
