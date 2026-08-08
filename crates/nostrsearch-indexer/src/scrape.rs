@@ -63,6 +63,16 @@ pub struct RelayInfo {
     /// When the NIP-11 check last ran (unix secs), so it can be redone.
     #[serde(default)]
     pub nip11_at: u64,
+    /// Unix secs of the most recent failed relay-day, for retry backoff.
+    ///
+    /// Failures must accumulate on a human timescale to mean anything. With a
+    /// narrow scope cut (tens of relays) and fifty worker slots, a failing
+    /// relay was redrawn the moment its unit ended: fifteen consecutive
+    /// failures -- the "never succeeded" retirement threshold -- took about
+    /// six minutes, and the whole in-scope set was marked dead in one burst.
+    /// A failed relay now waits out a backoff before it can be drawn again.
+    #[serde(default)]
+    pub last_fail: u64,
     /// Unix secs until which this relay is considered dead and not probed.
     ///
     /// A relay that refuses connections fails every draw it appears in, and
@@ -691,10 +701,19 @@ pub async fn run_pass<S: Sink>(
     let now_probe = chrono::Utc::now().timestamp() as u64;
     let today_probe = now_probe - (now_probe % 86_400);
     let total_days = today_probe.saturating_sub(cfg.min_date) / 86_400;
-    let kept_at_min = top_by_usage_weight(state.relays(), cfg.usage_percentile_min).len() as u64;
-    let expected = kept_at_min.saturating_mul(total_days.max(1));
+    let kept_at_min = top_by_usage_weight(state.relays(), cfg.usage_percentile_min);
+    // Coverage counts only the relays the floor cut keeps. The raw
+    // relay-days total includes every relay ever scraped -- thousands of
+    // since-excluded junk URLs from before NIP-11 filtering -- which
+    // inflated `done` past `expected` and snapped the cut straight to the
+    // ceiling on a node that had barely started on the relays that matter.
+    let done_in_scope: u64 = kept_at_min
+        .iter()
+        .map(|(u, _)| progress.by_relay.get(u).map(|t| t.days).unwrap_or(0))
+        .sum();
+    let expected = (kept_at_min.len() as u64).saturating_mul(total_days.max(1));
     let percentile = adaptive_percentile(
-        progress.relay_days,
+        done_in_scope,
         expected,
         cfg.usage_percentile_min,
         cfg.usage_percentile,
@@ -877,12 +896,20 @@ pub async fn run_pass<S: Sink>(
             let in_flight_t = in_flight.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                // A relay that accepts a connection and then never answers
-                // would otherwise hold its slot for the rest of the pass.
+                // The unit timeout lives *inside* scrape_relay_day, wrapping
+                // only the scraping, so that on timeout the relay's state is
+                // still written back and its connection still removed from
+                // the pool. Cancelling the whole future here skipped both:
+                // sockets leaked and timeouts recorded no failure. This outer
+                // guard is a generous backstop for the connect/cleanup
+                // phases only.
                 let work =
                     scrape_relay_day(&client, &url, info, &date, start, end, state, sink, &cfg);
-                if tokio::time::timeout(unit_timeout, work).await.is_err() {
-                    tracing::warn!(relay = %url, date = %date, "relay-day timed out");
+                if tokio::time::timeout(unit_timeout + std::time::Duration::from_secs(120), work)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!(relay = %url, date = %date, "relay-day unit wedged past backstop");
                 }
                 in_flight_t.lock().unwrap().remove(&key);
             });
@@ -1070,6 +1097,15 @@ pub fn adaptive_percentile(done: u64, expected: u64, min: u32, max: u32) -> u32 
     min + (f64::from(max - min) * frac).round() as u32
 }
 
+/// Seconds a relay must wait after its `n`th consecutive failure before it
+/// can be drawn again. Doubles per failure, capped at an hour.
+pub fn fail_backoff_secs(fails: u32) -> u64 {
+    if fails == 0 {
+        return 0;
+    }
+    (60u64 << fails.min(6)).min(3600)
+}
+
 /// One unit of work: a relay and the day to fetch from it.
 type RelayDay = (String, RelayInfo, String, u64, u64);
 
@@ -1104,6 +1140,14 @@ fn plan_batch(
 
         // Set aside as dead, and not yet due for a retry.
         if info.dead_until.is_some_and(|t| now < t) {
+            continue;
+        }
+
+        // Failed recently: wait out the backoff before trying again. Without
+        // this a failing relay is redrawn the moment a slot frees, and the
+        // retirement threshold is reached in minutes rather than measuring
+        // anything about the relay.
+        if info.fails > 0 && now < info.last_fail.saturating_add(fail_backoff_secs(info.fails)) {
             continue;
         }
 
@@ -1182,8 +1226,6 @@ async fn scrape_relay_day<S: Sink>(
     sink: std::sync::Arc<S>,
     cfg: &ScrapeConfig,
 ) {
-    use nostr_sdk::prelude::*;
-
     // Verify this is a relay before spending a websocket on it.
     //
     // The check is cheap, cached on the relay record, and only redone after
@@ -1243,14 +1285,46 @@ async fn scrape_relay_day<S: Sink>(
     if client.add_relay(url).await.is_err() {
         return;
     }
-    if client.connect_relay(url).await.is_err() {
-        return;
-    }
 
-    match scrape_day(client, url, &mut info, &sink, start, end, cfg.floor_secs).await {
+    // Wait for the connection to actually establish. `connect_relay` only
+    // spawns the attempt and returns Ok immediately, so the old code started
+    // the negentropy sync against a socket that did not exist yet: on any
+    // relay that was slow to connect the sync sat out its 10s timeout, the
+    // unit failed, and a perfectly healthy relay took a strike. Worse, a
+    // connect failure returned early without recording anything, so genuinely
+    // unreachable relays never accumulated the failures that retire them.
+    let connected = client
+        .try_connect_relay(url, std::time::Duration::from_secs(15))
+        .await
+        .is_ok();
+
+    // The unit timeout wraps only the scraping, *inside* this function.
+    // Wrapping the whole unit at the spawn site dropped the future on
+    // timeout, so the relay's state was never written back and the relay was
+    // never removed from the pool -- the socket leaked and the fail was not
+    // recorded.
+    let outcome = if connected {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(cfg.unit_timeout_secs),
+            scrape_day(client, url, &mut info, &sink, start, end, cfg.floor_secs),
+        )
+        .await
+        {
+            Ok(r) => r,
+            Err(_) => {
+                tracing::warn!(relay = %url, date = %date, "relay-day timed out");
+                Err(anyhow::anyhow!("relay-day timed out"))
+            }
+        }
+    } else {
+        Err(anyhow::anyhow!("connection failed or timed out"))
+    };
+
+    match outcome {
         Ok((seen, new)) => {
             // Alive: clear both the failure streak and any death sentence.
             info.fails = 0;
+            info.last_fail = 0;
             info.dead_until = None;
             info.last_ok = chrono::Utc::now().timestamp() as u64;
             state.put_day(
@@ -1276,6 +1350,7 @@ async fn scrape_relay_day<S: Sink>(
         }
         Err(_) => {
             info.fails = info.fails.saturating_add(1);
+            info.last_fail = chrono::Utc::now().timestamp() as u64;
             // Consecutive failures alone are not evidence a relay is gone.
             //
             // This network sits behind DDoS mitigation that drops SYN packets
@@ -1384,7 +1459,19 @@ async fn scrape_day<S: Sink>(
                     // Remember, so we don't retry it every day.
                     info.negentropy = Some(false);
                 } else {
-                    return Err(e.into());
+                    // Anything else -- most commonly "timeout", from a relay
+                    // that silently ignores NEG-OPEN rather than answering
+                    // NEG-ERR (relay.nostr.band, purplepag.es) -- says nothing
+                    // about whether the relay can serve plain REQs. This used
+                    // to fail the whole unit: the relay took a strike per
+                    // draw, reached the retirement threshold in minutes, and
+                    // the entire in-scope set was marked dead while every one
+                    // of those relays answered REQs perfectly well. Fall
+                    // through to the windowed fallback instead; if the relay
+                    // is really unreachable the fallback fails and *that*
+                    // records the failure. Negentropy stays unprobed so a
+                    // relay that was merely slow is tried again another day.
+                    tracing::debug!(relay = %url, error = %msg, "negentropy sync failed; trying windowed REQs");
                 }
             }
         }
@@ -1562,6 +1649,53 @@ mod scrape_concurrency_tests {
             3 >= cfg.dead_after_fails && quiet >= cfg.dead_for_secs,
             "a relay silent for days that keeps failing must be retired"
         );
+    }
+
+    /// A relay that just failed waits out a backoff before being redrawn.
+    ///
+    /// With a narrow scope cut and fifty slots, a failing relay was redrawn
+    /// the moment its unit ended. Fifteen consecutive failures -- the
+    /// "never succeeded" retirement threshold -- took about six minutes, and
+    /// the whole in-scope set was marked dead in one burst on deploy.
+    #[test]
+    fn a_failed_relay_backs_off_before_being_redrawn() {
+        let (st, dir) = state("backoff");
+        let now = chrono::Utc::now().timestamp() as u64;
+
+        let mut just_failed = super::RelayInfo::default();
+        just_failed.fails = 1;
+        just_failed.last_fail = now;
+        let mut long_ago = super::RelayInfo::default();
+        long_ago.fails = 6;
+        long_ago.last_fail = now - 4000; // past even the capped backoff
+
+        let t = vec![
+            ("wss://hot.example".to_string(), just_failed),
+            ("wss://cool.example".to_string(), long_ago),
+        ];
+        let cfg = super::ScrapeConfig::default();
+        let mut rng = rand::thread_rng();
+        let win = super::block_window(now - (now % 86_400), 0);
+        let inflight = std::sync::Mutex::new(std::collections::HashSet::new());
+
+        let mut saw_cool = false;
+        for _ in 0..50 {
+            for (u, ..) in super::plan_batch(&t, &st, &cfg, 10, &mut rng, win, &inflight) {
+                assert_ne!(u, "wss://hot.example", "a relay that just failed must wait");
+                if u == "wss://cool.example" {
+                    saw_cool = true;
+                }
+            }
+        }
+        assert!(saw_cool, "a relay past its backoff must be drawn again");
+
+        // The backoff itself: grows with failures, capped, zero when clean.
+        assert_eq!(super::fail_backoff_secs(0), 0);
+        assert!(super::fail_backoff_secs(1) >= 60);
+        assert!(super::fail_backoff_secs(2) > super::fail_backoff_secs(1));
+        assert_eq!(super::fail_backoff_secs(6), 3600);
+        assert_eq!(super::fail_backoff_secs(60), 3600, "backoff must cap, not overflow");
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A dead relay is not drawn until its retry time passes.
