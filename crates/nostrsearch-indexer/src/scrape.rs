@@ -724,7 +724,6 @@ pub async fn run_pass<S: Sink>(
     // StdRng, not thread_rng: the rng is held across await points here, and
     // ThreadRng is !Send, which would make this whole future !Send and break
     // every caller that spawns it.
-    let mut rng = <rand::rngs::StdRng as rand::SeedableRng>::from_entropy();
     let batch_size = cfg.concurrency.max(1);
     let mut scraped = 0u64;
 
@@ -775,10 +774,26 @@ pub async fn run_pass<S: Sink>(
         // the relay reverted to unprobed. It also meant `dead_until` was never
         // visible to later batches, so a dead relay kept being drawn for the
         // whole pass -- the retirement did nothing.
-        let targets = top_by_usage_weight(state.relays(), percentile);
-        let mut batch = plan_batch(
-            &targets, &state, &cfg, batch_size, &mut rng, window, &in_flight,
-        );
+        // Planning is blocking work: state.relays() scans every relay record
+        // and plan_batch does up to 30 day_done lookups per relay against
+        // RocksDB. Run on an async worker it starves the runtime -- the HTTP
+        // server stopped being scheduled entirely, /healthz included, while
+        // the process sat at 7 GB with no restarts.
+        let (targets, mut batch) = {
+            let state = state.clone();
+            let cfg = cfg.clone();
+            let in_flight = in_flight.clone();
+            let mut prng = <rand::rngs::StdRng as rand::SeedableRng>::from_entropy();
+            tokio::task::spawn_blocking(move || {
+                let targets = top_by_usage_weight(state.relays(), percentile);
+                let batch = plan_batch(
+                    &targets, &state, &cfg, batch_size, &mut prng, window, &in_flight,
+                );
+                (targets, batch)
+            })
+            .await
+            .unwrap_or_else(|_| (Vec::new(), Vec::new()))
+        };
 
         // An empty batch can mean two different things, and conflating them
         // ends the pass early.
@@ -789,10 +804,22 @@ pub async fn run_pass<S: Sink>(
         // will free relays to draw again. Only when nothing is in flight does
         // an empty batch mean this window really has no work left.
         while batch.is_empty() && !in_flight.lock().unwrap().is_empty() {
-            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-            batch = plan_batch(
-                &targets, &state, &cfg, batch_size, &mut rng, window, &in_flight,
-            );
+            // A second between attempts, and the scan itself off the runtime:
+            // re-planning at 250ms with a full RocksDB sweep each time is what
+            // wedged the node.
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let state = state.clone();
+            let cfg = cfg.clone();
+            let in_flight = in_flight.clone();
+            let targets = targets.clone();
+            let mut prng = <rand::rngs::StdRng as rand::SeedableRng>::from_entropy();
+            batch = tokio::task::spawn_blocking(move || {
+                plan_batch(
+                    &targets, &state, &cfg, batch_size, &mut prng, window, &in_flight,
+                )
+            })
+            .await
+            .unwrap_or_default();
         }
 
         // Nothing running and nothing to draw: this window is genuinely done.
@@ -810,9 +837,16 @@ pub async fn run_pass<S: Sink>(
                 scraped,
                 "scrape window complete; moving back a block"
             );
-            batch = plan_batch(
-                &targets, &state, &cfg, batch_size, &mut rng, window, &in_flight,
-            );
+            let st = state.clone();
+            let c = cfg.clone();
+            let inf = in_flight.clone();
+            let tg = targets.clone();
+            let mut prng = <rand::rngs::StdRng as rand::SeedableRng>::from_entropy();
+            batch = tokio::task::spawn_blocking(move || {
+                plan_batch(&tg, &st, &c, batch_size, &mut prng, window, &inf)
+            })
+            .await
+            .unwrap_or_default();
         }
         if batch.is_empty() {
             break;
@@ -1254,13 +1288,30 @@ async fn scrape_relay_day<S: Sink>(
             // bad week. Require both: repeated failure *and* nothing
             // successful for a full retry window.
             let now = chrono::Utc::now().timestamp() as u64;
-            let quiet_for = now.saturating_sub(info.last_ok);
-            if info.fails >= cfg.dead_after_fails && quiet_for >= cfg.dead_for_secs {
+            // last_ok == 0 means "never succeeded", not "succeeded in 1970".
+            //
+            // Treating it as a timestamp makes quiet_for ~56 years, which
+            // clears any silence window instantly -- so the guard meant to
+            // protect relays from SYN-drop bursts did nothing for the ones
+            // that had never completed a day, which is nearly all of them.
+            // They were retired on three failures, released at pass start,
+            // and retired again on the next burst.
+            //
+            // A relay that has never answered still has to be retired
+            // eventually or dead hosts accumulate forever, but it needs more
+            // evidence than one that is merely having a bad minute.
+            let retire = if info.last_ok == 0 {
+                info.fails >= cfg.dead_after_fails.saturating_mul(5)
+            } else {
+                info.fails >= cfg.dead_after_fails
+                    && now.saturating_sub(info.last_ok) >= cfg.dead_for_secs
+            };
+            if retire {
                 info.dead_until = Some(now + cfg.dead_for_secs);
                 tracing::info!(
                     relay = url,
                     fails = info.fails,
-                    quiet_for,
+                    last_ok = info.last_ok,
                     "relay marked dead"
                 );
             }
