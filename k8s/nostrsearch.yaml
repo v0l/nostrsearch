@@ -150,7 +150,7 @@ spec:
             # weight is not), SCRAPE_CONCURRENCY
             # (50 concurrent relay-day queries), SCRAPE_UNIT_TIMEOUT_SECS
             # (180), SCRAPE_DEAD_AFTER_FAILS (3), SCRAPE_DEAD_FOR_HOURS (24),
-            # SCRAPE_FLOOR_MINS (10), SCRAPE_PASS_INTERVAL_SECS (1800),
+            # SCRAPE_FLOOR_MINS (10), SCRAPE_PASS_INTERVAL_SECS (120),
             # SCRAPE_REDISCOVER_SECS (86400).
             # Currently disabled. The scraper is functional -- the batch
             # barrier that limited it to a few relay-days a minute is fixed --

@@ -121,7 +121,14 @@ pub struct ScraperOptions {
     pub usage_percentile: u32,
     /// Where the cut starts while the backlog is large.
     pub usage_percentile_min: u32,
-    /// Idle time between passes once caught up.
+    /// Idle time between passes.
+    ///
+    /// A pass ends when no relay in scope has an unscraped day anywhere in the
+    /// range, which while there is a backlog means it ended early -- because
+    /// relays were unreachable, retired, or busy. Waiting half an hour to
+    /// retry that is a long time to do nothing; the work is bounded by the
+    /// day-done records either way, so a short interval costs a cheap re-scan
+    /// rather than repeated work.
     pub pass_interval: std::time::Duration,
     /// How often to re-run kind-10002 relay discovery.
     pub rediscover_interval: std::time::Duration,
@@ -159,7 +166,7 @@ impl ScraperOptions {
             nip11_recheck_secs: u("SCRAPE_NIP11_RECHECK_HOURS", 168) * 3600,
             usage_percentile: u("SCRAPE_USAGE_PERCENTILE", 80) as u32,
             usage_percentile_min: u("SCRAPE_USAGE_PERCENTILE_MIN", 2) as u32,
-            pass_interval: std::time::Duration::from_secs(u("SCRAPE_PASS_INTERVAL_SECS", 1800)),
+            pass_interval: std::time::Duration::from_secs(u("SCRAPE_PASS_INTERVAL_SECS", 120)),
             rediscover_interval: std::time::Duration::from_secs(u(
                 "SCRAPE_REDISCOVER_SECS",
                 86_400,
