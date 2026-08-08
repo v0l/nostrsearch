@@ -780,8 +780,23 @@ pub async fn run_pass<S: Sink>(
             &targets, &state, &cfg, batch_size, &mut rng, window, &in_flight,
         );
 
-        // This month is done for every relay: step back and keep going, until
-        // the window falls off the configured floor.
+        // An empty batch can mean two different things, and conflating them
+        // ends the pass early.
+        //
+        // With one unit in flight per relay, a batch comes back empty as soon
+        // as every relay is busy -- which is the normal steady state, not an
+        // exhausted window. Wait for a slot instead: the units running now
+        // will free relays to draw again. Only when nothing is in flight does
+        // an empty batch mean this window really has no work left.
+        while batch.is_empty() && !in_flight.lock().unwrap().is_empty() {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            batch = plan_batch(
+                &targets, &state, &cfg, batch_size, &mut rng, window, &in_flight,
+            );
+        }
+
+        // Nothing running and nothing to draw: this window is genuinely done.
+        // Step back, until the window falls off the configured floor.
         while batch.is_empty() {
             if window.0 <= cfg.min_date {
                 break;
@@ -1882,6 +1897,50 @@ mod scrape_concurrency_tests {
         // A fresh node where nothing is advertised yet must not cut to one.
         let fresh = vec![mk("wss://x.example", 0), mk("wss://y.example", 0)];
         assert_eq!(super::top_by_usage_weight(fresh, 80).len(), 2);
+    }
+
+    /// "Every relay is busy" is not "this window is finished".
+    ///
+    /// With one unit in flight per relay, a batch comes back empty as soon as
+    /// all of them are working -- the normal steady state. Read as exhaustion
+    /// it walks the window back, runs off the end of the range and ends the
+    /// pass: observed as `scrape pass complete scraped=31` 366ms after start,
+    /// with 50,000 relay-days outstanding. Only an empty batch with nothing in
+    /// flight means the window is actually done.
+    #[test]
+    fn a_busy_relay_set_is_not_an_exhausted_window() {
+        let (st, dir) = state("busy");
+        let t = targets(4);
+        let cfg = super::ScrapeConfig::default();
+        let mut rng = rand::thread_rng();
+        let now = chrono::Utc::now().timestamp() as u64;
+        let win = super::block_window(now - (now % 86_400), 0);
+        let inflight = std::sync::Mutex::new(std::collections::HashSet::new());
+
+        // Nothing running: there is work, and it is offered.
+        assert!(
+            !super::plan_batch(&t, &st, &cfg, 10, &mut rng, win, &inflight).is_empty(),
+            "fresh relays must yield work"
+        );
+
+        // Every relay busy: no work is offered, but the window is not done --
+        // the same relays have thousands of unscraped days between them.
+        for (u, _) in &t {
+            inflight.lock().unwrap().insert(u.clone());
+        }
+        assert!(
+            super::plan_batch(&t, &st, &cfg, 10, &mut rng, win, &inflight).is_empty(),
+            "a fully busy relay set yields nothing to draw"
+        );
+
+        // Freeing one must produce work again, which is what distinguishes
+        // "busy" from "finished" -- the caller waits rather than stepping back.
+        let first = t[0].0.clone();
+        inflight.lock().unwrap().remove(&first);
+        let after = super::plan_batch(&t, &st, &cfg, 10, &mut rng, win, &inflight);
+        assert_eq!(after.len(), 1, "the freed relay must be drawable again");
+        assert_eq!(after[0].0, first);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// A relay already being scraped must not be drawn again.
