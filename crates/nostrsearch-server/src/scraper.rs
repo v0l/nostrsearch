@@ -162,7 +162,7 @@ impl ScraperOptions {
             birthday_days: u("SCRAPE_BIRTHDAY_DAYS", 14) as u32,
             dead_after_fails: u("SCRAPE_DEAD_AFTER_FAILS", 3) as u32,
             dead_for_secs: u("SCRAPE_DEAD_FOR_HOURS", 24) * 3600,
-            unit_timeout_secs: u("SCRAPE_UNIT_TIMEOUT_SECS", 180),
+            unit_timeout_secs: u("SCRAPE_UNIT_TIMEOUT_SECS", 900),
             nip11_recheck_secs: u("SCRAPE_NIP11_RECHECK_HOURS", 168) * 3600,
             usage_percentile: u("SCRAPE_USAGE_PERCENTILE", 80) as u32,
             usage_percentile_min: u("SCRAPE_USAGE_PERCENTILE_MIN", 2) as u32,

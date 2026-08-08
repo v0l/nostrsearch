@@ -708,6 +708,15 @@ pub struct ScrapeConfig {
     pub dead_for_secs: u64,
     /// Hard cap on one relay-day, in seconds. A relay that connects and then
     /// stalls would otherwise hold a worker slot for the rest of the pass.
+    ///
+    /// Sized for the windowed fallback on a busy relay, not just for
+    /// negentropy. A relay without negentropy caps REQs at ~500 events, so a
+    /// full day is fetched by bisection -- potentially over a hundred
+    /// sequential REQs. At 180s the largest relays could never finish a day:
+    /// each unit timed out, the timeout counted as a failure, and the relays
+    /// carrying the most usage sat at zero days scraped forever. Slots are
+    /// released per unit, so a long-running unit costs one worker, not the
+    /// pass.
     pub unit_timeout_secs: u64,
     /// How long a NIP-11 verdict stands before being rechecked, in seconds.
     pub nip11_recheck_secs: u64,
@@ -753,7 +762,7 @@ impl Default for ScrapeConfig {
             empty_days_limit: 14,
             dead_after_fails: 3,
             dead_for_secs: 24 * 3600,
-            unit_timeout_secs: 180,
+            unit_timeout_secs: 900,
             nip11_recheck_secs: 7 * 24 * 3600,
             usage_percentile: 80,
             usage_percentile_min: 2,
