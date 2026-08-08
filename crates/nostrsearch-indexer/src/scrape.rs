@@ -800,7 +800,8 @@ pub async fn run_pass<S: Sink>(
     let now_probe = chrono::Utc::now().timestamp() as u64;
     let today_probe = now_probe - (now_probe % 86_400);
     let total_days = today_probe.saturating_sub(cfg.min_date) / 86_400;
-    let kept_at_min = top_by_usage_weight(state.relays(), cfg.usage_percentile_min);
+    let kept_at_min =
+        top_by_usage_weight(state.relays(), cfg.usage_percentile_min, cfg.concurrency);
     // Coverage counts only the relays the floor cut keeps. The raw
     // relay-days total includes every relay ever scraped -- thousands of
     // since-excluded junk URLs from before NIP-11 filtering -- which
@@ -818,7 +819,8 @@ pub async fn run_pass<S: Sink>(
         cfg.usage_percentile,
     );
 
-    let scraped_relays = top_by_usage_weight(state.relays(), percentile).len();
+    let scraped_relays =
+        top_by_usage_weight(state.relays(), percentile, cfg.concurrency).len();
     tracing::info!(
         relays = scraped_relays,
         discovered = all_relays,
@@ -903,7 +905,7 @@ pub async fn run_pass<S: Sink>(
             let in_flight = in_flight.clone();
             let mut prng = <rand::rngs::StdRng as rand::SeedableRng>::from_entropy();
             tokio::task::spawn_blocking(move || {
-                let targets = top_by_usage_weight(state.relays(), percentile);
+                let targets = top_by_usage_weight(state.relays(), percentile, cfg.concurrency);
                 let batch = plan_batch(
                     &targets, &state, &cfg, batch_size, &mut prng, window, &in_flight,
                 );
@@ -1135,9 +1137,17 @@ pub async fn probe_nip11(url: &str, timeout: std::time::Duration) -> Option<bool
 /// side of it permanently half-scraped.
 ///
 /// Never returns empty for a non-empty input.
+///
+/// `min_keep` floors the kept set by rank. Advertisement weight is so
+/// concentrated that a narrow percentile can round down to a single relay --
+/// at 8% the cut kept exactly one -- and with one unit in flight per relay
+/// that leaves every other worker slot idle: fifty workers configured, one
+/// working. The floor is the worker count, so a narrow cut concentrates the
+/// workers on the most-used relays without ever idling them.
 pub fn top_by_usage_weight(
     mut targets: Vec<(String, RelayInfo)>,
     percentile: u32,
+    min_keep: usize,
 ) -> Vec<(String, RelayInfo)> {
     // Drop anything already shown not to be a relay before anything else.
     //
@@ -1169,7 +1179,7 @@ pub fn top_by_usage_weight(
             break;
         }
     }
-    targets.truncate(keep.max(1));
+    targets.truncate(keep.max(min_keep.max(1)));
     targets
 }
 
@@ -1999,6 +2009,38 @@ mod scrape_concurrency_tests {
         }
     }
 
+    /// A narrow cut must not idle the workers.
+    ///
+    /// Advertisement weight is concentrated enough that a single relay can
+    /// carry the whole percentile: at 8% the prod cut kept exactly one relay,
+    /// and with one unit in flight per relay, forty-nine of fifty workers sat
+    /// idle. The kept set is floored at the worker count.
+    #[test]
+    fn the_cut_never_keeps_fewer_relays_than_workers() {
+        let mk = |url: &str, n: u32| {
+            let mut i = super::RelayInfo::default();
+            i.sources = n;
+            (url.to_string(), i)
+        };
+        // One giant, then a tail: any small percentile is covered by the
+        // giant alone.
+        let mut all = vec![mk("wss://giant.example", 500_000)];
+        for i in 0..100 {
+            all.push(mk(&format!("wss://tail{i:03}.example"), 1_000));
+        }
+
+        let kept = super::top_by_usage_weight(all.clone(), 2, 50);
+        assert_eq!(kept.len(), 50, "the floor must fill the worker slots");
+        assert_eq!(kept[0].0, "wss://giant.example", "ranked order is preserved");
+
+        // The floor cannot exceed what exists.
+        let kept = super::top_by_usage_weight(all[..3].to_vec(), 2, 50);
+        assert_eq!(kept.len(), 3);
+
+        // And a floor of 1 preserves the old behaviour.
+        assert_eq!(super::top_by_usage_weight(all.clone(), 2, 1).len(), 1);
+    }
+
     /// Non-relays are excluded from the weight, not just from scheduling.
     ///
     /// `relay.snort.social/,` carries over a thousand advertisers. Counting
@@ -2021,7 +2063,7 @@ mod scrape_concurrency_tests {
             mk("wss://unchecked.example", 200, None),
         ];
 
-        let kept = super::top_by_usage_weight(all.clone(), 100);
+        let kept = super::top_by_usage_weight(all.clone(), 100, 1);
         let urls: Vec<&str> = kept.iter().map(|(u, _)| u.as_str()).collect();
         assert!(
             !urls.iter().any(|u| u.contains("junk")),
@@ -2035,7 +2077,7 @@ mod scrape_concurrency_tests {
         // The cut is computed against real demand only: with the junk gone,
         // 80% of weight is real-a + real-b, not the junk pair that outweighed
         // them.
-        let cut = super::top_by_usage_weight(all, 80);
+        let cut = super::top_by_usage_weight(all, 80, 1);
         assert!(
             cut.iter().any(|(u, _)| u == "wss://real-a.example"),
             "the heaviest real relay must be in scope"
@@ -2139,7 +2181,7 @@ mod scrape_concurrency_tests {
             all.push(mk(&format!("wss://spam{i:03}.example/quebec-zulu"), 1));
         }
 
-        let kept = super::top_by_usage_weight(all.clone(), 80);
+        let kept = super::top_by_usage_weight(all.clone(), 80, 1);
         assert!(
             kept.len() < 10,
             "80% of weight sits in a handful of relays; kept {}",
@@ -2162,7 +2204,7 @@ mod scrape_concurrency_tests {
         for i in 0..2000 {
             flooded.push(mk(&format!("wss://flood{i:04}.example/tango-victor"), 1));
         }
-        let after = super::top_by_usage_weight(flooded, 80);
+        let after = super::top_by_usage_weight(flooded, 80, 1);
         assert!(
             after.iter().any(|(u, _)| u == "wss://a.example")
                 && after.iter().any(|(u, _)| u == "wss://b.example"),
@@ -2170,17 +2212,17 @@ mod scrape_concurrency_tests {
         );
 
         // Determinism, and the degenerate cases.
-        let again = super::top_by_usage_weight(all.clone(), 80);
+        let again = super::top_by_usage_weight(all.clone(), 80, 1);
         assert_eq!(
             again.iter().map(|(u, _)| u.clone()).collect::<Vec<_>>(),
             kept.iter().map(|(u, _)| u.clone()).collect::<Vec<_>>(),
             "the same input must always yield the same cut"
         );
-        assert_eq!(super::top_by_usage_weight(all.clone(), 100).len(), all.len());
-        assert!(super::top_by_usage_weight(vec![], 80).is_empty());
+        assert_eq!(super::top_by_usage_weight(all.clone(), 100, 1).len(), all.len());
+        assert!(super::top_by_usage_weight(vec![], 80, 1).is_empty());
         // A fresh node where nothing is advertised yet must not cut to one.
         let fresh = vec![mk("wss://x.example", 0), mk("wss://y.example", 0)];
-        assert_eq!(super::top_by_usage_weight(fresh, 80).len(), 2);
+        assert_eq!(super::top_by_usage_weight(fresh, 80, 1).len(), 2);
     }
 
     /// "Every relay is busy" is not "this window is finished".

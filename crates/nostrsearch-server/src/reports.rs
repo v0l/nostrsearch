@@ -282,15 +282,30 @@ async fn sync_status(
 
         let floor_p = env_u("SCRAPE_USAGE_PERCENTILE_MIN", 2) as u32;
         let ceil_p = env_u("SCRAPE_USAGE_PERCENTILE", 80) as u32;
-        let kept_at_floor =
-            nostrsearch_indexer::scrape::top_by_usage_weight(relays.clone(), floor_p).len() as u64;
+        // Same floor the scraper applies: the kept set never shrinks below
+        // the worker count, so this page reports the scope the pass will
+        // actually cover.
+        let min_keep = env_u("SCRAPE_CONCURRENCY", 50) as usize;
+        let kept_at_floor = nostrsearch_indexer::scrape::top_by_usage_weight(
+            relays.clone(),
+            floor_p,
+            min_keep,
+        );
+        // Coverage counts only relays the floor cut keeps -- the raw total
+        // includes every relay ever scraped, junk included, which inflates
+        // coverage and snaps the cut to the ceiling.
+        let done_in_scope: u64 = kept_at_floor
+            .iter()
+            .map(|(u, _)| progress.by_relay.get(u).map(|t| t.days).unwrap_or(0))
+            .sum();
         let cut = nostrsearch_indexer::scrape::adaptive_percentile(
-            progress.relay_days,
-            kept_at_floor.saturating_mul(days.max(1)),
+            done_in_scope,
+            (kept_at_floor.len() as u64).saturating_mul(days.max(1)),
             floor_p,
             ceil_p,
         );
-        let kept = nostrsearch_indexer::scrape::top_by_usage_weight(relays.clone(), cut);
+        let kept =
+            nostrsearch_indexer::scrape::top_by_usage_weight(relays.clone(), cut, min_keep);
         let in_scope: std::collections::HashSet<String> =
             kept.iter().map(|(u, _)| u.clone()).collect();
 
