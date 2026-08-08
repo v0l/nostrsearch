@@ -50,6 +50,19 @@ pub struct RelayInfo {
     /// probing below a relay's real start is bounded and paid once.
     #[serde(default)]
     pub birthday: Option<u64>,
+    /// Whether the URL serves a NIP-11 relay information document.
+    ///
+    /// `None` = not yet checked, `Some(false)` = it does not, and is therefore
+    /// not a relay. Anyone can invent a relay by publishing a kind-10002 entry
+    /// naming a path on somebody else's host -- `relay.primal.net/sierra-ivory`
+    /// is not a relay, and neither is `relay.snort.social/,` -- and those
+    /// entries accumulate real advertisers, so no amount of usage weighting
+    /// excludes them. Asking the URL to describe itself does.
+    #[serde(default)]
+    pub nip11: Option<bool>,
+    /// When the NIP-11 check last ran (unix secs), so it can be redone.
+    #[serde(default)]
+    pub nip11_at: u64,
     /// Unix secs until which this relay is considered dead and not probed.
     ///
     /// A relay that refuses connections fails every draw it appears in, and
@@ -587,6 +600,8 @@ pub struct ScrapeConfig {
     /// Hard cap on one relay-day, in seconds. A relay that connects and then
     /// stalls would otherwise hold a worker slot for the rest of the pass.
     pub unit_timeout_secs: u64,
+    /// How long a NIP-11 verdict stands before being rechecked, in seconds.
+    pub nip11_recheck_secs: u64,
     /// Share of total advertisement weight to cover, as a percentage.
     ///
     /// Relays are ranked by how many distinct people advertise them and kept
@@ -630,6 +645,7 @@ impl Default for ScrapeConfig {
             dead_after_fails: 3,
             dead_for_secs: 24 * 3600,
             unit_timeout_secs: 180,
+            nip11_recheck_secs: 7 * 24 * 3600,
             usage_percentile: 80,
             usage_percentile_min: 2,
         }
@@ -818,6 +834,88 @@ pub fn block_window(today_start: u64, k: u64) -> (u64, u64) {
     (start, end)
 }
 
+/// NATO phonetic alphabet, the giveaway in machine-minted relay paths.
+const NATO: &[&str] = &[
+    "alfa", "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india",
+    "juliett", "juliet", "kilo", "lima", "mike", "november", "oscar", "papa", "quebec", "romeo",
+    "sierra", "tango", "uniform", "victor", "whiskey", "xray", "yankee", "zulu",
+];
+
+/// Does this URL's path look machine-generated rather than chosen?
+///
+/// Observed in the wild on real relay hosts: `/sierra-ivory`, `/quebec-zulu`,
+/// `/tango-vertex`, `/foxtrot-victor`, `/marble-india`. Each is a hyphenated
+/// pair drawn partly from the NATO alphabet, spread across many unrelated
+/// hosts, and none appears anywhere near the top of the advertiser rankings.
+///
+/// NIP-11 alone does not catch these: a relay that serves its document at
+/// every path answers for the invented one too, so the URL looks real while
+/// naming nothing.
+///
+/// Deliberately narrow. A single NATO word is not enough -- `/echo` is a
+/// plausible path a person would choose -- so a hyphenated compound
+/// *containing* one is required. That is the observed shape and it keeps
+/// ordinary paths like `/v1`, `/nostr`, `/relay` and `/strfry` out of scope.
+pub fn looks_like_generated_path(url: &str) -> bool {
+    let Some(path) = url.splitn(4, '/').nth(3) else {
+        return false;
+    };
+    let path = path.trim_end_matches('/');
+    if path.is_empty() {
+        return false;
+    }
+    let tokens: Vec<&str> = path
+        .split(['-', '_', '/'])
+        .filter(|t| !t.is_empty())
+        .collect();
+    if tokens.len() < 2 {
+        return false;
+    }
+    tokens
+        .iter()
+        .any(|t| NATO.contains(&t.to_ascii_lowercase().as_str()))
+}
+
+/// Ask a relay URL to describe itself (NIP-11).
+///
+/// The relay document is served over http(s) at the same host and path, with
+/// `Accept: application/nostr+json`. A URL that does not answer with one is
+/// not a relay, whatever a kind-10002 entry claims.
+///
+/// Returns `None` when the check could not be completed -- a timeout, TLS
+/// failure or transport error -- which is deliberately not the same as
+/// `Some(false)`: a relay that is merely down must not be discarded as fake.
+pub async fn probe_nip11(url: &str, timeout: std::time::Duration) -> Option<bool> {
+    let http = url
+        .replacen("wss://", "https://", 1)
+        .replacen("ws://", "http://", 1);
+    let client = reqwest::Client::builder().timeout(timeout).build().ok()?;
+    let resp = client
+        .get(&http)
+        .header(reqwest::header::ACCEPT, "application/nostr+json")
+        .send()
+        .await
+        .ok()?;
+    if !resp.status().is_success() {
+        // The host answered and said this path is not there.
+        return Some(false);
+    }
+    let body = resp.text().await.ok()?;
+    let doc: serde_json::Value = match serde_json::from_str(&body) {
+        Ok(v) => v,
+        // Answered, but not with a relay document -- typically a web page,
+        // which is what an invented path on a real host returns.
+        Err(_) => return Some(false),
+    };
+    // NIP-11 has no single mandatory field, so accept a document that carries
+    // any of the ones a relay would.
+    let looks_like_a_relay = doc.is_object()
+        && ["name", "pubkey", "supported_nips", "software", "description"]
+            .iter()
+            .any(|k| doc.get(*k).is_some());
+    Some(looks_like_a_relay)
+}
+
 /// Keep the relays carrying `percentile`% of all advertisement weight.
 ///
 /// Ranked by advertiser count, accumulated until the running share reaches the
@@ -836,6 +934,14 @@ pub fn top_by_usage_weight(
     mut targets: Vec<(String, RelayInfo)>,
     percentile: u32,
 ) -> Vec<(String, RelayInfo)> {
+    // Drop anything already shown not to be a relay before anything else.
+    //
+    // These are not merely unscrapeable, they are not relays at all, and they
+    // carry real advertisers -- `relay.snort.social/,` has over a thousand.
+    // Left in they inflate the denominator, so the share of "usage" the cut
+    // covers is computed against demand that does not exist, and they crowd
+    // real relays out of scope.
+    targets.retain(|(_, i)| i.nip11 != Some(false));
     if percentile >= 100 || targets.is_empty() {
         return targets;
     }
@@ -922,6 +1028,11 @@ fn plan_batch(
             continue;
         }
 
+        // Checked, and it does not serve a relay document. Not a relay.
+        if info.nip11 == Some(false) {
+            continue;
+        }
+
         // Days are drawn from the current window only, newest window first.
         // Complete randomness across the whole corpus spread every relay
         // thinly over four years, so nothing was ever finished and recent
@@ -988,6 +1099,51 @@ async fn scrape_relay_day<S: Sink>(
     cfg: &ScrapeConfig,
 ) {
     use nostr_sdk::prelude::*;
+
+    // Verify this is a relay before spending a websocket on it.
+    //
+    // The check is cheap, cached on the relay record, and only redone after
+    // nip11_recheck_secs -- so an invented path costs one HTTP request ever,
+    // rather than a connection, a sync and a timeout on every draw.
+    let now_probe = chrono::Utc::now().timestamp() as u64;
+
+    // Machine-minted path: reject without asking. A relay that serves NIP-11
+    // at every path would answer for this one, so the document proves nothing
+    // here -- the path itself is the evidence.
+    if info.nip11.is_none() && looks_like_generated_path(url) {
+        info.nip11 = Some(false);
+        info.nip11_at = now_probe;
+        info.dead_until = Some(now_probe + cfg.nip11_recheck_secs);
+        state.put_relay(url, &info);
+        tracing::info!(relay = %url, "generated relay path; not a relay, retired");
+        return;
+    }
+
+    if info.nip11.is_none() || now_probe.saturating_sub(info.nip11_at) > cfg.nip11_recheck_secs {
+        if let Some(ok) =
+            probe_nip11(url, std::time::Duration::from_secs(10)).await
+        {
+            info.nip11 = Some(ok);
+            info.nip11_at = now_probe;
+            if !ok {
+                // Retire it the same way a failing relay is retired, so every
+                // path that already respects dead_until respects this too.
+                // The record is kept rather than deleted: discovery re-adds
+                // whatever kind-10002 advertises, so deleting would mean
+                // re-probing the same invented URL on every pass. The
+                // tombstone is what makes the check cost one request, ever.
+                info.dead_until = Some(now_probe + cfg.nip11_recheck_secs);
+                tracing::info!(relay = %url, "no NIP-11 document; not a relay, retired");
+            }
+            state.put_relay(url, &info);
+            if !ok {
+                return;
+            }
+        }
+        // `None` means the check itself failed (timeout, TLS, transport). Not
+        // evidence either way, so fall through and try the relay normally
+        // rather than discarding one that is merely down.
+    }
 
     // Added to the shared pool on demand. add_relay is idempotent, so a relay
     // touched again in a later batch reuses the existing connection instead of
@@ -1389,6 +1545,142 @@ mod scrape_concurrency_tests {
             assert_eq!(b.len(), 1, "the one unfinished day must be scheduled");
             assert_eq!(b[0].2, open, "and it must be that day");
         }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Machine-minted paths are rejected; chosen ones are not.
+    ///
+    /// The false-positive side matters as much as the true-positive side:
+    /// path-bearing relays are real and common, and wrongly rejecting
+    /// `ditto.pub/relay` or `yabu.me/v2` would silently drop relays with a
+    /// thousand advertisers each.
+    #[test]
+    fn generated_paths_are_recognised_without_catching_real_ones() {
+        // Observed in the wild, on real relay hosts.
+        for u in [
+            "wss://relay.primal.net/sierra-ivory",
+            "wss://chillstr.nostr1.com/quebec-zulu",
+            "wss://relay.letsfo.com/tango-vertex",
+            "wss://relay.powr.build/foxtrot-victor",
+            "wss://relay2.ngengine.org/marble-india",
+            "wss://nostr.2b9t.xyz/foxtrot-beacon-ci",
+        ] {
+            assert!(super::looks_like_generated_path(u), "should reject {u}");
+        }
+
+        // Real relays, verified against the live relay list -- several with
+        // over a thousand advertisers.
+        for u in [
+            "wss://relay.damus.io",
+            "wss://ditto.pub/relay",
+            "wss://yabu.me/v2",
+            "wss://relay.getalby.com/v1",
+            "wss://nostr.petrkr.net/strfry",
+            "wss://feeds.nostr.band/popular",
+            "wss://relay.minds.com/nostr/v1/ws",
+            "wss://ftp.halifax.rwth-aachen.de/nostr",
+            // A single NATO word is a path a person might choose, so one
+            // token alone must not be enough to condemn it.
+            "wss://relay.example/echo",
+            "wss://relay.example/alpha",
+        ] {
+            assert!(!super::looks_like_generated_path(u), "should accept {u}");
+        }
+    }
+
+    /// Non-relays are excluded from the weight, not just from scheduling.
+    ///
+    /// `relay.snort.social/,` carries over a thousand advertisers. Counting
+    /// that toward total usage means the cut covers a share of demand that
+    /// does not exist, and real relays are crowded out of scope by URLs that
+    /// are not relays.
+    #[test]
+    fn non_relays_do_not_count_toward_usage_weight() {
+        let mk = |url: &str, n: u32, nip11: Option<bool>| {
+            let mut i = super::RelayInfo::default();
+            i.sources = n;
+            i.nip11 = nip11;
+            (url.to_string(), i)
+        };
+        let all = vec![
+            mk("wss://real-a.example", 500, Some(true)),
+            mk("wss://junk.example/,", 1200, Some(false)),
+            mk("wss://junk2.example/sierra-ivory", 900, Some(false)),
+            mk("wss://real-b.example", 300, Some(true)),
+            mk("wss://unchecked.example", 200, None),
+        ];
+
+        let kept = super::top_by_usage_weight(all.clone(), 100);
+        let urls: Vec<&str> = kept.iter().map(|(u, _)| u.as_str()).collect();
+        assert!(
+            !urls.iter().any(|u| u.contains("junk")),
+            "URLs shown not to be relays must be dropped, got {urls:?}"
+        );
+        assert!(
+            urls.contains(&"wss://unchecked.example"),
+            "an unchecked relay must survive so it can be checked"
+        );
+
+        // The cut is computed against real demand only: with the junk gone,
+        // 80% of weight is real-a + real-b, not the junk pair that outweighed
+        // them.
+        let cut = super::top_by_usage_weight(all, 80);
+        assert!(
+            cut.iter().any(|(u, _)| u == "wss://real-a.example"),
+            "the heaviest real relay must be in scope"
+        );
+        assert!(
+            !cut.iter().any(|(u, _)| u.contains("junk")),
+            "non-relays must not occupy the budget"
+        );
+    }
+
+    /// A URL known not to serve a relay document is never scheduled.
+    #[test]
+    fn relays_without_a_nip11_document_are_not_drawn() {
+        let (st, dir) = state("nip11");
+        let now = chrono::Utc::now().timestamp() as u64;
+
+        let mut fake = super::RelayInfo::default();
+        fake.nip11 = Some(false);
+        fake.nip11_at = now;
+        let mut real = super::RelayInfo::default();
+        real.nip11 = Some(true);
+        real.nip11_at = now;
+        let unknown = super::RelayInfo::default(); // never checked
+
+        let t = vec![
+            ("wss://relay.example/sierra-ivory".to_string(), fake),
+            ("wss://relay.example".to_string(), real),
+            ("wss://unchecked.example".to_string(), unknown),
+        ];
+        let cfg = super::ScrapeConfig::default();
+        let mut rng = rand::thread_rng();
+        let win = super::block_window(now - (now % 86_400), 0);
+        let inflight = std::sync::Mutex::new(std::collections::HashSet::new());
+
+        let mut saw_real = false;
+        let mut saw_unknown = false;
+        for _ in 0..60 {
+            for (u, ..) in super::plan_batch(&t, &st, &cfg, 5, &mut rng, win, &inflight) {
+                assert_ne!(
+                    u, "wss://relay.example/sierra-ivory",
+                    "a URL with no relay document must never be scheduled"
+                );
+                if u == "wss://relay.example" {
+                    saw_real = true;
+                }
+                if u == "wss://unchecked.example" {
+                    saw_unknown = true;
+                }
+            }
+        }
+        assert!(saw_real, "a verified relay must still be scraped");
+        assert!(
+            saw_unknown,
+            "an unchecked relay must be scheduled so it can be checked; \
+             treating unknown as fake would stop discovery dead"
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 

@@ -115,6 +115,8 @@ pub struct ScraperOptions {
     pub dead_for_secs: u64,
     /// Hard cap on one relay-day, in seconds.
     pub unit_timeout_secs: u64,
+    /// How long a NIP-11 verdict stands, in seconds.
+    pub nip11_recheck_secs: u64,
     /// Share of total advertisement weight to cover, as a percentage.
     pub usage_percentile: u32,
     /// Where the cut starts while the backlog is large.
@@ -154,6 +156,7 @@ impl ScraperOptions {
             dead_after_fails: u("SCRAPE_DEAD_AFTER_FAILS", 3) as u32,
             dead_for_secs: u("SCRAPE_DEAD_FOR_HOURS", 24) * 3600,
             unit_timeout_secs: u("SCRAPE_UNIT_TIMEOUT_SECS", 180),
+            nip11_recheck_secs: u("SCRAPE_NIP11_RECHECK_HOURS", 168) * 3600,
             usage_percentile: u("SCRAPE_USAGE_PERCENTILE", 80) as u32,
             usage_percentile_min: u("SCRAPE_USAGE_PERCENTILE_MIN", 2) as u32,
             pass_interval: std::time::Duration::from_secs(u("SCRAPE_PASS_INTERVAL_SECS", 1800)),
@@ -276,6 +279,7 @@ pub fn spawn_scraper(
                     // A relay that connects then stalls must not hold a
                     // worker slot for the rest of the pass.
                     unit_timeout_secs: opts.unit_timeout_secs,
+                    nip11_recheck_secs: opts.nip11_recheck_secs,
                     // Cut by advertisement weight, not relay count: the count
                     // is attacker-controlled (invented paths on real hosts),
                     // the weight is not.

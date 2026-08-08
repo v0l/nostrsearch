@@ -327,6 +327,7 @@ async fn run(args: Args, state: Arc<ScrapeState>, sink: Arc<PipelineSink>) -> an
         floor_secs: args.floor_secs(),
         concurrency: args.concurrency,
         empty_days_limit: args.birthday_days,
+        nip11_recheck_secs: 7 * 24 * 3600,
         usage_percentile: args.usage_percentile,
         usage_percentile_min: args.usage_percentile_min,
         ..Default::default()
