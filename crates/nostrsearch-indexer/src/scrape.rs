@@ -81,7 +81,7 @@ pub struct RelayInfo {
     /// six minutes, and the whole in-scope set was marked dead in one burst.
     /// A failed relay now waits out a backoff before it can be drawn again.
     ///
-    /// **Must stay the last field.** These records are stored as bincode,
+    /// **New fields go at the end** (see below). These records are stored as bincode,
     /// which is positional and not self-describing: `#[serde(default)]` does
     /// nothing for it, and inserting a field mid-struct makes every
     /// previously-written record undecodable. This field first shipped in the
@@ -92,18 +92,73 @@ pub struct RelayInfo {
     /// which bincode reports as EOF for the missing tail field).
     #[serde(default)]
     pub last_fail: u64,
+    /// Largest negentropy id set one reconciliation has ever returned -- the
+    /// working estimate of the relay's silent *sync* cap.
+    ///
+    /// Some implementations cap the set they present: strfry has
+    /// `negentropy.maxSyncEvents`, and wrappers that run enumeration through
+    /// their REQ query engine inherit its limit. The symptom is day counts
+    /// pinned at round numbers (10k, 40k) rather than an error, so an
+    /// affected day silently loses everything past the cap. Mirrors
+    /// [`cap`](Self::cap) for REQs: a window whose set reaches this ceiling
+    /// is assumed truncated and split.
+    ///
+    /// **Must stay the last field.** These records are stored as bincode,
+    /// which is positional and not self-describing: `#[serde(default)]` does
+    /// nothing for it, and inserting a field mid-struct makes every
+    /// previously-written record undecodable. `last_fail` first shipped in
+    /// the middle of the struct and silently emptied the relay table in prod
+    /// -- 8072 relays became 29, because `relays()` skips records that fail
+    /// to decode. Appending keeps old records decodable via
+    /// [`decode_relay_info`]'s legacy fallbacks (old blobs simply end early,
+    /// which bincode reports as EOF for the missing tail fields).
+    #[serde(default)]
+    pub neg_cap: u32,
 }
 
-/// Decode a stored [`RelayInfo`], accepting the previous on-disk layout.
+/// Decode a stored [`RelayInfo`], accepting every previous on-disk layout.
 ///
-/// Bincode is positional: a record written before `last_fail` existed is one
-/// `u64` short, so decoding it as the current struct fails with EOF. Fall
-/// back to the old layout and default the missing field, rather than treating
-/// every pre-upgrade relay record as corrupt and dropping it.
+/// Bincode is positional: a record written before a tail field existed is
+/// short by that field, so decoding it as the current struct fails with EOF.
+/// Fall back through the older layouts, newest first, defaulting the missing
+/// fields -- rather than treating every pre-upgrade relay record as corrupt
+/// and dropping it. Newest first matters: bincode ignores trailing bytes, so
+/// an older (shorter) layout would "successfully" decode a newer record and
+/// silently discard its tail fields.
 pub fn decode_relay_info(v: &[u8]) -> Option<RelayInfo> {
     if let Ok(info) = bincode::deserialize::<RelayInfo>(v) {
         return Some(info);
     }
+    // Layout up to `last_fail` (before `neg_cap`).
+    #[derive(Deserialize)]
+    struct V2 {
+        sources: u32,
+        negentropy: Option<bool>,
+        cap: u32,
+        fails: u32,
+        last_ok: u64,
+        birthday: Option<u64>,
+        nip11: Option<bool>,
+        nip11_at: u64,
+        dead_until: Option<u64>,
+        last_fail: u64,
+    }
+    if let Ok(o) = bincode::deserialize::<V2>(v) {
+        return Some(RelayInfo {
+            sources: o.sources,
+            negentropy: o.negentropy,
+            cap: o.cap,
+            fails: o.fails,
+            last_ok: o.last_ok,
+            birthday: o.birthday,
+            nip11: o.nip11,
+            nip11_at: o.nip11_at,
+            dead_until: o.dead_until,
+            last_fail: o.last_fail,
+            neg_cap: 0,
+        });
+    }
+    // Layout before `last_fail`.
     #[derive(Deserialize)]
     struct V1 {
         sources: u32,
@@ -127,6 +182,7 @@ pub fn decode_relay_info(v: &[u8]) -> Option<RelayInfo> {
         nip11_at: o.nip11_at,
         dead_until: o.dead_until,
         last_fail: 0,
+        neg_cap: 0,
     })
 }
 
@@ -145,8 +201,13 @@ pub struct DayEntry {
 pub struct ScrapeProgress {
     /// Distinct dates with at least one relay completed.
     pub days: u64,
-    /// Completed (relay, day) pairs.
+    /// Completed (relay, day) pairs, current epoch only.
     pub relay_days: u64,
+    /// Records from an older [`SYNC_EPOCH`], pending re-verification. Their
+    /// events still count in the totals -- those fetches were real -- but
+    /// they no longer count as coverage.
+    #[serde(default)]
+    pub stale_days: u64,
     /// Events relays returned, and how many were new to the index.
     pub events_seen: u64,
     pub events_new: u64,
@@ -174,8 +235,24 @@ pub struct RelayTotals {
     pub new: u64,
 }
 
+/// Scrape-semantics version stamped into every completion record.
+///
+/// A (relay, day) is only *done* if it was completed under the current
+/// semantics. Bump this when a bug is found that silently under-scraped
+/// completed days, and every existing record stops counting as done: the
+/// days are redrawn and re-verified, and the record is rewritten at the new
+/// epoch. Re-verification is cheap where it matters -- negentropy against
+/// our real local set reconciles an already-complete day to an empty diff.
+///
+/// Epoch 1: everything before it is suspect. Negentropy days were synced as
+/// one day-wide reconciliation against implementations that silently cap
+/// the presented id set (counts pinned at 10k/40k, the rest never fetched),
+/// and the pre-backoff scraper recorded `seen=0` days against relays that
+/// were failing from our side (auth-gated, connect races, SYN drops).
+pub const SYNC_EPOCH: u32 = 1;
+
 /// Outcome of one fully-scraped (relay, day).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DayDone {
     /// Events the relay returned for this day.
     pub seen: u64,
@@ -183,6 +260,33 @@ pub struct DayDone {
     pub new: u64,
     /// Unix secs when completed.
     pub at: u64,
+    /// [`SYNC_EPOCH`] this record was written under; 0 = pre-epoch record.
+    ///
+    /// **Must stay the last field** -- bincode is positional, `#[serde(
+    /// default)]` does nothing for it, and inserting mid-struct makes every
+    /// existing record undecodable (see [`RelayInfo::neg_cap`] for the
+    /// incident). Old records decode via [`decode_day_done`]'s fallback.
+    #[serde(default)]
+    pub epoch: u32,
+}
+
+/// Decode a stored [`DayDone`], accepting the pre-epoch layout.
+pub fn decode_day_done(v: &[u8]) -> Option<DayDone> {
+    if let Ok(d) = bincode::deserialize::<DayDone>(v) {
+        return Some(d);
+    }
+    #[derive(Deserialize)]
+    struct V1 {
+        seen: u64,
+        new: u64,
+        at: u64,
+    }
+    bincode::deserialize::<V1>(v).ok().map(|o| DayDone {
+        seen: o.seen,
+        new: o.new,
+        at: o.at,
+        epoch: 0,
+    })
 }
 
 /// Persistent scrape state: relay targets and per-(relay, day) completion.
@@ -259,11 +363,20 @@ impl ScrapeState {
         }
     }
 
+    /// Is this (relay, day) complete *under current scrape semantics*?
+    ///
+    /// A record from an older [`SYNC_EPOCH`] is not done: it was written by
+    /// a scraper since found to under-report (capped negentropy sets, days
+    /// recorded empty while the relay was failing from our side), so the day
+    /// must be redrawn and re-verified. The stale record stays in place --
+    /// its event totals are real -- until the re-scrape overwrites it.
     pub fn day_done(&self, date: &str, url: &str) -> bool {
         self.db
             .get_pinned(Self::day_key(date, url))
-            .map(|v| v.is_some())
-            .unwrap_or(false)
+            .ok()
+            .flatten()
+            .and_then(|v| decode_day_done(&v))
+            .is_some_and(|d| d.epoch >= SYNC_EPOCH)
     }
 
     pub fn put_day(&self, date: &str, url: &str, done: &DayDone) {
@@ -290,19 +403,28 @@ impl ScrapeState {
             let Some((date, url)) = rest.split_once('|') else {
                 continue;
             };
-            let Ok(done) = bincode::deserialize::<DayDone>(&v) else {
+            let Some(done) = decode_day_done(&v) else {
                 continue;
             };
 
-            p.relay_days += 1;
             p.events_seen += done.seen;
             p.events_new += done.new;
-            dates.insert(date.to_string());
-
             let t = p.by_relay.entry(url.to_string()).or_default();
-            t.days += 1;
             t.seen += done.seen;
             t.new += done.new;
+
+            // Only current-epoch records are coverage. Stale ones are real
+            // fetches but unverified claims about completeness, so they must
+            // not make the backlog look smaller than it is -- coverage is
+            // what widens the adaptive cut and steps the block window back.
+            if done.epoch >= SYNC_EPOCH {
+                p.relay_days += 1;
+                dates.insert(date.to_string());
+                t.days += 1;
+            } else {
+                p.stale_days += 1;
+                continue;
+            }
 
             recent.push(DayEntry {
                 date: date.to_string(),
@@ -410,7 +532,7 @@ impl ScrapeState {
             {
                 continue;
             }
-            let Ok(done) = bincode::deserialize::<DayDone>(&v) else {
+            let Some(done) = decode_day_done(&v) else {
                 continue;
             };
             f(&k, date, url, &done);
@@ -637,10 +759,33 @@ mod tests {
                 seen: 10,
                 new: 3,
                 at: 0,
+                epoch: SYNC_EPOCH,
             },
         );
         assert!(st.day_done("2026-07-30", "wss://a.example"));
         assert!(!st.day_done("2026-07-30", "wss://b.example"));
+
+        // A record from an older epoch is a claim the current scraper no
+        // longer trusts: it must not count as done, so the day is redrawn.
+        st.put_day(
+            "2026-07-29",
+            "wss://a.example",
+            &DayDone {
+                seen: 10_000, // the telltale capped count
+                new: 0,
+                at: 0,
+                epoch: 0,
+            },
+        );
+        assert!(
+            !st.day_done("2026-07-29", "wss://a.example"),
+            "a pre-epoch record must not count as coverage"
+        );
+        // And the pre-epoch *layout* -- no epoch field at all -- decodes and
+        // is equally not-done.
+        let old = bincode::serialize(&(10u64, 3u64, 0u64)).unwrap();
+        let d = decode_day_done(&old).expect("pre-epoch layout must decode");
+        assert_eq!((d.seen, d.new, d.at, d.epoch), (10, 3, 0, 0));
     }
 
     #[test]
@@ -1034,6 +1179,21 @@ pub async fn run_pass<S: Sink>(
 
 /// Days in one backfill window.
 pub const BLOCK_DAYS: u64 = 30;
+
+/// Width of one negentropy reconciliation window, in seconds.
+///
+/// One hour: small enough that a relay-side cap on the presented id set is
+/// unlikely to bind (the busiest observed relay, damus, runs ~10k ids/hour),
+/// large enough that a day costs 24 cheap dry-run exchanges rather than
+/// hundreds.
+pub const NEG_WINDOW_SECS: u64 = 3_600;
+
+/// Floor for the learned negentropy set ceiling ([`RelayInfo::neg_cap`]).
+///
+/// Below this, a window's set size is always taken at face value. Without a
+/// floor, the first window a fresh relay answers would equal its own
+/// "largest ever" and trigger a pointless split.
+pub const NEG_CAP_FLOOR: u32 = 5_000;
 
 /// Window `k` counting back from yesterday, as day-aligned `[start, end)`.
 ///
@@ -1452,6 +1612,7 @@ async fn scrape_relay_day<S: Sink>(
                     seen,
                     new,
                     at: info.last_ok,
+                    epoch: SYNC_EPOCH,
                 },
             );
             // An empty day at or below the relay's oldest known data is
@@ -1535,63 +1696,123 @@ async fn scrape_day<S: Sink>(
     let mut new = 0u64;
 
     // 1. Negentropy: enumerate the relay's ids for the day, fetch only gaps.
+    //
+    // Synced in fixed one-hour windows rather than one day-wide
+    // reconciliation. Some implementations silently cap the id set a single
+    // reconciliation presents -- strfry's `negentropy.maxSyncEvents`, and
+    // wrappers that enumerate through their REQ query engine inherit its
+    // limit -- which shows up as day counts pinned at round numbers (10k,
+    // 40k) with no error, and everything past the cap silently missing. The
+    // majors that were checked (damus, mostr, offchain) present a 250k-id day
+    // honestly, but the cap is invisible from a single answer, so every
+    // relay gets windows small enough that a cap is unlikely to bind. An
+    // hour that *still* reaches the relay's largest-ever set is assumed
+    // truncated and split, exactly like the REQ path below: `neg_cap` is
+    // the observed ceiling, and windows shrink down to `floor_secs`.
+    //
+    // 24 reconciliations per relay-day instead of one is cheap: each is a
+    // dry-run frame exchange, and with `local_items` as the baseline the
+    // steady-state traffic is the diff, not the relay's full id list.
     if info.negentropy != Some(false) {
-        let filter = Filter::new()
-            .since(Timestamp::from(start))
-            .until(Timestamp::from(end - 1));
         let opts = SyncOptions::new().dry_run();
-        // Reconcile against our real local set for the day, so steady-state
-        // traffic is the difference rather than the relay's full id list.
-        let items = sink.local_items(start, end - 1).await;
-        let sync = async {
-            let relay = client.relay(url).await?;
-            relay
-                .sync_with_items(filter.clone(), items, &opts)
-                .await
-                .map_err(anyhow::Error::from)
-        };
-        match sync.await {
-            Ok(out) => {
-                info.negentropy = Some(true);
-                let remote = &out.remote;
-                seen = remote.len() as u64;
-                let ids: Vec<[u8; 32]> = remote.iter().map(|id| id.to_bytes()).collect();
-                let missing = sink.missing(ids).await;
-                for chunk in missing.chunks(500) {
-                    let ids: Vec<EventId> =
-                        chunk.iter().map(|b| EventId::from_byte_array(*b)).collect();
-                    let events = client
-                        .fetch_events_from(
-                            [url],
-                            Filter::new().ids(ids),
-                            std::time::Duration::from_secs(30),
-                        )
-                        .await?;
-                    new += sink.process(events.into_iter().collect()).await;
+        // Hour-aligned windows tiling [start, end), newest first so the
+        // freshest data lands even if the unit times out midway.
+        let mut stack: Vec<(u64, u64)> = Vec::new();
+        let mut s = start;
+        while s < end {
+            let e = (s + NEG_WINDOW_SECS).min(end);
+            stack.push((s, e));
+            s = e;
+        }
+        let mut synced_any = false;
+        let mut abandon = false;
+        while let Some((s, e)) = stack.pop() {
+            let filter = Filter::new()
+                .since(Timestamp::from(s))
+                .until(Timestamp::from(e - 1));
+            // Reconcile against our real local set for the window, so
+            // steady-state traffic is the difference rather than the relay's
+            // full id list.
+            let items = sink.local_items(s, e - 1).await;
+            let sync = async {
+                let relay = client.relay(url).await?;
+                relay
+                    .sync_with_items(filter.clone(), items, &opts)
+                    .await
+                    .map_err(anyhow::Error::from)
+            };
+            match sync.await {
+                Ok(out) => {
+                    info.negentropy = Some(true);
+                    let n = out.remote.len() as u64;
+                    info.neg_cap = info.neg_cap.max(n as u32);
+                    // A window at the largest set this relay has ever
+                    // presented may be truncated at a silent cap: split it,
+                    // down to the floor. The floor guards the honest case --
+                    // a relay whose busiest-ever window keeps being its
+                    // busiest costs a few extra reconciliations, not a loop.
+                    let ceiling = u64::from(info.neg_cap.max(NEG_CAP_FLOOR));
+                    if n >= ceiling && (e - s) / 2 >= floor_secs {
+                        let mid = s + (e - s) / 2;
+                        stack.push((s, mid));
+                        stack.push((mid, e));
+                        continue;
+                    }
+                    seen += n;
+                    let ids: Vec<[u8; 32]> = out.remote.iter().map(|id| id.to_bytes()).collect();
+                    let missing = sink.missing(ids).await;
+                    for chunk in missing.chunks(500) {
+                        let ids: Vec<EventId> =
+                            chunk.iter().map(|b| EventId::from_byte_array(*b)).collect();
+                        let events = client
+                            .fetch_events_from(
+                                [url],
+                                Filter::new().ids(ids),
+                                std::time::Duration::from_secs(30),
+                            )
+                            .await?;
+                        new += sink.process(events.into_iter().collect()).await;
+                    }
+                    synced_any = true;
                 }
-                return Ok((seen, new));
-            }
-            Err(e) => {
-                let msg = e.to_string().to_lowercase();
-                if msg.contains("negentropy") || msg.contains("not supported") {
-                    // Remember, so we don't retry it every day.
-                    info.negentropy = Some(false);
-                } else {
-                    // Anything else -- most commonly "timeout", from a relay
-                    // that silently ignores NEG-OPEN rather than answering
-                    // NEG-ERR (relay.nostr.band, purplepag.es) -- says nothing
-                    // about whether the relay can serve plain REQs. This used
-                    // to fail the whole unit: the relay took a strike per
-                    // draw, reached the retirement threshold in minutes, and
-                    // the entire in-scope set was marked dead while every one
-                    // of those relays answered REQs perfectly well. Fall
-                    // through to the windowed fallback instead; if the relay
-                    // is really unreachable the fallback fails and *that*
-                    // records the failure. Negentropy stays unprobed so a
-                    // relay that was merely slow is tried again another day.
-                    tracing::debug!(relay = %url, error = %msg, "negentropy sync failed; trying windowed REQs");
+                Err(e) => {
+                    let msg = e.to_string().to_lowercase();
+                    if msg.contains("negentropy") || msg.contains("not supported") {
+                        // Remember, so we don't retry it every day.
+                        info.negentropy = Some(false);
+                    } else if synced_any {
+                        // Mid-day failure after real progress: fail the unit
+                        // and let the day be retried. Everything fetched so
+                        // far is already processed and deduped, so the retry
+                        // resumes rather than repeats -- redoing the whole
+                        // day over REQs would cost far more than it saves.
+                        return Err(e);
+                    } else {
+                        // Nothing synced yet -- most commonly "timeout", from
+                        // a relay that silently ignores NEG-OPEN rather than
+                        // answering NEG-ERR (relay.nostr.band, purplepag.es).
+                        // That says nothing about whether the relay can serve
+                        // plain REQs; failing the unit here is what once
+                        // marked the entire in-scope set dead. Fall through
+                        // to the windowed fallback, and leave negentropy
+                        // unprobed so a relay that was merely slow is tried
+                        // again another day.
+                        tracing::debug!(relay = %url, error = %msg, "negentropy sync failed; trying windowed REQs");
+                    }
+                    abandon = true;
+                    break;
                 }
             }
+        }
+        if !abandon {
+            return Ok((seen, new));
+        }
+        if synced_any {
+            // Unsupported answered mid-day (some proxies flip behaviour):
+            // the REQ fallback below re-covers the whole day; already-stored
+            // events dedupe to nothing.
+            seen = 0;
+            new = 0;
         }
     }
 
@@ -1688,7 +1909,7 @@ mod scrape_concurrency_tests {
         let span = (today - cfg.min_date) / 86_400;
         for back in 1..=span {
             let (date, ..) = super::day_bounds(back);
-            st.put_day(&date, &t[0].0, &super::DayDone { seen: 1, new: 0, at: now });
+            st.put_day(&date, &t[0].0, &super::DayDone { seen: 1, new: 0, at: now, epoch: super::SYNC_EPOCH });
         }
 
         for _ in 0..20 {
@@ -1936,7 +2157,7 @@ mod scrape_concurrency_tests {
                 keep_open = Some(date);
                 continue;
             }
-            st.put_day(&date, &t[0].0, &super::DayDone { seen: 1, new: 0, at: now });
+            st.put_day(&date, &t[0].0, &super::DayDone { seen: 1, new: 0, at: now, epoch: super::SYNC_EPOCH });
         }
         let open = keep_open.expect("the window must contain at least one day");
 
