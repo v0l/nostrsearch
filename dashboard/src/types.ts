@@ -63,6 +63,8 @@ export interface SyncRelay {
   events_new: number;
   /** Set while the relay is being left alone after repeated failures. */
   dead_until?: number;
+  /** Inside the usage-weight cut, and therefore actually being scraped. */
+  in_scope: boolean;
   url: string;
   sources: number;
   negentropy: boolean | null;

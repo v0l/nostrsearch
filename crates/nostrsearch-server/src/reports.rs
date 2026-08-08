@@ -242,6 +242,13 @@ struct SyncRelay {
     /// Set while the relay is being left alone after repeated failures.
     #[serde(skip_serializing_if = "Option::is_none")]
     dead_until: Option<u64>,
+    /// Inside the current usage-weight cut, and therefore actually scraped.
+    ///
+    /// The list shows every relay ever discovered, which is thousands; only a
+    /// few dozen are in scope. Without this the table reads as if all of them
+    /// are being worked on, and a relay sitting at zero looks broken rather
+    /// than simply out of scope.
+    in_scope: bool,
 }
 
 async fn sync_status(
@@ -255,30 +262,6 @@ async fn sync_status(
         // One scan, reused: `progress` already walks every recorded day, and
         // accumulates per-relay totals while it is there.
         let progress = state.progress(25);
-        let mut top: Vec<SyncRelay> = relays
-            .iter()
-            .map(|(url, i)| {
-                let t = progress.by_relay.get(url).copied().unwrap_or_default();
-                SyncRelay {
-                    url: url.clone(),
-                    sources: i.sources,
-                    negentropy: i.negentropy,
-                    cap: i.cap,
-                    fails: i.fails,
-                    last_ok: i.last_ok,
-                    birthday: i.birthday,
-                    days: t.days,
-                    events_seen: t.seen,
-                    events_new: t.new,
-                    dead_until: i.dead_until,
-                }
-            })
-            .collect();
-        // Most-advertised relays first: the ones that matter for coverage.
-        // Sort before slicing so paging is stable across requests.
-        top.sort_by(|a, b| b.sources.cmp(&a.sources).then_with(|| a.url.cmp(&b.url)));
-        let top: Vec<SyncRelay> = top.into_iter().skip(offset).take(limit).collect();
-
         // Same cut the scraper applies, so the figure describes the work it
         // will actually do rather than a hypothetical full sweep.
         let env_u = |k: &str, d: u64| {
@@ -308,6 +291,34 @@ async fn sync_status(
             ceil_p,
         );
         let kept = nostrsearch_indexer::scrape::top_by_usage_weight(relays.clone(), cut);
+        let in_scope: std::collections::HashSet<String> =
+            kept.iter().map(|(u, _)| u.clone()).collect();
+
+        let mut top: Vec<SyncRelay> = relays
+            .iter()
+            .map(|(url, i)| {
+                let t = progress.by_relay.get(url).copied().unwrap_or_default();
+                SyncRelay {
+                    url: url.clone(),
+                    sources: i.sources,
+                    negentropy: i.negentropy,
+                    cap: i.cap,
+                    fails: i.fails,
+                    last_ok: i.last_ok,
+                    birthday: i.birthday,
+                    days: t.days,
+                    events_seen: t.seen,
+                    events_new: t.new,
+                    dead_until: i.dead_until,
+                    in_scope: in_scope.contains(url),
+                }
+            })
+            .collect();
+        // Most-advertised relays first: the ones that matter for coverage.
+        // Sort before slicing so paging is stable across requests.
+        top.sort_by(|a, b| b.sources.cmp(&a.sources).then_with(|| a.url.cmp(&b.url)));
+        let top: Vec<SyncRelay> = top.into_iter().skip(offset).take(limit).collect();
+
         // Count only the days done for relays still in scope: days scraped
         // from a relay the cut has since dropped are not progress toward the
         // job that remains.

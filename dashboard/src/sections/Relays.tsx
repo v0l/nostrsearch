@@ -238,6 +238,9 @@ export function Relays({
           <thead>
             <tr>
               <th>Relay</th>
+              <th title="Inside the usage-weight cut, and therefore scraped">
+                Scope
+              </th>
               <th>Sync method</th>
               <th class="num">Advertised by</th>
               <th class="num">Days</th>
@@ -252,7 +255,7 @@ export function Relays({
           <tbody>
             {rows.length === 0 ? (
               <tr>
-                <td colSpan={authed ? 10 : 9} class="empty">
+                <td colSpan={authed ? 11 : 10} class="empty">
                   No relays discovered yet.
                 </td>
               </tr>
@@ -261,6 +264,17 @@ export function Relays({
                 <tr key={r.url}>
                   <td class="trunc" title={r.url}>
                     {r.url}
+                  </td>
+                  <td>
+                    {/* The list holds every relay ever discovered; only a few
+                        dozen are in scope. Without saying which, a relay
+                        sitting at zero reads as broken rather than simply not
+                        being worked on. */}
+                    {r.in_scope ? (
+                      <Chip tone="ok">scraping</Chip>
+                    ) : (
+                      <Chip tone="mute">out of scope</Chip>
+                    )}
                   </td>
                   <td>{negentropy(r.negentropy)}</td>
                   <td class="num">{num(r.sources)}</td>
