@@ -660,6 +660,28 @@ pub async fn run_pass<S: Sink>(
     sink: std::sync::Arc<S>,
     cfg: ScrapeConfig,
 ) {
+    // Release relays retired by connection failures alone.
+    //
+    // 543 were marked dead that way, including damus, nos.lol and nostr.band,
+    // because a burst of dropped SYNs looks identical to a relay being gone.
+    // Retirement now also requires sustained silence, so these are re-judged
+    // on that basis rather than left condemned by the old rule. Relays with no
+    // relay document keep their verdict -- that one was checked and correct.
+    {
+        let mut released = 0u64;
+        for (url, mut info) in state.relays() {
+            if info.dead_until.is_some() && info.nip11 != Some(false) {
+                info.dead_until = None;
+                info.fails = 0;
+                state.put_relay(&url, &info);
+                released += 1;
+            }
+        }
+        if released > 0 {
+            tracing::info!(released, "released relays retired on failures alone");
+        }
+    }
+
     let all_relays = state.relays().len();
 
     // How far along is the backlog? Coverage is measured against the relays
@@ -788,7 +810,15 @@ pub async fn run_pass<S: Sink>(
             let Ok(permit) = sem.clone().acquire_owned().await else {
                 break;
             };
-            let key = format!("{url}|{date}");
+            // Keyed on the relay, not the relay-day.
+            //
+            // Two units for the same relay run concurrently otherwise, and the
+            // first to finish calls remove_relay, tearing the shared client's
+            // connection out from under the second. That records a failure
+            // against a relay that answered perfectly well, and three of them
+            // retire it: 543 relays were marked dead this way, including
+            // damus, nos.lol and nostr.band.
+            let key = url.clone();
             in_flight.lock().unwrap().insert(key.clone());
 
             let state = state.clone();
@@ -1028,6 +1058,13 @@ fn plan_batch(
             continue;
         }
 
+        // Already being scraped. One unit per relay at a time: concurrent
+        // units share one client connection, and the first to finish closes
+        // it under the others.
+        if in_flight.lock().unwrap().contains(url) {
+            continue;
+        }
+
         // Checked, and it does not serve a relay document. Not a relay.
         if info.nip11 == Some(false) {
             continue;
@@ -1070,9 +1107,7 @@ fn plan_batch(
             }
             // Skip both finished days and ones already handed to a worker:
             // day_done only becomes true once a unit completes.
-            if !state.day_done(&date, url)
-                && !in_flight.lock().unwrap().contains(&format!("{url}|{date}"))
-            {
+            if !state.day_done(&date, url) {
                 open_days.push((date, start, end));
             }
         }
@@ -1192,13 +1227,25 @@ async fn scrape_relay_day<S: Sink>(
         }
         Err(_) => {
             info.fails = info.fails.saturating_add(1);
-            if info.fails >= cfg.dead_after_fails {
-                let now = chrono::Utc::now().timestamp() as u64;
+            // Consecutive failures alone are not evidence a relay is gone.
+            //
+            // This network sits behind DDoS mitigation that drops SYN packets
+            // under concurrent connection bursts, which is exactly what fifty
+            // simultaneous relay dials look like. Retiring on three failures
+            // marked 543 relays dead -- damus, nos.lol, nostr.band among them
+            // -- while damus answers a TLS handshake from this pod on demand.
+            //
+            // A relay that has answered recently is having a bad minute, not a
+            // bad week. Require both: repeated failure *and* nothing
+            // successful for a full retry window.
+            let now = chrono::Utc::now().timestamp() as u64;
+            let quiet_for = now.saturating_sub(info.last_ok);
+            if info.fails >= cfg.dead_after_fails && quiet_for >= cfg.dead_for_secs {
                 info.dead_until = Some(now + cfg.dead_for_secs);
                 tracing::info!(
                     relay = url,
                     fails = info.fails,
-                    retry_in_secs = cfg.dead_for_secs,
+                    quiet_for,
                     "relay marked dead"
                 );
             }
@@ -1420,6 +1467,35 @@ mod scrape_concurrency_tests {
              first"
         );
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A relay that answered recently is not retired for a burst of failures.
+    ///
+    /// The network this runs on sits behind DDoS mitigation that drops SYNs
+    /// under concurrent connection bursts -- fifty simultaneous dials produce
+    /// exactly that. Retiring on three consecutive failures marked 543 relays
+    /// dead, including damus and nostr.band, while damus answers a TLS
+    /// handshake from the pod on demand.
+    #[test]
+    fn a_recently_working_relay_survives_a_burst_of_failures() {
+        let now = chrono::Utc::now().timestamp() as u64;
+        let cfg = super::ScrapeConfig::default();
+
+        // Answered a minute ago, then failed repeatedly: keep it.
+        let recent_ok = now - 60;
+        let quiet = now.saturating_sub(recent_ok);
+        assert!(
+            !(10 >= cfg.dead_after_fails && quiet >= cfg.dead_for_secs),
+            "a relay that answered a minute ago must not be retired for a burst"
+        );
+
+        // Nothing for well over a retry window, and failing: retire it.
+        let long_gone = now - cfg.dead_for_secs * 3;
+        let quiet = now.saturating_sub(long_gone);
+        assert!(
+            3 >= cfg.dead_after_fails && quiet >= cfg.dead_for_secs,
+            "a relay silent for days that keeps failing must be retired"
+        );
     }
 
     /// A dead relay is not drawn until its retry time passes.
@@ -1808,11 +1884,14 @@ mod scrape_concurrency_tests {
         assert_eq!(super::top_by_usage_weight(fresh, 80).len(), 2);
     }
 
-    /// A unit already handed to a worker must not be drawn again.
+    /// A relay already being scraped must not be drawn again.
     ///
     /// day_done only becomes true once a unit completes, so without an
-    /// in-flight guard the planner reissues work that is already running --
-    /// two connections to the same relay for the same day.
+    /// in-flight guard the planner reissues work that is already running. The
+    /// guard is keyed on the relay rather than the relay-day: concurrent units
+    /// for one relay share a connection in the pooled client, and the first to
+    /// finish closes it under the others, which records failures against a
+    /// relay that answered perfectly well.
     #[test]
     fn work_in_flight_is_not_redrawn() {
         let (st, dir) = state("inflight");
@@ -1825,14 +1904,15 @@ mod scrape_concurrency_tests {
 
         let first = super::plan_batch(&t, &st, &cfg, 1, &mut rng, win, &inflight);
         assert_eq!(first.len(), 1, "a fresh relay must yield work");
-        let (url, _, date, ..) = first[0].clone();
-        inflight.lock().unwrap().insert(format!("{url}|{date}"));
+        let (url, ..) = first[0].clone();
+        inflight.lock().unwrap().insert(url.clone());
 
         for _ in 0..50 {
-            for (u, _, d, ..) in super::plan_batch(&t, &st, &cfg, 5, &mut rng, win, &inflight) {
-                assert!(
-                    !(u == url && d == date),
-                    "{u} {d} is already running and must not be reissued"
+            for (u, ..) in super::plan_batch(&t, &st, &cfg, 5, &mut rng, win, &inflight) {
+                assert_ne!(
+                    u, url,
+                    "a relay already being scraped must not be drawn again, on \
+                     any day: the units would share and then close one connection"
                 );
             }
         }
