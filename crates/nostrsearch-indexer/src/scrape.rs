@@ -63,16 +63,6 @@ pub struct RelayInfo {
     /// When the NIP-11 check last ran (unix secs), so it can be redone.
     #[serde(default)]
     pub nip11_at: u64,
-    /// Unix secs of the most recent failed relay-day, for retry backoff.
-    ///
-    /// Failures must accumulate on a human timescale to mean anything. With a
-    /// narrow scope cut (tens of relays) and fifty worker slots, a failing
-    /// relay was redrawn the moment its unit ended: fifteen consecutive
-    /// failures -- the "never succeeded" retirement threshold -- took about
-    /// six minutes, and the whole in-scope set was marked dead in one burst.
-    /// A failed relay now waits out a backoff before it can be drawn again.
-    #[serde(default)]
-    pub last_fail: u64,
     /// Unix secs until which this relay is considered dead and not probed.
     ///
     /// A relay that refuses connections fails every draw it appears in, and
@@ -82,6 +72,62 @@ pub struct RelayInfo {
     /// immediately.
     #[serde(default)]
     pub dead_until: Option<u64>,
+    /// Unix secs of the most recent failed relay-day, for retry backoff.
+    ///
+    /// Failures must accumulate on a human timescale to mean anything. With a
+    /// narrow scope cut (tens of relays) and fifty worker slots, a failing
+    /// relay was redrawn the moment its unit ended: fifteen consecutive
+    /// failures -- the "never succeeded" retirement threshold -- took about
+    /// six minutes, and the whole in-scope set was marked dead in one burst.
+    /// A failed relay now waits out a backoff before it can be drawn again.
+    ///
+    /// **Must stay the last field.** These records are stored as bincode,
+    /// which is positional and not self-describing: `#[serde(default)]` does
+    /// nothing for it, and inserting a field mid-struct makes every
+    /// previously-written record undecodable. This field first shipped in the
+    /// middle of the struct and silently emptied the relay table in prod --
+    /// 8072 relays became 29, because `relays()` skips records that fail to
+    /// decode. Appending keeps old records decodable via
+    /// [`decode_relay_info`]'s legacy fallback (old blobs simply end early,
+    /// which bincode reports as EOF for the missing tail field).
+    #[serde(default)]
+    pub last_fail: u64,
+}
+
+/// Decode a stored [`RelayInfo`], accepting the previous on-disk layout.
+///
+/// Bincode is positional: a record written before `last_fail` existed is one
+/// `u64` short, so decoding it as the current struct fails with EOF. Fall
+/// back to the old layout and default the missing field, rather than treating
+/// every pre-upgrade relay record as corrupt and dropping it.
+pub fn decode_relay_info(v: &[u8]) -> Option<RelayInfo> {
+    if let Ok(info) = bincode::deserialize::<RelayInfo>(v) {
+        return Some(info);
+    }
+    #[derive(Deserialize)]
+    struct V1 {
+        sources: u32,
+        negentropy: Option<bool>,
+        cap: u32,
+        fails: u32,
+        last_ok: u64,
+        birthday: Option<u64>,
+        nip11: Option<bool>,
+        nip11_at: u64,
+        dead_until: Option<u64>,
+    }
+    bincode::deserialize::<V1>(v).ok().map(|o| RelayInfo {
+        sources: o.sources,
+        negentropy: o.negentropy,
+        cap: o.cap,
+        fails: o.fails,
+        last_ok: o.last_ok,
+        birthday: o.birthday,
+        nip11: o.nip11,
+        nip11_at: o.nip11_at,
+        dead_until: o.dead_until,
+        last_fail: 0,
+    })
 }
 
 /// One completed (relay, day), flattened for the status page.
@@ -178,7 +224,7 @@ impl ScrapeState {
                 break;
             }
             let url = String::from_utf8_lossy(&k[2..]).into_owned();
-            if let Ok(info) = bincode::deserialize::<RelayInfo>(&v) {
+            if let Some(info) = decode_relay_info(&v) {
                 out.push((url, info));
             }
         }
@@ -384,7 +430,7 @@ impl ScrapeState {
         let Ok(Some(v)) = self.db.get(&k) else {
             return false;
         };
-        let Ok(old) = bincode::deserialize::<RelayInfo>(&v) else {
+        let Some(old) = decode_relay_info(&v) else {
             return false;
         };
         let fresh = RelayInfo {
@@ -515,6 +561,59 @@ mod tests {
         assert_eq!(normalize_relay_url("wss://abc.onion"), None);
         assert_eq!(normalize_relay_url("wss://127.0.0.1:8080"), None);
         assert_eq!(normalize_relay_url("wss://localhost"), None);
+    }
+
+    /// Records written before `last_fail` existed must still decode.
+    ///
+    /// Bincode is positional; the first deploy of `last_fail` put it
+    /// mid-struct, every pre-upgrade record failed to decode, and the prod
+    /// relay table went from 8072 relays to 29 -- `relays()` silently skips
+    /// undecodable records. New fields go at the end and old blobs decode via
+    /// the legacy fallback.
+    #[test]
+    fn pre_upgrade_relay_records_still_decode() {
+        #[derive(serde::Serialize)]
+        struct V1 {
+            sources: u32,
+            negentropy: Option<bool>,
+            cap: u32,
+            fails: u32,
+            last_ok: u64,
+            birthday: Option<u64>,
+            nip11: Option<bool>,
+            nip11_at: u64,
+            dead_until: Option<u64>,
+        }
+        for dead_until in [None, Some(1_786_301_334u64)] {
+            let old = V1 {
+                sources: 533_200,
+                negentropy: Some(true),
+                cap: 500,
+                fails: 3,
+                last_ok: 1_786_212_005,
+                birthday: Some(1_652_832_000),
+                nip11: Some(true),
+                nip11_at: 1_786_000_000,
+                dead_until,
+            };
+            let bytes = bincode::serialize(&old).unwrap();
+            let got = super::decode_relay_info(&bytes)
+                .expect("a pre-upgrade record must decode, not be dropped");
+            assert_eq!(got.sources, 533_200);
+            assert_eq!(got.negentropy, Some(true));
+            assert_eq!(got.last_ok, 1_786_212_005);
+            assert_eq!(got.dead_until, dead_until);
+            assert_eq!(got.last_fail, 0, "missing field defaults, not garbage");
+        }
+
+        // And the current format round-trips with the new field intact.
+        let mut cur = super::RelayInfo::default();
+        cur.sources = 7;
+        cur.last_fail = 1_786_300_000;
+        let bytes = bincode::serialize(&cur).unwrap();
+        let got = super::decode_relay_info(&bytes).unwrap();
+        assert_eq!(got.last_fail, 1_786_300_000);
+        assert_eq!(got.sources, 7);
     }
 
     #[test]
