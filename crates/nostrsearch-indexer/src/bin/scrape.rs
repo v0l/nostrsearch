@@ -61,6 +61,10 @@ struct Args {
     #[arg(long, value_name = "PCT", default_value_t = 80)]
     usage_percentile: u32,
 
+    /// Where the cut starts while the backlog is large
+    #[arg(long, value_name = "PCT", default_value_t = 2)]
+    usage_percentile_min: u32,
+
     /// Concurrent relay/day queries (each relay walks its days serially)
     #[arg(long, value_name = "N", default_value_t = 50)]
     concurrency: usize,
@@ -324,6 +328,7 @@ async fn run(args: Args, state: Arc<ScrapeState>, sink: Arc<PipelineSink>) -> an
         concurrency: args.concurrency,
         empty_days_limit: args.birthday_days,
         usage_percentile: args.usage_percentile,
+        usage_percentile_min: args.usage_percentile_min,
         ..Default::default()
     };
     nostrsearch_indexer::scrape::run_pass(state, sink.clone(), cfg).await;

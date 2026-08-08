@@ -117,6 +117,8 @@ pub struct ScraperOptions {
     pub unit_timeout_secs: u64,
     /// Share of total advertisement weight to cover, as a percentage.
     pub usage_percentile: u32,
+    /// Where the cut starts while the backlog is large.
+    pub usage_percentile_min: u32,
     /// Idle time between passes once caught up.
     pub pass_interval: std::time::Duration,
     /// How often to re-run kind-10002 relay discovery.
@@ -153,6 +155,7 @@ impl ScraperOptions {
             dead_for_secs: u("SCRAPE_DEAD_FOR_HOURS", 24) * 3600,
             unit_timeout_secs: u("SCRAPE_UNIT_TIMEOUT_SECS", 180),
             usage_percentile: u("SCRAPE_USAGE_PERCENTILE", 80) as u32,
+            usage_percentile_min: u("SCRAPE_USAGE_PERCENTILE_MIN", 2) as u32,
             pass_interval: std::time::Duration::from_secs(u("SCRAPE_PASS_INTERVAL_SECS", 1800)),
             rediscover_interval: std::time::Duration::from_secs(u(
                 "SCRAPE_REDISCOVER_SECS",
@@ -277,6 +280,7 @@ pub fn spawn_scraper(
                     // is attacker-controlled (invented paths on real hosts),
                     // the weight is not.
                     usage_percentile: opts.usage_percentile,
+                    usage_percentile_min: opts.usage_percentile_min,
                 };
                 nostrsearch_indexer::scrape::run_pass(state.clone(), node_sink.clone(), cfg).await;
                 tracing::info!(

@@ -603,7 +603,21 @@ pub struct ScrapeConfig {
     /// length.
     ///
     /// 100 disables the cut.
+    ///
+    /// Used as the *ceiling* when adaptive widening is on: see
+    /// [`usage_percentile_min`](Self::usage_percentile_min).
     pub usage_percentile: u32,
+    /// Where the cut starts while the backlog is large.
+    ///
+    /// With years of history unscraped, covering 80% of advertisement weight
+    /// spreads the workers over thousands of relays and finishes none of them.
+    /// Starting at a few percent means only the relays carrying the most usage
+    /// are touched, so their history completes; the cut then widens toward
+    /// `usage_percentile` as coverage fills in, bringing in progressively
+    /// less-advertised relays once the important ones are done.
+    ///
+    /// Set equal to `usage_percentile` to disable widening and pin the cut.
+    pub usage_percentile_min: u32,
 }
 
 impl Default for ScrapeConfig {
@@ -617,6 +631,7 @@ impl Default for ScrapeConfig {
             dead_for_secs: 24 * 3600,
             unit_timeout_secs: 180,
             usage_percentile: 80,
+            usage_percentile_min: 2,
         }
     }
 }
@@ -630,11 +645,31 @@ pub async fn run_pass<S: Sink>(
     cfg: ScrapeConfig,
 ) {
     let all_relays = state.relays().len();
-    let scraped_relays = top_by_usage_weight(state.relays(), cfg.usage_percentile).len();
+
+    // How far along is the backlog? Coverage is measured against the relays
+    // the *current* cut keeps, so the two converge over successive passes:
+    // a narrow cut completes quickly, which widens the next one.
+    let progress = state.progress(0);
+    let now_probe = chrono::Utc::now().timestamp() as u64;
+    let today_probe = now_probe - (now_probe % 86_400);
+    let total_days = today_probe.saturating_sub(cfg.min_date) / 86_400;
+    let kept_at_min = top_by_usage_weight(state.relays(), cfg.usage_percentile_min).len() as u64;
+    let expected = kept_at_min.saturating_mul(total_days.max(1));
+    let percentile = adaptive_percentile(
+        progress.relay_days,
+        expected,
+        cfg.usage_percentile_min,
+        cfg.usage_percentile,
+    );
+
+    let scraped_relays = top_by_usage_weight(state.relays(), percentile).len();
     tracing::info!(
         relays = scraped_relays,
         discovered = all_relays,
-        usage_percentile = cfg.usage_percentile,
+        percentile,
+        floor = cfg.usage_percentile_min,
+        ceiling = cfg.usage_percentile,
+        relay_days_done = progress.relay_days,
         "scrape pass starting"
     );
 
@@ -702,7 +737,7 @@ pub async fn run_pass<S: Sink>(
         // the relay reverted to unprobed. It also meant `dead_until` was never
         // visible to later batches, so a dead relay kept being drawn for the
         // whole pass -- the retirement did nothing.
-        let targets = top_by_usage_weight(state.relays(), cfg.usage_percentile);
+        let targets = top_by_usage_weight(state.relays(), percentile);
         let mut batch = plan_batch(
             &targets, &state, &cfg, batch_size, &mut rng, window, &in_flight,
         );
@@ -825,6 +860,29 @@ pub fn top_by_usage_weight(
     }
     targets.truncate(keep.max(1));
     targets
+}
+
+/// Widen the usage cut as the backlog drains.
+///
+/// `done` is completed relay-days, `expected` what full coverage of the
+/// currently-kept relays over the whole date range would take. While that
+/// ratio is small the cut sits at `min`, so the workers concentrate on the
+/// relays carrying the most usage and actually finish them. As coverage
+/// approaches complete it climbs to `max`, pulling in the longer tail.
+///
+/// Deliberately monotonic in coverage: a cut that narrowed again would drop
+/// relays mid-history and leave them permanently half-scraped, which is the
+/// same failure the deterministic tie-break exists to prevent.
+pub fn adaptive_percentile(done: u64, expected: u64, min: u32, max: u32) -> u32 {
+    if max <= min {
+        return max;
+    }
+    if expected == 0 {
+        // Nothing known about the workload yet; start conservative.
+        return min;
+    }
+    let frac = (done as f64 / expected as f64).clamp(0.0, 1.0);
+    min + (f64::from(max - min) * frac).round() as u32
 }
 
 /// One unit of work: a relay and the day to fetch from it.
@@ -1332,6 +1390,35 @@ mod scrape_concurrency_tests {
             assert_eq!(b[0].2, open, "and it must be that day");
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The cut starts narrow and widens as the backlog drains.
+    #[test]
+    fn the_cut_widens_as_coverage_fills_in() {
+        // Nothing scraped yet: sit at the floor, so the workers concentrate on
+        // the relays carrying the most usage instead of spreading over
+        // thousands and finishing none.
+        assert_eq!(super::adaptive_percentile(0, 1_000_000, 2, 80), 2);
+        // Half covered: half way out.
+        assert_eq!(super::adaptive_percentile(500_000, 1_000_000, 2, 80), 41);
+        // Complete: the full ceiling, pulling in the long tail.
+        assert_eq!(super::adaptive_percentile(1_000_000, 1_000_000, 2, 80), 80);
+        // Over-complete (relays scraped that the current cut no longer keeps)
+        // must clamp rather than overshoot the ceiling.
+        assert_eq!(super::adaptive_percentile(9_000_000, 1_000_000, 2, 80), 80);
+
+        // Monotonic in coverage: a cut that narrowed again would drop relays
+        // mid-history and leave them permanently half-scraped.
+        let mut last = 0;
+        for i in 0..=20u64 {
+            let p = super::adaptive_percentile(i * 50_000, 1_000_000, 2, 80);
+            assert!(p >= last, "percentile went backwards at {i}: {p} < {last}");
+            last = p;
+        }
+
+        // Degenerate inputs.
+        assert_eq!(super::adaptive_percentile(0, 0, 2, 80), 2, "unknown workload starts narrow");
+        assert_eq!(super::adaptive_percentile(0, 100, 80, 80), 80, "equal bounds pins the cut");
     }
 
     /// The cut covers a share of usage, not a share of the relay list.
