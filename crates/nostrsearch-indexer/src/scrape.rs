@@ -587,6 +587,16 @@ pub struct ScrapeConfig {
     /// Hard cap on one relay-day, in seconds. A relay that connects and then
     /// stalls would otherwise hold a worker slot for the rest of the pass.
     pub unit_timeout_secs: u64,
+    /// Percentage of relays to scrape, most-advertised first.
+    ///
+    /// Discovery is uncapped and finds ~8000 relays, but advertisement is
+    /// heavily skewed: the tail is largely dead hosts, personal relays and
+    /// one-off test instances that cost a connection, a sync and a timeout
+    /// each to learn nothing. Scraping the top half spends the same worker
+    /// slots on the relays people actually publish to.
+    ///
+    /// 100 disables the cut.
+    pub top_percent: u32,
 }
 
 impl Default for ScrapeConfig {
@@ -599,6 +609,7 @@ impl Default for ScrapeConfig {
             dead_after_fails: 3,
             dead_for_secs: 24 * 3600,
             unit_timeout_secs: 180,
+            top_percent: 50,
         }
     }
 }
@@ -611,7 +622,14 @@ pub async fn run_pass<S: Sink>(
     sink: std::sync::Arc<S>,
     cfg: ScrapeConfig,
 ) {
-    tracing::info!(relays = state.relays().len(), "scrape pass starting");
+    let all_relays = state.relays().len();
+    let scraped_relays = top_by_sources(state.relays(), cfg.top_percent).len();
+    tracing::info!(
+        relays = scraped_relays,
+        discovered = all_relays,
+        top_percent = cfg.top_percent,
+        "scrape pass starting"
+    );
 
     // Work is a (relay, day) pair drawn at random, run in batches of at most
     // `concurrency`.
@@ -677,7 +695,7 @@ pub async fn run_pass<S: Sink>(
         // the relay reverted to unprobed. It also meant `dead_until` was never
         // visible to later batches, so a dead relay kept being drawn for the
         // whole pass -- the retirement did nothing.
-        let targets = state.relays();
+        let targets = top_by_sources(state.relays(), cfg.top_percent);
         let mut batch = plan_batch(
             &targets, &state, &cfg, batch_size, &mut rng, window, &in_flight,
         );
@@ -756,6 +774,27 @@ pub fn block_window(today_start: u64, k: u64) -> (u64, u64) {
     let end = today_start.saturating_sub(k * BLOCK_DAYS * 86_400);
     let start = end.saturating_sub(BLOCK_DAYS * 86_400);
     (start, end)
+}
+
+/// Keep the most-advertised `percent` of relays.
+///
+/// Sorted by advertiser count, ties broken on url so the cut is deterministic
+/// -- an unstable boundary would move relays in and out of scope between
+/// passes and leave their history permanently half-scraped.
+///
+/// Never returns empty for a non-empty input: a rounding-down cut on a small
+/// relay set would otherwise stop the scraper entirely.
+pub fn top_by_sources(
+    mut targets: Vec<(String, RelayInfo)>,
+    percent: u32,
+) -> Vec<(String, RelayInfo)> {
+    if percent >= 100 || targets.is_empty() {
+        return targets;
+    }
+    targets.sort_by(|a, b| b.1.sources.cmp(&a.1.sources).then_with(|| a.0.cmp(&b.0)));
+    let keep = ((targets.len() * percent as usize) / 100).max(1);
+    targets.truncate(keep);
+    targets
 }
 
 /// One unit of work: a relay and the day to fetch from it.
@@ -1263,6 +1302,50 @@ mod scrape_concurrency_tests {
             assert_eq!(b[0].2, open, "and it must be that day");
         }
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The cut keeps the most-advertised relays and is stable across passes.
+    #[test]
+    fn the_relay_cut_keeps_the_most_advertised_and_is_deterministic() {
+        let mk = |url: &str, n: u32| {
+            let mut i = super::RelayInfo::default();
+            i.sources = n;
+            (url.to_string(), i)
+        };
+        let all = vec![
+            mk("wss://d.example", 1),
+            mk("wss://a.example", 900),
+            mk("wss://c.example", 5),
+            mk("wss://b.example", 100),
+        ];
+
+        let kept = super::top_by_sources(all.clone(), 50);
+        let urls: Vec<&str> = kept.iter().map(|(u, _)| u.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec!["wss://a.example", "wss://b.example"],
+            "the cut must keep the most-advertised half"
+        );
+
+        // Stability matters: a boundary that moves between passes leaves the
+        // relays either side of it permanently half-scraped.
+        for _ in 0..20 {
+            let again = super::top_by_sources(all.clone(), 50);
+            assert_eq!(
+                again.iter().map(|(u, _)| u.clone()).collect::<Vec<_>>(),
+                kept.iter().map(|(u, _)| u.clone()).collect::<Vec<_>>(),
+                "the same input must always yield the same cut"
+            );
+        }
+
+        // 100 disables it; a tiny set must never cut to nothing.
+        assert_eq!(super::top_by_sources(all.clone(), 100).len(), 4);
+        assert_eq!(
+            super::top_by_sources(vec![mk("wss://only.example", 3)], 50).len(),
+            1,
+            "rounding down must not stop the scraper on a small relay set"
+        );
+        assert!(super::top_by_sources(vec![], 50).is_empty());
     }
 
     /// A unit already handed to a worker must not be drawn again.

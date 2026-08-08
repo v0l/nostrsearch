@@ -115,6 +115,8 @@ pub struct ScraperOptions {
     pub dead_for_secs: u64,
     /// Hard cap on one relay-day, in seconds.
     pub unit_timeout_secs: u64,
+    /// Percentage of relays to scrape, most-advertised first.
+    pub top_percent: u32,
     /// Idle time between passes once caught up.
     pub pass_interval: std::time::Duration,
     /// How often to re-run kind-10002 relay discovery.
@@ -150,6 +152,7 @@ impl ScraperOptions {
             dead_after_fails: u("SCRAPE_DEAD_AFTER_FAILS", 3) as u32,
             dead_for_secs: u("SCRAPE_DEAD_FOR_HOURS", 24) * 3600,
             unit_timeout_secs: u("SCRAPE_UNIT_TIMEOUT_SECS", 180),
+            top_percent: u("SCRAPE_TOP_PERCENT", 50) as u32,
             pass_interval: std::time::Duration::from_secs(u("SCRAPE_PASS_INTERVAL_SECS", 1800)),
             rediscover_interval: std::time::Duration::from_secs(u(
                 "SCRAPE_REDISCOVER_SECS",
@@ -270,6 +273,9 @@ pub fn spawn_scraper(
                     // A relay that connects then stalls must not hold a
                     // worker slot for the rest of the pass.
                     unit_timeout_secs: opts.unit_timeout_secs,
+                    // The advertisement tail is mostly dead hosts and one-off
+                    // test relays; the same slots do more on the top half.
+                    top_percent: opts.top_percent,
                 };
                 nostrsearch_indexer::scrape::run_pass(state.clone(), node_sink.clone(), cfg).await;
                 tracing::info!(
