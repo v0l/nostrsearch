@@ -151,12 +151,41 @@ pub fn sync_router(state: std::sync::Arc<nostrsearch_indexer::scrape::ScrapeStat
     Router::new().route("/", get(sync_status)).with_state(state)
 }
 
+/// How much of the scrape horizon is left.
+///
+/// "Relay-days" is the unit of scrape work: one relay, one day. The total is
+/// the relays currently in scope times the days between the configured floor
+/// and yesterday, so it moves when the cut widens -- which is the honest
+/// number, since a narrower cut genuinely has less to do.
+#[derive(Serialize)]
+struct Horizon {
+    /// Relays currently in scope (after the usage-weight cut).
+    relays: usize,
+    /// Relays discovered in total, in or out of scope.
+    relays_discovered: usize,
+    /// Days between the floor and yesterday.
+    days: u64,
+    /// relays x days: the whole job at the current cut.
+    relay_days_total: u64,
+    /// Completed, counting only relays currently in scope.
+    relay_days_done: u64,
+    /// Still to do.
+    relay_days_remaining: u64,
+    /// 0-100.
+    percent_complete: u32,
+    /// The cut in force, and its bounds.
+    usage_percentile: u32,
+    oldest_day: String,
+}
+
 #[derive(Serialize)]
 struct SyncStatus {
     /// Relays discovered from kind-10002 lists, and how they are behaving.
     relays: SyncRelays,
     /// Day-by-day backfill coverage.
     scrape: nostrsearch_indexer::scrape::ScrapeProgress,
+    /// How much scraping is left.
+    horizon: Horizon,
 }
 
 /// Page controls for the relay list.
@@ -250,7 +279,63 @@ async fn sync_status(
         top.sort_by(|a, b| b.sources.cmp(&a.sources).then_with(|| a.url.cmp(&b.url)));
         let top: Vec<SyncRelay> = top.into_iter().skip(offset).take(limit).collect();
 
+        // Same cut the scraper applies, so the figure describes the work it
+        // will actually do rather than a hypothetical full sweep.
+        let env_u = |k: &str, d: u64| {
+            std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
+        };
+        let min_date = std::env::var("SCRAPE_MIN_DATE")
+            .ok()
+            .and_then(|v| nostrsearch_indexer::scrape::parse_date(&v))
+            .unwrap_or_else(|| {
+                nostrsearch_indexer::scrape::parse_date("2022-01-01").unwrap_or(0)
+            });
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let today = now - (now % 86_400);
+        let days = today.saturating_sub(min_date) / 86_400;
+
+        let floor_p = env_u("SCRAPE_USAGE_PERCENTILE_MIN", 2) as u32;
+        let ceil_p = env_u("SCRAPE_USAGE_PERCENTILE", 80) as u32;
+        let kept_at_floor =
+            nostrsearch_indexer::scrape::top_by_usage_weight(relays.clone(), floor_p).len() as u64;
+        let cut = nostrsearch_indexer::scrape::adaptive_percentile(
+            progress.relay_days,
+            kept_at_floor.saturating_mul(days.max(1)),
+            floor_p,
+            ceil_p,
+        );
+        let kept = nostrsearch_indexer::scrape::top_by_usage_weight(relays.clone(), cut);
+        // Count only the days done for relays still in scope: days scraped
+        // from a relay the cut has since dropped are not progress toward the
+        // job that remains.
+        let done: u64 = kept
+            .iter()
+            .map(|(url, _)| progress.by_relay.get(url).map(|t| t.days).unwrap_or(0))
+            .sum();
+        let total = (kept.len() as u64).saturating_mul(days);
+        let horizon = Horizon {
+            relays: kept.len(),
+            relays_discovered: relays.len(),
+            days,
+            relay_days_total: total,
+            relay_days_done: done.min(total),
+            relay_days_remaining: total.saturating_sub(done),
+            percent_complete: if total == 0 {
+                100
+            } else {
+                ((done.min(total) * 100) / total) as u32
+            },
+            usage_percentile: cut,
+            oldest_day: chrono::DateTime::from_timestamp(min_date as i64, 0)
+                .map(|d| d.format("%Y-%m-%d").to_string())
+                .unwrap_or_default(),
+        };
+
         SyncStatus {
+            horizon,
             relays: SyncRelays {
                 total: relays.len(),
                 negentropy: relays

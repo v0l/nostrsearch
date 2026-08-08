@@ -33,6 +33,19 @@ export interface DayEntry {
   at: number;
 }
 
+/** How much of the scrape horizon is left, at the cut currently in force. */
+export interface Horizon {
+  relays: number;
+  relays_discovered: number;
+  days: number;
+  relay_days_total: number;
+  relay_days_done: number;
+  relay_days_remaining: number;
+  percent_complete: number;
+  usage_percentile: number;
+  oldest_day: string;
+}
+
 export interface ScrapeProgress {
   days: number;
   relay_days: number;
@@ -71,6 +84,7 @@ export interface SyncStatus {
     top: SyncRelay[];
   };
   scrape: ScrapeProgress;
+  horizon: Horizon;
 }
 
 export interface AnalysisStatus {

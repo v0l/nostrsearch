@@ -11,6 +11,53 @@ import { Bars, Chip, ConfirmButton, Panel, ago, compact, num, useNotify } from "
  * Secondary to everything the reports say — this is how the corpus is being
  * filled, not what is in it.
  */
+/**
+ * How much scraping is left, and how wide the net currently is.
+ *
+ * The scraper does not sweep every discovered relay: it ranks them by how
+ * many people advertise them and covers a share of that weight, starting
+ * narrow so the most-used relays actually finish, then widening as the
+ * backlog drains. Without showing the cut, "relays: 40 of 8072" reads as a
+ * fault rather than the intended behaviour.
+ */
+function HorizonPanel({ sync }: { sync: SyncStatus | null }) {
+  const h = sync?.horizon;
+  if (!h) return null;
+  const pct = Math.max(0, Math.min(100, h.percent_complete));
+
+  return (
+    <>
+      <div class="row tight" style={{ marginBottom: "10px" }}>
+        <Chip tone={h.relay_days_remaining > 0 ? "mute" : "ok"}>
+          {compact(h.relay_days_remaining)} relay-days left
+        </Chip>
+        <Chip tone="mute">
+          {compact(h.relay_days_done)} / {compact(h.relay_days_total)} done
+        </Chip>
+        <Chip tone="mute">
+          {num(h.relays)} of {num(h.relays_discovered)} relays &middot; top{" "}
+          {h.usage_percentile}% by usage
+        </Chip>
+        <Chip tone="mute">
+          {h.oldest_day} &rarr; now &middot; {num(h.days)} days
+        </Chip>
+      </div>
+      <div
+        class="hbar"
+        title={`${pct}% of the current horizon scraped`}
+        aria-label={`${pct}% complete`}
+      >
+        <span style={{ width: `${pct}%` }} />
+      </div>
+      <p class="panel-note" style={{ marginTop: "6px" }}>
+        Relays are ranked by how many people advertise them; the cut starts
+        narrow so the most-used finish first, then widens as coverage fills in.
+        The total moves when it widens.
+      </p>
+    </>
+  );
+}
+
 function Backfill({ sync }: { sync: SyncStatus | null }) {
   const byDay = new Map<string, { seen: number; fresh: number; relays: number }>();
   for (const d of sync?.scrape.recent ?? []) {
@@ -172,6 +219,7 @@ export function Relays({
       aside={sync ? `${num(sync.relays.failing)} failing` : undefined}
       note="Relays discovered from published relay lists, ranked by how many people advertise them. Forgetting a relay clears what the scraper learned about it — horizon, failures and page size — and it starts over."
     >
+      <HorizonPanel sync={sync} />
       <Backfill sync={sync} />
       <RecentDays sync={sync} />
 

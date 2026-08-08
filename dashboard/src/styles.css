@@ -945,3 +945,9 @@ body.page .readout .v.mute {
 .feed-new { font-style: normal; color: var(--patina); }
 .sub-note { font-weight: 400; font-size: 11px; color: var(--slate);
   margin-left: 8px; letter-spacing: 0; }
+
+/* Horizon completion bar: how much of the scrape range is done. */
+.hbar { display: block; height: 6px; background: var(--wash);
+  border: 1px solid var(--rule); border-radius: 3px; overflow: hidden; }
+.hbar > span { display: block; height: 100%; background: var(--patina);
+  transition: width .4s ease; }
