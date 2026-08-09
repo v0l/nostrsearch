@@ -1089,14 +1089,18 @@ pub async fn run_pass<S: Sink>(
         Default::default();
     let unit_timeout = std::time::Duration::from_secs(cfg.unit_timeout_secs);
 
-    // Fill newest-first, one fixed block of days at a time.
+    // Fill newest-first, but per relay, not as a cohort.
     //
-    // Within a month days are still drawn at random, which is what keeps every
-    // relay advancing together instead of one relay monopolising the workers.
-    // Across blocks the order is deliberate: a window is finished before the
-    // next one back is opened, so recent history -- the part anyone is
-    // actually searching -- completes first and coverage has a definite edge
-    // rather than being uniformly sparse over four years.
+    // Each relay walks its own block sequence backwards from yesterday via a
+    // cursor in `blocks`. A single global window shared by all relays made
+    // the block boundary a barrier: relays that finished the current block
+    // sat idle until the last straggler finished its final heavy day --
+    // observed as 3 units in flight with 50 workers configured. Per-relay
+    // cursors keep every healthy relay continuously busy while still filling
+    // each relay's recent history before its older history.
+    //
+    // Within a block days are drawn at random, which keeps relays on the
+    // same block interleaved rather than marching in lockstep.
     // One client for the pass. `Client` owns a relay pool and manages its
     // connections internally, so building one per relay-day meant constructing
     // and tearing down a pool 50 at a time, continuously, for the whole run --
@@ -1107,10 +1111,8 @@ pub async fn run_pass<S: Sink>(
     // drives the same pool.
     let client = nostr_sdk::Client::default();
 
-    let now0 = chrono::Utc::now().timestamp() as u64;
-    let today_start = now0 - (now0 % 86_400);
-    let mut block = 0u64;
-    let mut window = block_window(today_start, block);
+    // Per-relay block cursors, shared by every replan in this pass.
+    let blocks: std::sync::Arc<BlockCursor> = Default::default();
 
     loop {
         // Re-read between batches rather than working from one snapshot taken
@@ -1127,30 +1129,31 @@ pub async fn run_pass<S: Sink>(
         // RocksDB. Run on an async worker it starves the runtime -- the HTTP
         // server stopped being scheduled entirely, /healthz included, while
         // the process sat at 7 GB with no restarts.
-        let (targets, mut batch) = {
+        let mut batch = {
             let state = state.clone();
             let cfg = cfg.clone();
             let in_flight = in_flight.clone();
+            let blocks = blocks.clone();
             let mut prng = <rand::rngs::StdRng as rand::SeedableRng>::from_entropy();
             tokio::task::spawn_blocking(move || {
                 let targets = top_by_usage_weight(state.relays(), percentile, cfg.concurrency);
-                let batch = plan_batch(
-                    &targets, &state, &cfg, batch_size, &mut prng, window, &in_flight,
-                );
-                (targets, batch)
+                plan_batch(
+                    &targets, &state, &cfg, batch_size, &mut prng, &blocks, &in_flight,
+                )
             })
             .await
-            .unwrap_or_else(|_| (Vec::new(), Vec::new()))
+            .unwrap_or_default()
         };
 
         // An empty batch can mean two different things, and conflating them
         // ends the pass early.
         //
         // With one unit in flight per relay, a batch comes back empty as soon
-        // as every relay is busy -- which is the normal steady state, not an
-        // exhausted window. Wait for a slot instead: the units running now
-        // will free relays to draw again. Only when nothing is in flight does
-        // an empty batch mean this window really has no work left.
+        // as every drawable relay is busy or backing off -- normal steady
+        // state, not an exhausted corpus. Wait and replan: finishing units
+        // free their relays, and expiring backoffs return relays to the pool.
+        // Only an empty batch with nothing in flight means this pass has no
+        // work left anywhere.
         while batch.is_empty() && !in_flight.lock().unwrap().is_empty() {
             // A second between attempts, and the scan itself off the runtime:
             // re-planning at 250ms with a full RocksDB sweep each time is what
@@ -1159,39 +1162,13 @@ pub async fn run_pass<S: Sink>(
             let state = state.clone();
             let cfg = cfg.clone();
             let in_flight = in_flight.clone();
-            let targets = targets.clone();
+            let blocks = blocks.clone();
             let mut prng = <rand::rngs::StdRng as rand::SeedableRng>::from_entropy();
             batch = tokio::task::spawn_blocking(move || {
+                let targets = top_by_usage_weight(state.relays(), percentile, cfg.concurrency);
                 plan_batch(
-                    &targets, &state, &cfg, batch_size, &mut prng, window, &in_flight,
+                    &targets, &state, &cfg, batch_size, &mut prng, &blocks, &in_flight,
                 )
-            })
-            .await
-            .unwrap_or_default();
-        }
-
-        // Nothing running and nothing to draw: this window is genuinely done.
-        // Step back, until the window falls off the configured floor.
-        while batch.is_empty() {
-            if window.0 <= cfg.min_date {
-                break;
-            }
-            block += 1;
-            window = block_window(today_start, block);
-            tracing::info!(
-                block,
-                window_start = window.0,
-                window_end = window.1,
-                scraped,
-                "scrape window complete; moving back a block"
-            );
-            let st = state.clone();
-            let c = cfg.clone();
-            let inf = in_flight.clone();
-            let tg = targets.clone();
-            let mut prng = <rand::rngs::StdRng as rand::SeedableRng>::from_entropy();
-            batch = tokio::task::spawn_blocking(move || {
-                plan_batch(&tg, &st, &c, batch_size, &mut prng, window, &inf)
             })
             .await
             .unwrap_or_default();
@@ -1461,7 +1438,28 @@ pub fn fail_backoff_secs(fails: u32) -> u64 {
 /// One unit of work: a relay and the day to fetch from it.
 type RelayDay = (String, RelayInfo, String, u64, u64);
 
-/// Draw up to `limit` relay-days at random.
+/// Per-relay position in the backwards block walk, shared across the
+/// replans of one pass.
+///
+/// `url -> k` means blocks `0..k` (the newest `k * BLOCK_DAYS` days) are
+/// complete for that relay and the next open day is in block `k` or older.
+/// `u64::MAX` means the relay's whole range is done. Purely a scan cursor:
+/// losing it costs one re-scan from block 0, never correctness, which is why
+/// it lives in memory and resets each pass.
+type BlockCursor = std::sync::Mutex<std::collections::HashMap<String, u64>>;
+
+/// Draw up to `limit` relay-days, each relay walking **its own** newest-first
+/// block sequence.
+///
+/// The walk used to be a single global window shared by every relay, stepped
+/// back only when *no* relay had work left in it and nothing was in flight.
+/// That made the block boundary a cohort barrier: relays that finished the
+/// current block sat idle -- not drawable, their older days out of window --
+/// until the last straggler ground through its final heavy day. Observed in
+/// prod as 3 units in flight with 50 workers configured and 80,000 relay-days
+/// outstanding. Per-relay cursors keep every healthy relay busy continuously
+/// while preserving the property that matters: each relay fills its own
+/// recent history before its older history.
 ///
 /// Days already recorded and days before `min_date` are not candidates.
 /// Relays are sampled without replacement within a batch so one relay cannot
@@ -1472,7 +1470,7 @@ fn plan_batch(
     cfg: &ScrapeConfig,
     limit: usize,
     rng: &mut impl rand::Rng,
-    window: (u64, u64),
+    blocks: &BlockCursor,
     in_flight: &std::sync::Mutex<std::collections::HashSet<String>>,
 ) -> Vec<RelayDay> {
     use rand::seq::SliceRandom;
@@ -1515,50 +1513,54 @@ fn plan_batch(
             continue;
         }
 
-        // Days are drawn from the current window only, newest window first.
-        // Complete randomness across the whole corpus spread every relay
-        // thinly over four years, so nothing was ever finished and recent
-        // history -- the part anyone is actually searching -- filled at the
-        // same glacial rate as 2022.
-        let lo = window.0.max(cfg.min_date);
-        let hi = window.1.min(today_start);
-        if lo >= hi {
-            continue;
-        }
-        let span_days = (hi - lo) / 86_400;
-        if span_days == 0 {
-            continue;
-        }
-
-        // Enumerate the window's unfinished days, then pick one at random.
-        //
-        // This used to take 8 random draws and give up. Once a window was
-        // mostly complete those draws kept landing on finished days, the relay
-        // yielded nothing, and if that held for every relay the batch came
-        // back empty -- which the caller reads as "window exhausted" and steps
-        // past, permanently, with days still unscraped. Enough windows falsely
-        // exhausted and the pass ends and the scraper goes idle.
-        //
-        // A window is BLOCK_DAYS wide, so this is at most 30 `day_done`
-        // lookups against RocksDB: cheaper than the relay query it schedules,
-        // and it cannot report exhaustion that is not real.
-        let mut open_days: Vec<(String, u64, u64)> = Vec::new();
-        for off in 0..span_days {
-            let start = lo + off * 86_400;
-            let back = (today_start - start) / 86_400;
-            let (date, start, end) = day_bounds(back);
-            if start < lo || start >= hi {
-                continue;
+        // Walk this relay's blocks from its cursor, newest first, to the
+        // first block with an open day. Enumerating a block is at most
+        // BLOCK_DAYS `day_done` lookups, and the cursor means a completed
+        // block is walked past once per pass, not once per draw.
+        let mut k = blocks.lock().unwrap().get(url).copied().unwrap_or(0);
+        let mut picked: Option<(String, u64, u64)> = None;
+        while k != u64::MAX {
+            let (w_lo, w_hi) = block_window(today_start, k);
+            if w_hi <= cfg.min_date {
+                // Ran off the configured floor: everything this relay can be
+                // asked for is done. Park the cursor so the scan never runs
+                // again this pass.
+                k = u64::MAX;
+                break;
             }
-            // Skip both finished days and ones already handed to a worker:
-            // day_done only becomes true once a unit completes.
-            if !state.day_done(&date, url) {
-                open_days.push((date, start, end));
+            let lo = w_lo.max(cfg.min_date);
+            let hi = w_hi.min(today_start);
+            if lo < hi {
+                // Enumerate the block's unfinished days, then pick one at
+                // random. Enumeration (not sampling) is deliberate: a sampler
+                // that gives up can report exhaustion that is not real, and a
+                // falsely-exhausted block would advance the cursor past days
+                // still unscraped.
+                let mut open_days: Vec<(String, u64, u64)> = Vec::new();
+                for off in 0..(hi - lo) / 86_400 {
+                    let start = lo + off * 86_400;
+                    let back = (today_start - start) / 86_400;
+                    let (date, start, end) = day_bounds(back);
+                    if start < lo || start >= hi {
+                        continue;
+                    }
+                    // day_done only becomes true once a unit completes; the
+                    // in-flight guard above covers the day being worked now.
+                    if !state.day_done(&date, url) {
+                        open_days.push((date, start, end));
+                    }
+                }
+                // Random *within* the block still, so relays on the same
+                // block stay interleaved rather than marching in lockstep.
+                if let Some(day) = open_days.choose(rng).cloned() {
+                    picked = Some(day);
+                    break;
+                }
             }
+            k += 1;
         }
-        // Random *within* the window still, so relays stay interleaved rather
-        // than every one of them marching the same day in lockstep.
-        if let Some((date, start, end)) = open_days.choose(rng).cloned() {
+        blocks.lock().unwrap().insert(url.clone(), k);
+        if let Some((date, start, end)) = picked {
             out.push((url.clone(), info.clone(), date, start, end));
         }
     }
@@ -1996,10 +1998,10 @@ mod scrape_concurrency_tests {
         let t = targets(200);
         let cfg = super::ScrapeConfig::default();
         let mut rng = rand::thread_rng();
-        let win = (0u64, u64::MAX); // whole corpus, for tests about other rules
+        let blocks = super::BlockCursor::default();
         let inflight = std::sync::Mutex::new(std::collections::HashSet::new());
 
-        let batch = super::plan_batch(&t, &st, &cfg, 50, &mut rng, win, &inflight);
+        let batch = super::plan_batch(&t, &st, &cfg, 50, &mut rng, &blocks, &inflight);
         assert!(batch.len() <= 50, "batch must not exceed the limit");
         assert!(batch.len() > 40, "should fill a batch from 200 fresh relays");
 
@@ -2021,7 +2023,7 @@ mod scrape_concurrency_tests {
         let t = targets(1);
         let cfg = super::ScrapeConfig::default();
         let mut rng = rand::thread_rng();
-        let win = (0u64, u64::MAX); // whole corpus, for tests about other rules
+        let blocks = super::BlockCursor::default();
         let inflight = std::sync::Mutex::new(std::collections::HashSet::new());
 
         // Record every day this relay could be asked for.
@@ -2035,7 +2037,7 @@ mod scrape_concurrency_tests {
 
         for _ in 0..20 {
             assert!(
-                super::plan_batch(&t, &st, &cfg, 50, &mut rng, win, &inflight).is_empty(),
+                super::plan_batch(&t, &st, &cfg, 50, &mut rng, &blocks, &inflight).is_empty(),
                 "a fully-scraped relay must yield no work"
             );
         }
@@ -2061,12 +2063,12 @@ mod scrape_concurrency_tests {
         let t = vec![("wss://r.example".to_string(), info)];
         let cfg = super::ScrapeConfig::default();
         let mut rng = rand::thread_rng();
-        let win = (0u64, u64::MAX); // whole corpus, for tests about other rules
+        let blocks = super::BlockCursor::default();
         let inflight = std::sync::Mutex::new(std::collections::HashSet::new());
 
         let mut saw_older = false;
         for _ in 0..200 {
-            for (_, _, _, start, _) in super::plan_batch(&t, &st, &cfg, 10, &mut rng, win, &inflight) {
+            for (_, _, _, start, _) in super::plan_batch(&t, &st, &cfg, 10, &mut rng, &blocks, &inflight) {
                 assert!(start >= cfg.min_date, "drew below the configured floor");
                 if start < birthday {
                     saw_older = true;
@@ -2135,12 +2137,12 @@ mod scrape_concurrency_tests {
         ];
         let cfg = super::ScrapeConfig::default();
         let mut rng = rand::thread_rng();
-        let win = super::block_window(now - (now % 86_400), 0);
+        let blocks = super::BlockCursor::default();
         let inflight = std::sync::Mutex::new(std::collections::HashSet::new());
 
         let mut saw_cool = false;
         for _ in 0..50 {
-            for (u, ..) in super::plan_batch(&t, &st, &cfg, 10, &mut rng, win, &inflight) {
+            for (u, ..) in super::plan_batch(&t, &st, &cfg, 10, &mut rng, &blocks, &inflight) {
                 assert_ne!(u, "wss://hot.example", "a relay that just failed must wait");
                 if u == "wss://cool.example" {
                     saw_cool = true;
@@ -2179,12 +2181,12 @@ mod scrape_concurrency_tests {
         ];
         let cfg = super::ScrapeConfig::default();
         let mut rng = rand::thread_rng();
-        let win = (0u64, u64::MAX); // whole corpus, for tests about other rules
+        let blocks = super::BlockCursor::default();
         let inflight = std::sync::Mutex::new(std::collections::HashSet::new());
 
         let mut saw_alive = false;
         for _ in 0..100 {
-            for (url, ..) in super::plan_batch(&t, &st, &cfg, 10, &mut rng, win, &inflight) {
+            for (url, ..) in super::plan_batch(&t, &st, &cfg, 10, &mut rng, &blocks, &inflight) {
                 assert_ne!(url, "wss://dead.example", "a dead relay must not be drawn");
                 if url == "wss://alive.example" {
                     saw_alive = true;
@@ -2195,27 +2197,55 @@ mod scrape_concurrency_tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
-    /// Draws stay inside the window they are given.
+    /// Each relay walks its own blocks: a fresh relay draws from block 0,
+    /// and a relay whose block 0 is complete draws from block 1 -- in the
+    /// same batch, with no cohort barrier between them.
     ///
-    /// Filling newest-first is the whole point: complete randomness across
-    /// four years spread every relay thinly over the corpus, so nothing
-    /// finished and recent history filled no faster than 2022.
+    /// Filling newest-first per relay is the point, but the walk must be per
+    /// relay: a single global window made the block boundary a barrier, and
+    /// relays that finished the current block idled -- 3 units in flight
+    /// with 50 workers configured -- until the slowest straggler released
+    /// the cohort.
     #[test]
-    fn draws_are_confined_to_the_window() {
+    fn relays_walk_their_own_blocks_without_a_cohort_barrier() {
         let (st, dir) = state("window");
-        let t = targets(40);
+        let t = targets(2);
         let cfg = super::ScrapeConfig::default();
         let mut rng = rand::thread_rng();
 
         let now = chrono::Utc::now().timestamp() as u64;
-        let win = super::block_window(now - (now % 86_400), 0);
+        let today = now - (now % 86_400);
+        let (b0_lo, b0_hi) = super::block_window(today, 0);
+        let (b1_lo, b1_hi) = super::block_window(today, 1);
+        let blocks = super::BlockCursor::default();
         let inflight = std::sync::Mutex::new(std::collections::HashSet::new());
+
+        // Relay 0: block 0 fully done. Relay 1: fresh.
+        for off in 0..super::BLOCK_DAYS {
+            let start = b0_lo + off * 86_400;
+            if start >= b0_hi.min(today) {
+                break;
+            }
+            let back = (today - start) / 86_400;
+            let (date, ..) = super::day_bounds(back);
+            st.put_day(&date, &t[0].0, &super::DayDone { seen: 1, new: 0, at: now, epoch: super::SYNC_EPOCH });
+        }
+
         for _ in 0..40 {
-            for (_, _, _, start, _) in super::plan_batch(&t, &st, &cfg, 20, &mut rng, win, &inflight) {
-                assert!(
-                    start >= win.0 && start < win.1,
-                    "drew {start} outside the window {win:?}"
-                );
+            let batch = super::plan_batch(&t, &st, &cfg, 20, &mut rng, &blocks, &inflight);
+            assert_eq!(batch.len(), 2, "both relays must draw in the same batch");
+            for (url, _, _, start, _) in batch {
+                if url == t[0].0 {
+                    assert!(
+                        start >= b1_lo && start < b1_hi,
+                        "a relay with block 0 done must draw from block 1, got {start}"
+                    );
+                } else {
+                    assert!(
+                        start >= b0_lo && start < b0_hi,
+                        "a fresh relay must draw from block 0, got {start}"
+                    );
+                }
             }
         }
         let _ = std::fs::remove_dir_all(dir);
@@ -2262,14 +2292,15 @@ mod scrape_concurrency_tests {
 
         let now = chrono::Utc::now().timestamp() as u64;
         let today = now - (now % 86_400);
-        let win = super::block_window(today, 0);
+        let blocks = super::BlockCursor::default();
         let inflight = std::sync::Mutex::new(std::collections::HashSet::new());
 
-        // Finish every day in the window except one.
+        // Finish every day in the newest block except one.
+        let (w_lo, w_hi) = super::block_window(today, 0);
         let mut keep_open: Option<String> = None;
         for off in 0..super::BLOCK_DAYS {
-            let start = win.0 + off * 86_400;
-            if start >= win.1 {
+            let start = w_lo + off * 86_400;
+            if start >= w_hi {
                 break;
             }
             let back = (today - start) / 86_400;
@@ -2285,7 +2316,7 @@ mod scrape_concurrency_tests {
         // Every attempt must find it. A sampler that gives up would miss it
         // most of the time.
         for _ in 0..25 {
-            let b = super::plan_batch(&t, &st, &cfg, 50, &mut rng, win, &inflight);
+            let b = super::plan_batch(&t, &st, &cfg, 50, &mut rng, &blocks, &inflight);
             assert_eq!(b.len(), 1, "the one unfinished day must be scheduled");
             assert_eq!(b[0].2, open, "and it must be that day");
         }
@@ -2460,13 +2491,13 @@ mod scrape_concurrency_tests {
         ];
         let cfg = super::ScrapeConfig::default();
         let mut rng = rand::thread_rng();
-        let win = super::block_window(now - (now % 86_400), 0);
+        let blocks = super::BlockCursor::default();
         let inflight = std::sync::Mutex::new(std::collections::HashSet::new());
 
         let mut saw_real = false;
         let mut saw_unknown = false;
         for _ in 0..60 {
-            for (u, ..) in super::plan_batch(&t, &st, &cfg, 5, &mut rng, win, &inflight) {
+            for (u, ..) in super::plan_batch(&t, &st, &cfg, 5, &mut rng, &blocks, &inflight) {
                 assert_ne!(
                     u, "wss://relay.example/sierra-ivory",
                     "a URL with no relay document must never be scheduled"
@@ -2591,12 +2622,12 @@ mod scrape_concurrency_tests {
         let cfg = super::ScrapeConfig::default();
         let mut rng = rand::thread_rng();
         let now = chrono::Utc::now().timestamp() as u64;
-        let win = super::block_window(now - (now % 86_400), 0);
+        let blocks = super::BlockCursor::default();
         let inflight = std::sync::Mutex::new(std::collections::HashSet::new());
 
         // Nothing running: there is work, and it is offered.
         assert!(
-            !super::plan_batch(&t, &st, &cfg, 10, &mut rng, win, &inflight).is_empty(),
+            !super::plan_batch(&t, &st, &cfg, 10, &mut rng, &blocks, &inflight).is_empty(),
             "fresh relays must yield work"
         );
 
@@ -2606,7 +2637,7 @@ mod scrape_concurrency_tests {
             inflight.lock().unwrap().insert(u.clone());
         }
         assert!(
-            super::plan_batch(&t, &st, &cfg, 10, &mut rng, win, &inflight).is_empty(),
+            super::plan_batch(&t, &st, &cfg, 10, &mut rng, &blocks, &inflight).is_empty(),
             "a fully busy relay set yields nothing to draw"
         );
 
@@ -2614,7 +2645,7 @@ mod scrape_concurrency_tests {
         // "busy" from "finished" -- the caller waits rather than stepping back.
         let first = t[0].0.clone();
         inflight.lock().unwrap().remove(&first);
-        let after = super::plan_batch(&t, &st, &cfg, 10, &mut rng, win, &inflight);
+        let after = super::plan_batch(&t, &st, &cfg, 10, &mut rng, &blocks, &inflight);
         assert_eq!(after.len(), 1, "the freed relay must be drawable again");
         assert_eq!(after[0].0, first);
         let _ = std::fs::remove_dir_all(dir);
@@ -2635,16 +2666,16 @@ mod scrape_concurrency_tests {
         let cfg = super::ScrapeConfig::default();
         let mut rng = rand::thread_rng();
         let now = chrono::Utc::now().timestamp() as u64;
-        let win = super::block_window(now - (now % 86_400), 0);
+        let blocks = super::BlockCursor::default();
         let inflight = std::sync::Mutex::new(std::collections::HashSet::new());
 
-        let first = super::plan_batch(&t, &st, &cfg, 1, &mut rng, win, &inflight);
+        let first = super::plan_batch(&t, &st, &cfg, 1, &mut rng, &blocks, &inflight);
         assert_eq!(first.len(), 1, "a fresh relay must yield work");
         let (url, ..) = first[0].clone();
         inflight.lock().unwrap().insert(url.clone());
 
         for _ in 0..50 {
-            for (u, ..) in super::plan_batch(&t, &st, &cfg, 5, &mut rng, win, &inflight) {
+            for (u, ..) in super::plan_batch(&t, &st, &cfg, 5, &mut rng, &blocks, &inflight) {
                 assert_ne!(
                     u, url,
                     "a relay already being scraped must not be drawn again, on \
