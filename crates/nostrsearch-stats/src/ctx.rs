@@ -144,19 +144,10 @@ impl<'a> AnalysisCtx<'a> {
 /// Reusable publisher gate: lets a consumer analysis skip events from authors
 /// below minimum follower / WoT thresholds (e.g. "don't count stats for users
 /// with < 10 followers"). Check it at the top of `observe`.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 pub struct PublisherFilter {
     pub min_followers: u32,
     pub min_wot_tier: u8,
-}
-
-impl Default for PublisherFilter {
-    fn default() -> Self {
-        Self {
-            min_followers: 0,
-            min_wot_tier: 0,
-        }
-    }
 }
 
 impl PublisherFilter {

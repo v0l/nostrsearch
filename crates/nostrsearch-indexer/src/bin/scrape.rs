@@ -12,6 +12,7 @@
 
 use nostrsearch_core::event::NostrEvent;
 use nostrsearch_indexer::id_store::IdStore;
+use nostrsearch_indexer::pipeline::lock as lock_pipeline;
 use nostrsearch_indexer::scrape::{
     RelayInfo, ScrapeConfig, ScrapeState, Sink, discover_relays, normalize_relay_url, parse_date,
 };
@@ -135,7 +136,7 @@ impl PipelineSink {
     /// Commit the index, then durably record the pending ids — in that order,
     /// so a crash re-fetches a window instead of leaving holes.
     fn checkpoint(&self, finish: bool) -> anyhow::Result<()> {
-        let mut p = self.pipeline.lock().unwrap();
+        let mut p = lock_pipeline(&self.pipeline);
         if finish {
             p.finish()?;
         } else {
@@ -160,7 +161,7 @@ impl Sink for PipelineSink {
     async fn process(&self, events: Vec<nostr_sdk::Event>) -> u64 {
         self.seen.fetch_add(events.len() as u64, Ordering::Relaxed);
         tokio::task::block_in_place(|| {
-            let mut p = self.pipeline.lock().unwrap();
+            let mut p = lock_pipeline(&self.pipeline);
             let mut pending = self.pending.lock().unwrap();
             let mut new = 0u64;
             for ev in &events {
@@ -169,8 +170,9 @@ impl Sink for PipelineSink {
                 if pending.contains(&id) || self.store.contains(&id) {
                     continue;
                 }
-                p.process(&core);
-                pending.insert(id);
+                if p.process(&core) {
+                    pending.insert(id);
+                }
                 new += 1;
             }
             self.new.fetch_add(new, Ordering::Relaxed);
@@ -228,8 +230,10 @@ fn main() -> anyhow::Result<()> {
     }
     for url in &args.seed_relays {
         if let Some(u) = normalize_relay_url(url) {
-            let mut info = RelayInfo::default();
-            info.sources = u32::MAX; // manual seeds always qualify
+            let info = RelayInfo {
+                sources: u32::MAX, // manual seeds always qualify
+                ..Default::default()
+            };
             state.put_relay(&u, &info);
         }
     }
@@ -257,7 +261,7 @@ fn main() -> anyhow::Result<()> {
     };
     let pipeline = Arc::new(Mutex::new(Pipeline::new(cfg)?));
     // Scraped events are new arrivals: fold them as live, not backfill.
-    pipeline.lock().unwrap().go_live();
+    lock_pipeline(&pipeline).go_live();
 
     let sink = Arc::new(PipelineSink {
         pipeline,

@@ -390,7 +390,7 @@ impl ScrapeState {
     /// Snapshot of every in-flight unit, most recently active first.
     pub fn live_units(&self) -> Vec<UnitProgress> {
         let mut v: Vec<UnitProgress> = self.live.lock().unwrap().values().cloned().collect();
-        v.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        v.sort_by_key(|u| std::cmp::Reverse(u.updated_at));
         v
     }
 
@@ -514,7 +514,7 @@ impl ScrapeState {
         p.newest_day = dates.iter().next_back().cloned();
 
         // Most recently completed first.
-        recent.sort_by(|a, b| b.at.cmp(&a.at));
+        recent.sort_by_key(|d| std::cmp::Reverse(d.at));
         recent.truncate(recent_limit);
         p.recent = recent;
         p
@@ -649,9 +649,6 @@ impl ScrapeState {
     }
 }
 
-/// Normalize a relay URL for use as a stable target key. Returns `None` for
-/// anything we don't want to scrape (onions, localhost, non-websocket).
-
 /// Scan the Tantivy index for kind-10002 relay lists and count distinct
 /// authors per relay. Returns `(url, distinct_authors)` sorted descending.
 pub fn discover_relays(index_root: &Path) -> anyhow::Result<Vec<(String, u32)>> {
@@ -697,7 +694,7 @@ pub fn discover_relays(index_root: &Path) -> anyhow::Result<Vec<(String, u32)>> 
                 })
                 .unwrap_or(0);
             for v in doc.get_all(schema.tag_url) {
-                if let Some(u) = v.as_str().and_then(|s| normalize_relay_url(s)) {
+                if let Some(u) = v.as_str().and_then(normalize_relay_url) {
                     authors.entry(u).or_default().insert(pk_hash);
                 }
             }
@@ -1221,7 +1218,7 @@ pub async fn run_pass<S: Sink>(
             });
             scraped += 1;
         }
-        if scraped % (batch_size as u64 * 20) == 0 {
+        if scraped.is_multiple_of(batch_size as u64 * 20) {
             tracing::info!(scraped, "scrape pass progress");
         }
     }
@@ -2621,7 +2618,6 @@ mod scrape_concurrency_tests {
         let t = targets(4);
         let cfg = super::ScrapeConfig::default();
         let mut rng = rand::thread_rng();
-        let now = chrono::Utc::now().timestamp() as u64;
         let blocks = super::BlockCursor::default();
         let inflight = std::sync::Mutex::new(std::collections::HashSet::new());
 
@@ -2665,7 +2661,6 @@ mod scrape_concurrency_tests {
         let t = targets(1);
         let cfg = super::ScrapeConfig::default();
         let mut rng = rand::thread_rng();
-        let now = chrono::Utc::now().timestamp() as u64;
         let blocks = super::BlockCursor::default();
         let inflight = std::sync::Mutex::new(std::collections::HashSet::new());
 

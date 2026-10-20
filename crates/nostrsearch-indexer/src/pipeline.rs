@@ -18,8 +18,14 @@ use nostrsearch_core::event::NostrEvent;
 use nostrsearch_stats::analyses::{ActiveUsers, Activity, Clients, FollowGraph, Pagerank, Relays};
 use nostrsearch_stats::{Registry, SharedWot, StatStore, World, WotIndex};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
+
+/// Lock a shared pipeline, carrying on past a poisoned lock. One panicking
+/// event must not stop every later event from being indexed.
+pub fn lock(p: &Mutex<Pipeline>) -> MutexGuard<'_, Pipeline> {
+    p.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// Configuration for the unified pipeline.
 pub struct PipelineConfig {
@@ -374,7 +380,9 @@ impl Pipeline {
         self.manager.clone()
     }
 
-    pub fn process(&mut self, ev: &NostrEvent) {
+    /// Fold `ev` and index it. Returns whether a document was written, which
+    /// is what callers may record in the id store.
+    pub fn process(&mut self, ev: &NostrEvent) -> bool {
         let now = Self::now();
         let t0 = Instant::now();
         // Fold into the right dependency stage. `observe_into_stage` does the
@@ -385,11 +393,17 @@ impl Pipeline {
         let t1 = Instant::now();
         // Index exactly once. Later backfill passes replay the same events
         // purely to feed dependent analyses.
-        if (self.live || self.pass == 0)
-            && let Err(e) = self.manager.index_event(ev)
-        {
-            tracing::warn!(error = %e, "index_event failed");
-        }
+        let indexed = if self.live || self.pass == 0 {
+            match self.manager.index_event(ev) {
+                Ok(_) => true,
+                Err(e) => {
+                    tracing::warn!(error = %e, "index_event failed");
+                    false
+                }
+            }
+        } else {
+            false
+        };
         self.stats_ns += (t1 - t0).as_nanos() as u64;
         self.index_ns += t1.elapsed().as_nanos() as u64;
         // Only the live tail refreshes periodically. During a backfill the
@@ -403,6 +417,7 @@ impl Pipeline {
         if self.live && self.since_refresh >= self.cfg.wot_refresh_every {
             self.maybe_refresh_wot();
         }
+        indexed
     }
 
     /// Re-materialize the world, rebuild + hot-swap the WoT index, persist

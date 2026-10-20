@@ -10,7 +10,7 @@ use nostrsearch_indexer::{PipelineConfig, ShardWriterConfig};
 use nostrsearch_server::admin::{AdminConfig, AdminState};
 use nostrsearch_server::{AppState, ShardRegistry};
 use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 fn tempdir(tag: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();

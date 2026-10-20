@@ -95,7 +95,9 @@ impl StatStore {
         // tolerate. Not worth refusing to start over.
         if let Ok(bytes) = std::fs::read(self.boundary_path(name)) {
             progress.boundary = bytes
-                .chunks_exact(32)
+                .as_chunks::<32>()
+                .0
+                .iter()
                 .map(|c| {
                     let mut id = [0u8; 32];
                     id.copy_from_slice(c);

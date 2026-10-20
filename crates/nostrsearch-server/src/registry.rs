@@ -205,6 +205,38 @@ impl OpenShards {
 }
 
 impl ShardRegistry {
+    fn open_reader(&self, id: ShardId, policy: tantivy::ReloadPolicy) -> Option<ShardReader> {
+        let dir = self.root.join(id.name());
+        if !dir.exists() {
+            return None;
+        }
+        let index = Index::open_in_dir(&dir).ok()?;
+        NostrSchema::register_tokenizers(&index);
+        let (_, ns) = NostrSchema::build();
+        let reader = index
+            .reader_builder()
+            .reload_policy(policy)
+            .try_into()
+            .ok()?;
+        Some(ShardReader {
+            id,
+            index,
+            reader,
+            schema: ns,
+        })
+    }
+
+    fn cached(&self, id: ShardId) -> Option<Arc<ShardReader>> {
+        self.open.lock().ok()?.shards.get(&id).cloned()
+    }
+
+    fn cached_or_transient(&self, id: ShardId) -> Option<Arc<ShardReader>> {
+        self.cached(id).or_else(|| {
+            self.open_reader(id, tantivy::ReloadPolicy::Manual)
+                .map(Arc::new)
+        })
+    }
+
     /// Open (or return cached) a shard reader.
     fn shard(&self, id: ShardId) -> Option<Arc<ShardReader>> {
         // Fast path: already open. Take the handle and release the lock -- the
@@ -216,24 +248,7 @@ impl ShardRegistry {
                 return Some(s);
             }
         }
-        let dir = self.root.join(id.name());
-        if !dir.exists() {
-            return None;
-        }
-        let index = Index::open_in_dir(&dir).ok()?;
-        NostrSchema::register_tokenizers(&index);
-        let (_, ns) = NostrSchema::build();
-        let reader = index
-            .reader_builder()
-            .reload_policy(tantivy::ReloadPolicy::OnCommitWithDelay)
-            .try_into()
-            .ok()?;
-        let sr = Arc::new(ShardReader {
-            id,
-            index,
-            reader,
-            schema: ns,
-        });
+        let sr = Arc::new(self.open_reader(id, tantivy::ReloadPolicy::OnCommitWithDelay)?);
         let mut open = self.open.lock().ok()?;
         // Another thread may have opened the same shard while this one was
         // building its reader; prefer theirs so the cache holds one per shard.
@@ -249,6 +264,9 @@ impl ShardRegistry {
 
     /// Execute a search filter: plan, prune shards, fan out, merge, hydrate.
     pub fn search(&self, filter: &SearchFilter) -> Result<Vec<SearchHit>, RegistryError> {
+        if filter.limit == 0 {
+            return Ok(Vec::new());
+        }
         // Plan against any open shard's index (schema is identical across
         // shards, so the QueryParser only needs one). If no shard exists yet,
         // there is nothing to search.
@@ -370,11 +388,19 @@ impl ShardRegistry {
 
         // Merge across shards: composite score for text queries, created_at
         // (encoded in score) for metadata queries.
-        hits.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        if text_query {
+            hits.sort_by(|a, b| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        } else {
+            hits.sort_by(|a, b| {
+                b.created_at
+                    .cmp(&a.created_at)
+                    .then_with(|| a.event_id.cmp(&b.event_id))
+            });
+        }
         hits.truncate(filter.limit);
         Ok(hits)
     }
@@ -446,43 +472,49 @@ impl ShardRegistry {
             .lock()
             .map(|o| o.shards.keys().copied().collect())
             .unwrap_or_default();
-        if self.root.exists() {
-            if let Ok(rd) = std::fs::read_dir(&self.root) {
-                for entry in rd.flatten() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if let Some(id) = ShardId::parse(&name) {
-                        ids.insert(id);
-                    }
+        if self.root.exists()
+            && let Ok(rd) = std::fs::read_dir(&self.root)
+        {
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if let Some(id) = ShardId::parse(&name) {
+                    ids.insert(id);
                 }
             }
         }
         ids.into_iter().collect()
     }
 
-    /// Fetch a single event by id across all shards.
+    /// Fetch a single event by id. Open readers are tried first; the rest of
+    /// the corpus is read through uncached readers, so a miss cannot evict
+    /// the shards searches are using.
     pub fn get_event(&self, event_id: &str) -> Result<Option<SearchHit>, RegistryError> {
-        let filter = SearchFilter {
-            limit: 1,
-            ..Default::default()
-        };
-        // Brute-force across shards by term on event_id. Enumerate shard dirs
-        // from disk (not just already-open readers) so a node that started
-        // against an empty index still finds events written afterwards.
-        let ids: Vec<ShardId> = self.all_shard_ids();
-        for id in ids {
-            if let Some(shard) = self.shard(id) {
-                let searcher = shard.reader.searcher();
-                let term = tantivy::Term::from_field_text(shard.schema.event_id, event_id);
-                let q =
-                    tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
-                let top = searcher.search(&q, &TopDocs::with_limit(1))?;
-                if let Some((_score, addr)) = top.into_iter().next() {
-                    let _ = filter;
-                    return hydrate(&searcher, &shard.schema, addr, 1.0, shard.id).map(Some);
-                }
+        let mut ids = self.all_shard_ids();
+        ids.reverse();
+        let (open, closed): (Vec<ShardId>, Vec<ShardId>) =
+            ids.into_iter().partition(|id| self.cached(*id).is_some());
+        for id in open.into_iter().chain(closed) {
+            if let Some(shard) = self.cached_or_transient(id)
+                && let Some(hit) = Self::find_in(&shard, event_id)?
+            {
+                return Ok(Some(hit));
             }
         }
         Ok(None)
+    }
+
+    fn find_in(shard: &ShardReader, event_id: &str) -> Result<Option<SearchHit>, RegistryError> {
+        let searcher = shard.reader.searcher();
+        let term = tantivy::Term::from_field_text(shard.schema.event_id, event_id);
+        let q = tantivy::query::TermQuery::new(term, tantivy::schema::IndexRecordOption::Basic);
+        match searcher
+            .search(&q, &TopDocs::with_limit(1))?
+            .into_iter()
+            .next()
+        {
+            Some((_, addr)) => hydrate(&searcher, &shard.schema, addr, 1.0, shard.id).map(Some),
+            None => Ok(None),
+        }
     }
 
     /// Cluster stats. Scans the root for shard dirs (not just already-open
@@ -491,13 +523,13 @@ impl ShardRegistry {
         // (re)discover in case shards were added since open
         let _ = self.discover();
         let mut ids: Vec<ShardId> = Vec::new();
-        if self.root.exists() {
-            if let Ok(rd) = std::fs::read_dir(&self.root) {
-                for entry in rd.flatten() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if let Some(id) = ShardId::parse(&name) {
-                        ids.push(id);
-                    }
+        if self.root.exists()
+            && let Ok(rd) = std::fs::read_dir(&self.root)
+        {
+            for entry in rd.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if let Some(id) = ShardId::parse(&name) {
+                    ids.push(id);
                 }
             }
         }
@@ -506,9 +538,11 @@ impl ShardRegistry {
         let mut per_shard = Vec::new();
         let mut total = 0u64;
         for id in ids {
-            if let Some(shard) = self.shard(id) {
-                let searcher = shard.reader.searcher();
-                let n = searcher.num_docs();
+            let docs = match self.cached(id) {
+                Some(shard) => Some(shard.reader.searcher().num_docs()),
+                None => committed_docs(&self.root.join(id.name())),
+            };
+            if let Some(n) = docs {
                 total += n;
                 per_shard.push(ShardStat {
                     shard: id.name(),
@@ -528,6 +562,30 @@ impl ShardRegistry {
             shards: per_shard,
         }
     }
+}
+
+fn committed_docs(dir: &std::path::Path) -> Option<u64> {
+    #[derive(serde::Deserialize)]
+    struct Meta {
+        segments: Vec<Segment>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Segment {
+        max_doc: u64,
+        deletes: Option<Deletes>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Deletes {
+        num_deleted_docs: u64,
+    }
+    let raw = std::fs::read(dir.join("meta.json")).ok()?;
+    let meta: Meta = serde_json::from_slice(&raw).ok()?;
+    Some(
+        meta.segments
+            .iter()
+            .map(|s| s.max_doc - s.deletes.as_ref().map_or(0, |d| d.num_deleted_docs))
+            .sum(),
+    )
 }
 
 fn hydrate(

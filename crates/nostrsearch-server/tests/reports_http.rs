@@ -7,7 +7,7 @@ use nostrsearch_core::scoring::ScoreWeights;
 use nostrsearch_server::reports::ReportStore;
 use nostrsearch_server::{AppState, ShardRegistry};
 use nostrsearch_stats::ReportDelta;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 fn tempdir(tag: &str) -> std::path::PathBuf {
@@ -162,5 +162,40 @@ async fn streams_deltas_and_converges_on_the_snapshot() -> anyhow::Result<()> {
     assert_eq!(held["snort"]["sum"], 2);
     assert_eq!(held["damus"]["sum"], 9);
 
+    Ok(())
+}
+
+/// An open console must not hold a graceful shutdown hostage: the stream ends
+/// when the server starts shutting down, so the writer gets to flush.
+#[tokio::test]
+async fn open_streams_do_not_block_graceful_shutdown() -> anyhow::Result<()> {
+    let store = ReportStore::new();
+    let index_root = tempdir("shutdown");
+    let registry = ShardRegistry::open(&index_root, ScoreWeights::default())?;
+    let state = Arc::new(AppState { registry });
+    let app = nostrsearch_server::http::router_all(state, None, None, Some(store.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let closer = store.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = stop_rx.await;
+                closer.close_streams();
+            })
+            .await
+    });
+
+    let resp = reqwest::get(format!("http://{addr}/reports/stream")).await?;
+    assert_eq!(resp.status(), 200);
+    let mut body = resp.bytes_stream();
+
+    stop_tx.send(()).ok();
+    tokio::time::timeout(std::time::Duration::from_secs(5), server).await???;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while let Some(Ok(_)) = body.next().await {}
+    })
+    .await?;
     Ok(())
 }

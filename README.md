@@ -23,7 +23,7 @@ built.
 | Archive | serves the corpus, indexes it by id, accepts relay writes |
 | API | `/search`, `/event/{id}`, `/stats`, `/archive/*`, `/reports/*`, `/admin/*` |
 | Console | built into the binary, live-patched from `/reports/stream` |
-| Tests | 152 passing |
+| Tests | 205 passing |
 
 Throughput measured on real hole.v0l.io data at ~122k events/sec (48 cores),
 and ~2.5 GB of index per 2.8 GB day dump. Both predate the current schema:

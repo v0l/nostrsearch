@@ -455,7 +455,7 @@ mod tests {
             commit_every_docs: 2,
             ..Default::default()
         };
-        let mut mgr = ShardManager::new(dir.path(), cfg);
+        let mgr = ShardManager::new(dir.path(), cfg);
 
         // 2023-11-14 and 2023-12-01 land in different shards
         let nov = 1_700_000_000u64;
@@ -480,7 +480,7 @@ mod tests {
             commit_every_docs: 1, // commit every doc
             ..Default::default()
         };
-        let mut mgr = ShardManager::new(dir.path(), cfg);
+        let mgr = ShardManager::new(dir.path(), cfg);
         let ts = 1_700_000_000u64;
         mgr.index_event(&ev(ts, "one")).unwrap();
         mgr.index_event(&ev(ts + 1, "two")).unwrap();
@@ -534,7 +534,7 @@ mod eviction_tests {
             writer_threads: 1,
             ..Default::default()
         };
-        let mut mgr = ShardManager::new(dir.path(), cfg);
+        let mgr = ShardManager::new(dir.path(), cfg);
 
         // 12 distinct monthly shards
         for m in 1..=12u32 {

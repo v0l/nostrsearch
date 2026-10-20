@@ -6,7 +6,7 @@ use nostr_sdk::prelude::*;
 use nostrsearch_core::scoring::ScoreWeights;
 use nostrsearch_indexer::{PipelineConfig, ShardWriterConfig};
 use nostrsearch_server::{AppState, ArchiveState, RelayState, ShardRegistry};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 fn tempdir(tag: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
@@ -91,7 +91,7 @@ async fn relay_write_is_archived_and_searchable_in_one_process() -> anyhow::Resu
     let mut found = None;
     for _ in 0..40 {
         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-        let mut reg = ShardRegistry::open(&index_root, ScoreWeights::default())?;
+        let reg = ShardRegistry::open(&index_root, ScoreWeights::default())?;
         if reg.stats().total_docs > 0 {
             // Now query through the live server state (shared registry).
             let hits = {

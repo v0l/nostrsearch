@@ -26,6 +26,7 @@
 use nostr_archive_cursor::DefaultJsonFilesDatabase;
 use nostr_sdk::prelude::*;
 use nostrsearch_core::event::NostrEvent;
+use nostrsearch_indexer::pipeline::lock as lock_pipeline;
 use nostrsearch_indexer::{Pipeline, PipelineConfig};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc;
@@ -200,15 +201,15 @@ impl WriterCtl {
 /// silently drifts from it on each restart.
 pub struct WriterHandle {
     shutdown: tokio::sync::watch::Sender<bool>,
-    join: tokio::task::JoinHandle<()>,
+    done: tokio::sync::oneshot::Receiver<()>,
 }
 
 impl WriterHandle {
     /// Signal the writer to flush and stop, then wait for it.
     pub async fn shutdown(self) {
         let _ = self.shutdown.send(true);
-        if let Err(e) = self.join.await {
-            tracing::warn!(error = %e, "writer task join failed");
+        if self.done.await.is_err() {
+            tracing::warn!("writer thread exited without finishing");
         }
     }
 }
@@ -249,7 +250,7 @@ pub fn spawn_writer_with_reports(
     // handful of events a second, and ingest holds the lock per chunk.
     let pipeline = Arc::new(Mutex::new(Pipeline::new(cfg)?));
     // Live tail semantics: everything from here on is realtime.
-    pipeline.lock().unwrap().go_live();
+    lock_pipeline(&pipeline).go_live();
 
     // Publish once from the state just loaded, before any event arrives.
     //
@@ -258,7 +259,7 @@ pub fn spawn_writer_with_reports(
     // an empty /reports until the next live event happened to land -- and on a
     // node with no firehose attached, indefinitely. The data was on disk the
     // whole time.
-    publish_reports(&pipeline.lock().unwrap(), reports.as_ref());
+    publish_reports(&lock_pipeline(&pipeline), reports.as_ref());
 
     let pipeline_for_task = pipeline.clone();
 
@@ -266,7 +267,8 @@ pub fn spawn_writer_with_reports(
     let (sd_tx, mut sd_rx) = tokio::sync::watch::channel(false);
     // Small: these are rare operator actions, not a data path.
     let (cmd_tx, mut cmd_rx) = mpsc::channel::<WriterCmd>(16);
-    let join = tokio::spawn(async move {
+    let (done_tx, done) = tokio::sync::oneshot::channel();
+    let writer = async move {
         let pipeline = pipeline_for_task;
         let mut tick = tokio::time::interval(commit_every);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -295,15 +297,16 @@ pub fn spawn_writer_with_reports(
 
                 maybe = rx.recv() => match maybe {
                     Some(ev) => {
-                        pipeline.lock().unwrap().process(&ev);
-                        indexed.note(&ev);
+                        if process_guarded(&pipeline, &ev) {
+                            indexed.note(&ev);
+                        }
                         dirty = true;
                     }
                     None => break, // all senders dropped
                 },
                 _ = tick.tick() => {
                     if dirty {
-                        match pipeline.lock().unwrap().commit() {
+                        match lock_pipeline(&pipeline).commit() {
                             // Committed, so the documents are searchable and
                             // their ids may now be claimed. Never before: a
                             // store ahead of the index makes those events
@@ -311,13 +314,13 @@ pub fn spawn_writer_with_reports(
                             Ok(()) => indexed.flush(dedupe.as_ref()),
                             Err(e) => tracing::warn!(error = %e, "commit failed"),
                         }
-                        publish_reports(&pipeline.lock().unwrap(), reports.as_ref());
+                        publish_reports(&lock_pipeline(&pipeline), reports.as_ref());
                         dirty = false;
                     }
                 }
                 _ = delta_tick.tick() => {
                     if let Some(store) = reports.as_ref() {
-                        let deltas = pipeline.lock().unwrap().drain_report_deltas();
+                        let deltas = lock_pipeline(&pipeline).drain_report_deltas();
                         store.apply_deltas(unix_now(), deltas);
                     }
                 }
@@ -326,15 +329,15 @@ pub fn spawn_writer_with_reports(
                         // A failed re-attach leaves the graph unreachable, so
                         // the reset is reported as the failure it is rather
                         // than as an empty success.
-                        let res = pipeline.lock().unwrap().reset_all_analyses();
-                        publish_reports(&pipeline.lock().unwrap(), reports.as_ref());
+                        let res = lock_pipeline(&pipeline).reset_all_analyses();
+                        publish_reports(&lock_pipeline(&pipeline), reports.as_ref());
                         let _ = reply.send(res.map_err(|e| e.to_string()));
                     }
                     WriterCmd::RelayTargets { reply } => {
-                        let _ = reply.send(pipeline.lock().unwrap().relay_targets());
+                        let _ = reply.send(lock_pipeline(&pipeline).relay_targets());
                     }
                     WriterCmd::ResetAnalysis { name, reply } => {
-                        let reset = pipeline.lock().unwrap().reset_analysis(&name);
+                        let reset = lock_pipeline(&pipeline).reset_analysis(&name);
                         let ok = match reset {
                             Ok(v) => v,
                             // Re-attach failed: the graph is unreachable and a
@@ -348,7 +351,7 @@ pub fn spawn_writer_with_reports(
                         // reading the corpus, decided while the names are in
                         // hand rather than assumed by the caller.
                         let needs = ok.as_ref().is_none_or(|names| {
-                            pipeline.lock().unwrap().names_need_corpus(names)
+                            lock_pipeline(&pipeline).names_need_corpus(names)
                         });
                         // A derived analysis rebuilds from other analyses'
                         // materialized output, which is already on disk. Do it
@@ -357,22 +360,22 @@ pub fn spawn_writer_with_reports(
                         if let Some(names) = ok.as_ref()
                             && !needs
                         {
-                            let n = pipeline.lock().unwrap().refresh_now(names);
+                            let n = lock_pipeline(&pipeline).refresh_now(names);
                             tracing::info!(
                                 reset = ?names,
                                 refreshed = n,
                                 "rebuilt derived analyses without a corpus pass"
                             );
-                            publish_reports(&pipeline.lock().unwrap(), reports.as_ref());
+                            publish_reports(&lock_pipeline(&pipeline), reports.as_ref());
                         }
                         let ok = ok.map(|names| (names, needs));
                         // Republish immediately so the dashboard reflects the
                         // now-empty report rather than the stale one.
-                        publish_reports(&pipeline.lock().unwrap(), reports.as_ref());
+                        publish_reports(&lock_pipeline(&pipeline), reports.as_ref());
                         let _ = reply.send(Ok(ok));
                     }
                     WriterCmd::Status { reply } => {
-                        let _ = reply.send(pipeline.lock().unwrap().analyses_status());
+                        let _ = reply.send(lock_pipeline(&pipeline).analyses_status());
                     }
                 },
                 _ = sd_rx.changed() => {
@@ -381,8 +384,9 @@ pub fn spawn_writer_with_reports(
                         // Drain anything already queued so a deploy doesn't
                         // drop in-flight events.
                         while let Ok(ev) = rx.try_recv() {
-                            pipeline.lock().unwrap().process(&ev);
-                            indexed.note(&ev);
+                            if process_guarded(&pipeline, &ev) {
+                                indexed.note(&ev);
+                            }
                         }
                         break;
                     }
@@ -390,25 +394,48 @@ pub fn spawn_writer_with_reports(
             }
         }
 
-        match pipeline.lock().unwrap().finish() {
+        match lock_pipeline(&pipeline).finish() {
             // Same rule on the way out: claim the ids only once the final
             // commit has made them searchable.
             Ok(()) => indexed.flush(dedupe.as_ref()),
             Err(e) => tracing::warn!(error = %e, "final flush failed"),
         }
-        publish_reports(&pipeline.lock().unwrap(), reports.as_ref());
+        publish_reports(&lock_pipeline(&pipeline), reports.as_ref());
         tracing::info!("writer task stopped (flushed)");
-    });
+    };
+    std::thread::Builder::new()
+        .name("writer".into())
+        .spawn(move || {
+            match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt.block_on(writer),
+                Err(e) => tracing::error!(error = %e, "writer runtime failed to start"),
+            }
+            let _ = done_tx.send(());
+        })?;
 
     Ok((
         EventSink(tx),
         WriterHandle {
             shutdown: sd_tx,
-            join,
+            done,
         },
         WriterCtl(cmd_tx),
         pipeline,
     ))
+}
+
+fn process_guarded(pipeline: &Mutex<Pipeline>, ev: &NostrEvent) -> bool {
+    let mut p = lock_pipeline(pipeline);
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| p.process(ev))) {
+        Ok(indexed) => indexed,
+        Err(_) => {
+            tracing::error!(id = %ev.id, "processing panicked; event skipped");
+            false
+        }
+    }
 }
 
 /// How often the writer drains partial report changes for the live stream.
@@ -522,7 +549,9 @@ async fn run_firehose(
     archive: Option<DefaultJsonFilesDatabase>,
     sink: EventSink,
 ) -> anyhow::Result<()> {
-    let mut builder = Client::builder().signer(Keys::generate());
+    let mut builder = Client::builder()
+        .signer(Keys::generate())
+        .admit_policy(nostrsearch_indexer::firehose::EphemeralFilter);
     if let Some(db) = archive {
         builder = builder.database(db);
     }
@@ -533,34 +562,13 @@ async fn run_firehose(
     client.connect().await;
     tracing::info!(relays = relays.len(), "firehose connected");
 
-    // Archive everything except ephemeral kinds (NIP-01: not stored by relays).
-    let kinds: Vec<Kind> = (0u16..20_000)
-        .chain(30_000..=u16::MAX)
-        .map(Kind::Custom)
-        .collect();
-
-    loop {
-        let filter = Filter::default()
-            .kinds(kinds.clone())
-            .since(Timestamp::now());
-        if let Err(e) = client.subscribe(filter, None).await {
-            tracing::error!(error = %e, "firehose subscribe failed; retrying in 5s");
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            continue;
-        }
-
-        let mut rx = client.notifications();
-        loop {
-            match rx.recv().await {
-                Ok(RelayPoolNotification::Event { event, .. }) => sink.send(to_core(&event)).await,
-                Ok(RelayPoolNotification::Shutdown) => return Ok(()),
-                Ok(_) => {}
-                Err(_) => break,
-            }
-        }
-        tracing::warn!("firehose stream closed; reconnecting in 5s");
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-    }
+    let filter = nostrsearch_indexer::firehose::live_filter(None, true);
+    nostrsearch_indexer::firehose::stream(&client, filter, |ev| {
+        let sink = sink.clone();
+        async move { sink.send(to_core(&ev)).await }
+    })
+    .await;
+    Ok(())
 }
 
 /// Shared archive handle for the node (one process = one index lock).

@@ -26,7 +26,7 @@
 //! work and self-corrects.
 
 use crate::id_store::IdStore;
-use crate::pipeline::Pipeline;
+use crate::pipeline::{Pipeline, lock as lock_pipeline};
 use nostr_archive_cursor::NostrCursor;
 use nostrsearch_core::event::NostrEvent;
 use std::collections::HashSet;
@@ -131,7 +131,32 @@ pub async fn ingest(
     cancel: Arc<AtomicBool>,
 ) -> anyhow::Result<()> {
     progress.running.store(true, Ordering::Relaxed);
+    let stop_checkpoint = Arc::new(AtomicBool::new(false));
+    let result = run_passes(
+        pipeline,
+        opts,
+        id_store,
+        pending_ids,
+        progress.clone(),
+        cancel,
+        stop_checkpoint.clone(),
+    )
+    .await;
+    stop_checkpoint.store(true, Ordering::Relaxed);
+    progress.running.store(false, Ordering::Relaxed);
+    progress.finished_at.store(unix_now(), Ordering::Relaxed);
+    result
+}
 
+async fn run_passes(
+    pipeline: Arc<Mutex<Pipeline>>,
+    opts: IngestOptions,
+    id_store: Option<Arc<IdStore>>,
+    pending_ids: Arc<Mutex<HashSet<[u8; 32]>>>,
+    progress: Arc<IngestProgress>,
+    cancel: Arc<AtomicBool>,
+    stop_checkpoint: Arc<AtomicBool>,
+) -> anyhow::Result<()> {
     // Periodic checkpoint: commit, then record what that commit made durable.
     //
     // Without it a 24-hour run records nothing until the very end, so a kill at
@@ -145,17 +170,18 @@ pub async fn ingest(
         let store = id_store.clone();
         let every = opts.checkpoint_every;
         let done = cancel.clone();
+        let stop = stop_checkpoint.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(every);
             tick.tick().await; // consume the immediate first tick
             loop {
                 tick.tick().await;
-                if done.load(Ordering::Relaxed) {
+                if done.load(Ordering::Relaxed) || stop.load(Ordering::Relaxed) {
                     return;
                 }
                 let (pipe, pending, store) = (pipe.clone(), pending.clone(), store.clone());
                 let res = tokio::task::spawn_blocking(move || {
-                    let mut p = pipe.lock().unwrap();
+                    let mut p = lock_pipeline(&pipe);
                     commit_and_claim(&mut p, store.as_ref(), &pending)
                 })
                 .await;
@@ -168,7 +194,7 @@ pub async fn ingest(
         })
     };
 
-    let passes = pipeline.lock().unwrap().backfill_passes();
+    let passes = lock_pipeline(&pipeline).backfill_passes();
     progress.passes.store(passes as u64, Ordering::Relaxed);
     if passes > 1 {
         tracing::info!(
@@ -183,7 +209,7 @@ pub async fn ingest(
             break;
         }
 
-        let pass = pipeline.lock().unwrap().current_pass();
+        let pass = lock_pipeline(&pipeline).current_pass();
         let indexing_pass = pass == 0;
         progress.pass.store(pass as u64, Ordering::Relaxed);
 
@@ -194,9 +220,9 @@ pub async fn ingest(
         // whole corpus to hand every event to an observe() that discards them.
         // Skipping straight to advance_pass still runs the refresh and
         // materialize that actually produce its output.
-        if !pipeline.lock().unwrap().pass_needs_corpus() {
+        if !lock_pipeline(&pipeline).pass_needs_corpus() {
             tracing::info!(pass, "pass needs no corpus; skipping read");
-            if !pipeline.lock().unwrap().advance_pass() {
+            if !advance(&pipeline).await? {
                 break;
             }
             continue;
@@ -226,7 +252,7 @@ pub async fn ingest(
         let prog = progress.clone();
         let cancel_cb = cancel.clone();
         // Indexing handle, taken once: it is shared and needs no pipeline lock.
-        let indexer = pipeline.lock().unwrap().indexer();
+        let indexer = lock_pipeline(&pipeline).indexer();
 
         tokio::task::spawn_blocking(move || {
             // The cursor's own dedupe keeps every event id it has seen in a
@@ -260,43 +286,37 @@ pub async fn ingest(
                     // from are exactly the ones the dedupe store already knows.
                     // So dedupe gates indexing only; every event in the batch
                     // is still folded.
-                    let mut skipped = 0u64;
-                    // Positions in `batch` that still need indexing.
-                    let mut to_index: Vec<usize> = Vec::new();
-                    // Ids of the events kept, positionally aligned with
-                    // `batch`. Claimed only once their documents exist.
-                    let mut new_ids: Vec<[u8; 32]> = Vec::new();
                     let t_dedupe = std::time::Instant::now();
-                    if let Some(store) = &ck_store {
-                        let ids: Vec<[u8; 32]> = batch
-                            .iter()
-                            .map(|e| hex32(&e.id).unwrap_or([0u8; 32]))
-                            .collect();
-                        let known = store.contains_batch(&ids);
-                        to_index.reserve(batch.len());
-                        new_ids.reserve(batch.len());
-                        // Ids indexed since the last checkpoint are not in the
-                        // store yet. Without checking them too, a duplicate
-                        // arriving inside the checkpoint window is indexed
-                        // twice -- and tantivy has no unique key to catch it.
-                        let pend = ck_pending.lock().unwrap();
-                        let plan = plan_index_work(&ids, &known, |id| pend.contains(id));
-                        drop(pend);
-                        skipped = plan.skipped;
-                        to_index = plan.to_index;
-                        new_ids = plan.new_ids;
-                        prog.skipped.fetch_add(skipped, Ordering::Relaxed);
-                    } else {
-                        // No dedupe store: everything is new.
-                        to_index.extend(0..batch.len());
-                    }
+                    // Positions in `batch` that still need indexing, and the
+                    // ids of those events, claimed only once their documents
+                    // exist.
+                    let (to_index, new_ids): (Vec<usize>, Vec<[u8; 32]>) = match &ck_store {
+                        Some(store) => {
+                            let ids: Vec<[u8; 32]> = batch
+                                .iter()
+                                .map(|e| hex32(&e.id).unwrap_or([0u8; 32]))
+                                .collect();
+                            let known = store.contains_batch(&ids);
+                            // Ids indexed since the last checkpoint are not in
+                            // the store yet. Without checking them too, a
+                            // duplicate arriving inside the checkpoint window
+                            // is indexed twice -- and tantivy has no unique
+                            // key to catch it.
+                            let pend = ck_pending.lock().unwrap();
+                            let plan = plan_index_work(&ids, &known, |id| pend.contains(id));
+                            drop(pend);
+                            prog.skipped.fetch_add(plan.skipped, Ordering::Relaxed);
+                            (plan.to_index, plan.new_ids)
+                        }
+                        None => ((0..batch.len()).collect(), Vec::new()),
+                    };
                     prog.dedupe_ns
                         .fetch_add(t_dedupe.elapsed().as_nanos() as u64, Ordering::Relaxed);
 
                     // Fold under the pipeline lock. This mutates per-analysis
                     // state so it must be serial, but it is only hashmap work.
                     {
-                        let mut p = pipe.lock().unwrap();
+                        let mut p = lock_pipeline(&pipe);
                         for ev in &batch {
                             p.fold_only(ev);
                         }
@@ -351,7 +371,7 @@ pub async fn ingest(
 
         // Materialize this stage into the world so the next pass's consumers
         // can read it; stop when every stage has folded.
-        if !pipeline.lock().unwrap().advance_pass() {
+        if !advance(&pipeline).await? {
             break;
         }
     }
@@ -359,14 +379,17 @@ pub async fn ingest(
     // Finalize: switch to live, then record ids only after their documents are
     // durable — the commit-and-claim pairing, via the single shared path below.
     {
-        let mut p = pipeline.lock().unwrap();
-        p.go_live();
-        commit_and_claim(&mut p, id_store.as_ref(), &pending_ids)?;
+        let (pipeline, id_store, pending_ids) =
+            (pipeline.clone(), id_store.clone(), pending_ids.clone());
+        tokio::task::spawn_blocking(move || {
+            let mut p = lock_pipeline(&pipeline);
+            p.go_live();
+            commit_and_claim(&mut p, id_store.as_ref(), &pending_ids)
+        })
+        .await??;
     }
 
     checkpoint.abort();
-    progress.running.store(false, Ordering::Relaxed);
-    progress.finished_at.store(unix_now(), Ordering::Relaxed);
     let failed = progress.failed.load(Ordering::Relaxed);
     if failed > 0 {
         tracing::warn!(
@@ -382,6 +405,13 @@ pub async fn ingest(
         "archive ingest complete"
     );
     Ok(())
+}
+
+/// Materialize the finished stage on the blocking pool: it can take minutes
+/// on a full corpus, and holds the pipeline lock throughout.
+async fn advance(pipeline: &Arc<Mutex<Pipeline>>) -> anyhow::Result<bool> {
+    let pipeline = pipeline.clone();
+    Ok(tokio::task::spawn_blocking(move || lock_pipeline(&pipeline).advance_pass()).await?)
 }
 
 /// Commit every open shard, then durably record the ids indexed since the

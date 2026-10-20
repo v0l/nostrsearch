@@ -33,6 +33,7 @@
 //! adding to what is already there.
 
 use clap::Parser;
+use nostrsearch_indexer::pipeline::lock as lock_pipeline;
 use nostrsearch_indexer::{Pipeline, PipelineConfig, ShardWriterConfig};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -521,7 +522,7 @@ async fn run(args: Config, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()>
             let store = id_store_sig.clone();
             let pending = pending_sig.clone();
             let flushed = tokio::task::spawn_blocking(move || {
-                let mut p = pipe.lock().unwrap();
+                let mut p = lock_pipeline(&pipe);
                 p.finish()?;
                 // Everything is committed; record the seen-ids so the next
                 // run resumes instead of re-processing this window.
@@ -655,7 +656,6 @@ async fn run(args: Config, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()>
                 sort_batches,
                 dedupe: args.dedupe,
                 checkpoint_every: std::time::Duration::from_secs(args.checkpoint_secs),
-                ..Default::default()
             },
             id_store.clone(),
             pending_ids.clone(),
@@ -671,7 +671,7 @@ async fn run(args: Config, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()>
     if !args.relays.is_empty() {
         // If we skipped backfill, still switch the pipeline into live mode.
         if args.input_dir.is_none() {
-            pipeline.lock().unwrap().go_live();
+            lock_pipeline(&pipeline).go_live();
         }
 
         // periodic commit for durability while tailing
@@ -681,7 +681,7 @@ async fn run(args: Config, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()>
                 let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
                 loop {
                     tick.tick().await;
-                    if let Err(e) = pipe.lock().unwrap().commit() {
+                    if let Err(e) = lock_pipeline(&pipe).commit() {
                         tracing::warn!(error = %e, "periodic commit failed");
                     }
                 }
@@ -700,13 +700,13 @@ async fn run(args: Config, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()>
             "starting firehose tail"
         );
         nostrsearch_indexer::firehose::run(&fh, move |ev| {
-            pipe.lock().unwrap().process(ev);
+            lock_pipeline(&pipe).process(ev);
             total_cb.fetch_add(1, Ordering::Relaxed);
         })
         .await?;
     } else {
         // archive-only run: final flush
-        pipeline.lock().unwrap().finish()?;
+        lock_pipeline(&pipeline).finish()?;
     }
 
     let done = total.load(Ordering::Relaxed);

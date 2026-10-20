@@ -49,6 +49,7 @@ pub struct Reports {
 pub struct ReportStore {
     inner: Arc<RwLock<Reports>>,
     tx: broadcast::Sender<ReportDelta>,
+    closing: Arc<tokio::sync::watch::Sender<bool>>,
 }
 
 impl Default for ReportStore {
@@ -56,6 +57,7 @@ impl Default for ReportStore {
         Self {
             inner: Arc::new(RwLock::new(Reports::default())),
             tx: broadcast::channel(DELTA_BUFFER).0,
+            closing: Arc::new(tokio::sync::watch::channel(false).0),
         }
     }
 }
@@ -63,6 +65,10 @@ impl Default for ReportStore {
 impl ReportStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn close_streams(&self) {
+        self.closing.send_replace(true);
     }
 
     /// Apply and fan out incremental changes drained from the pipeline.
@@ -353,11 +359,7 @@ async fn sync_status(
             relay_days_total: total,
             relay_days_done: done.min(total),
             relay_days_remaining: total.saturating_sub(done),
-            percent_complete: if total == 0 {
-                100
-            } else {
-                ((done.min(total) * 100) / total) as u32
-            },
+            percent_complete: (done.min(total) * 100).checked_div(total).unwrap_or(100) as u32,
             usage_percentile: cut,
             oldest_day: chrono::DateTime::from_timestamp(min_date as i64, 0)
                 .map(|d| d.format("%Y-%m-%d").to_string())
@@ -417,10 +419,15 @@ async fn stream(
     State(store): State<ReportStore>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let rx = store.subscribe();
+    let mut closing = store.closing.subscribe();
     let s = async_stream::stream! {
         let mut rx = rx;
         loop {
-            match rx.recv().await {
+            let next = tokio::select! {
+                r = rx.recv() => r,
+                _ = closing.wait_for(|c| *c) => break,
+            };
+            match next {
                 Ok(delta) => {
                     if let Ok(ev) = Event::default().event("delta").json_data(&delta) {
                         yield Ok(ev);
@@ -567,7 +574,7 @@ mod relay_page_tests {
     /// two pages or none as the map rehashes between requests.
     #[test]
     fn ordering_breaks_ties_so_paging_is_stable() {
-        let mut v = vec![("b.example", 5u32), ("a.example", 5), ("c.example", 9)];
+        let mut v = [("b.example", 5u32), ("a.example", 5), ("c.example", 9)];
         v.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
         assert_eq!(
             v.iter().map(|(u, _)| *u).collect::<Vec<_>>(),

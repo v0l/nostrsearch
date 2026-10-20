@@ -13,9 +13,9 @@
 //!                          └─► stats Registry    (WoT / trending)
 //! ```
 //!
-//! Ephemeral kinds (20000-29999) are excluded from the upstream filter — per
-//! NIP-01 relays aren't expected to store them, and archiving them would bloat
-//! the corpus (same policy as nostrhole).
+//! Ephemeral kinds (20000-29999) are dropped on arrival — per NIP-01 relays
+//! aren't expected to store them, and archiving them would bloat the corpus
+//! (same policy as nostrhole).
 
 use nostr_archive_cursor::DefaultJsonFilesDatabase;
 use nostr_sdk::prelude::*;
@@ -39,13 +39,82 @@ pub fn to_core(ev: &Event) -> NostrEvent {
     }
 }
 
-/// All non-ephemeral kinds. Nostr filters are inclusive-only, so the
-/// 20000-29999 ephemeral range is excluded by enumeration (as nostrhole does).
-fn non_ephemeral_kinds() -> Vec<Kind> {
-    (0u16..20_000)
-        .chain(30_000..=u16::MAX)
-        .map(Kind::Custom)
-        .collect()
+/// The live subscription. No kind list: enumerating every non-ephemeral kind
+/// is a ~320 KB REQ that some relays (nos.lol) drop the connection over.
+/// Ephemeral kinds are discarded on arrival instead, by [`EphemeralFilter`].
+pub fn live_filter(kinds: Option<&[u16]>, since_now: bool) -> Filter {
+    let mut filter = Filter::new();
+    if since_now {
+        filter = filter.since(Timestamp::now());
+    }
+    match kinds {
+        Some(k) => filter.kinds(
+            k.iter()
+                .map(|v| Kind::Custom(*v))
+                .filter(|k| !k.is_ephemeral()),
+        ),
+        None => filter,
+    }
+}
+
+/// Rejects ephemeral events before the client archives or emits them.
+#[derive(Debug)]
+pub struct EphemeralFilter;
+
+impl AdmitPolicy for EphemeralFilter {
+    fn admit_event<'a>(
+        &'a self,
+        _relay_url: &'a RelayUrl,
+        _subscription_id: &'a SubscriptionId,
+        event: &'a Event,
+    ) -> BoxedFuture<'a, Result<AdmitStatus, PolicyError>> {
+        Box::pin(async move {
+            Ok(if event.kind.is_ephemeral() {
+                AdmitStatus::rejected("ephemeral")
+            } else {
+                AdmitStatus::Success
+            })
+        })
+    }
+}
+
+/// Subscribe once and forward events until the client shuts down.
+///
+/// A lagged receiver keeps going: the subscription is still open, and
+/// resubscribing would stack another one on top of it. Events missed while
+/// lagging are left for the gap scraper.
+pub async fn stream<F, Fut>(client: &Client, filter: Filter, mut on_event: F)
+where
+    F: FnMut(Box<Event>) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    loop {
+        if let Err(e) = client.subscribe(filter.clone(), None).await {
+            tracing::error!(error = %e, "firehose subscribe failed; retrying in 5s");
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            continue;
+        }
+        tracing::info!("firehose subscribed");
+        let mut rx = client.notifications();
+        loop {
+            match rx.recv().await {
+                Ok(RelayPoolNotification::Event { event, .. }) => on_event(event).await,
+                Ok(RelayPoolNotification::Message {
+                    message: RelayMessage::Notice(m),
+                    relay_url,
+                }) => tracing::warn!(relay = %relay_url, "notice: {}", m),
+                Ok(RelayPoolNotification::Shutdown) => return,
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                    tracing::warn!(skipped = n, "firehose lagged; continuing");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+        client.unsubscribe_all().await;
+        tracing::warn!("firehose stream closed; resubscribing in 5s");
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
 }
 
 /// Options for the firehose.
@@ -113,7 +182,9 @@ pub async fn run<F>(cfg: &FirehoseConfig, mut sink: F) -> anyhow::Result<()>
 where
     F: FnMut(&NostrEvent) + Send,
 {
-    let mut builder = Client::builder().signer(Keys::generate());
+    let mut builder = Client::builder()
+        .signer(Keys::generate())
+        .admit_policy(EphemeralFilter);
 
     if let Some(dir) = &cfg.archive_dir {
         let db = open_archive(dir)?;
@@ -134,44 +205,12 @@ where
     client.connect().await;
     tracing::info!(relays = cfg.relays.len(), "firehose connected");
 
-    loop {
-        let mut filter = Filter::default();
-        filter = match &cfg.kinds {
-            // Explicit whitelist, minus any ephemeral kinds.
-            Some(k) => filter.kinds(
-                k.iter()
-                    .map(|v| Kind::Custom(*v))
-                    .filter(|k| !k.is_ephemeral()),
-            ),
-            None => filter.kinds(non_ephemeral_kinds()),
-        };
-        if cfg.since_now {
-            filter = filter.since(Timestamp::now());
-        }
-
-        if let Err(e) = client.subscribe(filter, None).await {
-            tracing::error!(error = %e, "firehose subscribe failed; retrying in 5s");
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-            continue;
-        }
-
-        let mut rx = client.notifications();
-        loop {
-            match rx.recv().await {
-                // The archive DB has already persisted this event at this point.
-                Ok(RelayPoolNotification::Event { event, .. }) => sink(&to_core(&event)),
-                Ok(RelayPoolNotification::Message { message, relay_url }) => {
-                    if let RelayMessage::Notice(m) = message {
-                        tracing::warn!(relay = %relay_url, "notice: {}", m);
-                    }
-                }
-                Ok(RelayPoolNotification::Shutdown) => return Ok(()),
-                Ok(_) => {}
-                Err(_) => break, // stream closed → reconnect
-            }
-        }
-
-        tracing::warn!("firehose stream closed; reconnecting in 5s");
-        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-    }
+    let filter = live_filter(cfg.kinds.as_deref(), cfg.since_now);
+    // The archive DB has already persisted each event by the time it arrives.
+    stream(&client, filter, |ev| {
+        sink(&to_core(&ev));
+        std::future::ready(())
+    })
+    .await;
+    Ok(())
 }

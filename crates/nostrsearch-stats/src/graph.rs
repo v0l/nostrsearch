@@ -179,7 +179,7 @@ fn decode(raw: &[u8]) -> Follows {
     ts.copy_from_slice(&raw[..8]);
     let body = &raw[8..];
     let mut follows = Vec::with_capacity(body.len() / 32);
-    for chunk in body.chunks_exact(32) {
+    for chunk in body.as_chunks::<32>().0 {
         let mut pk = [0u8; 32];
         pk.copy_from_slice(chunk);
         follows.push(Hash32(pk));

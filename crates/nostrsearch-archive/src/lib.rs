@@ -196,7 +196,7 @@ async fn files_json(
     State(st): State<ArchiveState>,
 ) -> Result<Json<Vec<ArchiveFileInfo>>, Response> {
     let mut files = list(&st).await?;
-    files.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    files.sort_by_key(|f| std::cmp::Reverse(f.timestamp));
     Ok(Json(files))
 }
 
@@ -312,11 +312,7 @@ async fn serve_file(
     AxPath(file): AxPath<String>,
 ) -> Result<Response, Response> {
     // Reject traversal and anything that isn't an archive dump.
-    if file.contains("..")
-        || file.contains('/')
-        || file.contains('\\')
-        || !file.starts_with("events_")
-    {
+    if file.contains("..") || file.contains('/') || file.contains('\\') || !is_archive_dump(&file) {
         return Err((StatusCode::BAD_REQUEST, "invalid file name").into_response());
     }
     let path = st.dir.join(&file);
@@ -346,7 +342,7 @@ async fn serve_file(
 /// HTML landing page listing the archive (nostrhole's index page).
 async fn index(State(st): State<ArchiveState>) -> Result<Html<String>, Response> {
     let mut files = list(&st).await?;
-    files.sort_by(|a, b| b.timestamp.cmp(&a.timestamp));
+    files.sort_by_key(|f| std::cmp::Reverse(f.timestamp));
 
     let total_size: u64 = files.iter().map(|f| f.size).sum();
     // Only known when this process holds the index (i.e. relay mode).

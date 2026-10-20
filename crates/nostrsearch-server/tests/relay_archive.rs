@@ -6,7 +6,7 @@ use nostr_archive_cursor::DefaultJsonFilesDatabase;
 use nostr_sdk::prelude::*;
 use nostrsearch_core::scoring::ScoreWeights;
 use nostrsearch_server::{AppState, ArchiveState, RelayState, ShardRegistry};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 fn tempdir(tag: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();

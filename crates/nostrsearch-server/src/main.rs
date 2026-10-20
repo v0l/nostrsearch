@@ -84,11 +84,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ── Search side (reader; auto-reloads on the writer's commits) ──────────
     let registry = ShardRegistry::open(&index_root, ScoreWeights::default())?;
-    let docs = {
-        let mut r = ShardRegistry::open(&index_root, ScoreWeights::default())?;
-        r.stats().total_docs
-    };
-    tracing::info!(index_root = %index_root.display(), docs, "opened index root");
+    tracing::info!(index_root = %index_root.display(), "opened index root");
     let state = Arc::new(AppState {
         registry,
     });
@@ -215,19 +211,17 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // ── Firehose: shares the same archive handle and writer task ────────────
-    if want_firehose {
-        if let Some(sink) = &sink {
-            let db = archive
-                .as_ref()
-                .and_then(|a| a.db.as_ref())
-                .map(|d| (**d).clone());
-            tracing::info!(
-                relays = relays.len(),
-                archiving = db.is_some(),
-                "starting firehose"
-            );
-            nostrsearch_server::spawn_firehose(relays.clone(), db, sink.clone());
-        }
+    if want_firehose && let Some(sink) = &sink {
+        let db = archive
+            .as_ref()
+            .and_then(|a| a.db.as_ref())
+            .map(|d| (**d).clone());
+        tracing::info!(
+            relays = relays.len(),
+            archiving = db.is_some(),
+            "starting firehose"
+        );
+        nostrsearch_server::spawn_firehose(relays.clone(), db, sink.clone());
     }
 
     // ── Scraper: continuous full-network gap-filler ─────────────────────────
@@ -296,6 +290,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let has_admin = admin.is_some();
+    let streams = reports.clone();
     let app = nostrsearch_server::http::router_full_node(
         state,
         archive,
@@ -314,7 +309,10 @@ async fn main() -> anyhow::Result<()> {
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
+    .with_graceful_shutdown(async move {
+        shutdown_signal().await;
+        streams.close_streams();
+    })
     .await?;
 
     // Flush the index before exiting, otherwise everything since the last

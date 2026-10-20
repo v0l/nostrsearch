@@ -43,7 +43,9 @@ pub fn decode_hex(s: &str, allowed: &[&str]) -> Option<String> {
         }
     }
     let bytes: Vec<u8> = bits
-        .chunks_exact(8)
+        .as_chunks::<8>()
+        .0
+        .iter()
         .map(|c| c.iter().fold(0u8, |acc, b| (acc << 1) | b))
         .collect();
 

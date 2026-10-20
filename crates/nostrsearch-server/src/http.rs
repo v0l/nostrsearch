@@ -178,6 +178,10 @@ fn split_csv(s: &Option<String>) -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn clamp_limit(limit: Option<usize>) -> usize {
+    limit.unwrap_or(50).clamp(1, 500)
+}
+
 fn split_kinds(s: &Option<String>) -> Vec<u16> {
     split_csv(s).iter().filter_map(|x| x.parse().ok()).collect()
 }
@@ -197,7 +201,7 @@ async fn search_get(
         tag_g: split_csv(&p.geo),
         hosts: split_csv(&p.site),
         nip05: split_csv(&p.nip05),
-        limit: p.limit.unwrap_or(50).min(500),
+        limit: clamp_limit(p.limit),
         ..Default::default()
     };
     run_search(state, filter).await
@@ -217,6 +221,7 @@ async fn search_post(
 /// The wire form of a search filter (mirrors `SearchFilter`, serde-friendly).
 #[derive(Debug, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct SearchFilterDto {
     pub search: Option<String>,
     pub authors: Vec<String>,
@@ -233,28 +238,6 @@ pub struct SearchFilterDto {
     pub hosts: Vec<String>,
     pub nip05: Vec<String>,
     pub limit: Option<usize>,
-}
-
-impl Default for SearchFilterDto {
-    fn default() -> Self {
-        Self {
-            search: None,
-            authors: vec![],
-            kinds: vec![],
-            tag_t: vec![],
-            tag_e: vec![],
-            tag_p: vec![],
-            tag_a: vec![],
-            tag_d: vec![],
-            tag_g: vec![],
-            since: None,
-            until: None,
-            lang: None,
-            hosts: vec![],
-            nip05: vec![],
-            limit: None,
-        }
-    }
 }
 
 impl From<SearchFilterDto> for SearchFilter {
@@ -274,7 +257,7 @@ impl From<SearchFilterDto> for SearchFilter {
             lang: d.lang,
             hosts: d.hosts,
             nip05: d.nip05,
-            limit: d.limit.unwrap_or(50).min(500),
+            limit: clamp_limit(d.limit),
         }
     }
 }
@@ -369,18 +352,16 @@ async fn stats(State(state): State<SharedState>) -> Result<Json<RegistryStats>, 
 #[derive(Debug)]
 pub enum ApiError {
     Registry(crate::registry::RegistryError),
-    Poisoned,
     NotFound,
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let (code, msg) = match self {
+            ApiError::Registry(e @ crate::registry::RegistryError::Query(_)) => {
+                (StatusCode::BAD_REQUEST, e.to_string())
+            }
             ApiError::Registry(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
-            ApiError::Poisoned => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "registry lock poisoned".to_string(),
-            ),
             ApiError::NotFound => (StatusCode::NOT_FOUND, "event not found".to_string()),
         };
         (code, Json(serde_json::json!({ "error": msg }))).into_response()

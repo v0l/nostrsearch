@@ -184,7 +184,6 @@ async fn auth(State(st): State<AdminState>, req: Request, next: Next) -> Respons
         Ok(e) => e,
         Err(_) => return deny("auth event is not a valid nostr event"),
     };
-    {}
 
     // Signature first: everything below trusts the event's contents.
     if event.verify().is_err() {
@@ -233,18 +232,10 @@ async fn auth(State(st): State<AdminState>, req: Request, next: Next) -> Respons
     let original = req
         .extensions()
         .get::<axum::extract::OriginalUri>()
-        .map(|o| o.0.path().to_string());
-    let want_path = original.as_deref().unwrap_or_else(|| req.uri().path());
-    let ok_url = match url::Url::parse(&u) {
-        Ok(parsed) => {
-            let path_ok = parsed.path() == want_path;
-            match &st.cfg.origin {
-                Some(origin) => path_ok && u.starts_with(origin.as_str()),
-                None => path_ok,
-            }
-        }
-        Err(_) => false,
-    };
+        .map(|o| o.0.clone())
+        .unwrap_or_else(|| req.uri().clone());
+    let want_path = original.path().to_string();
+    let ok_url = url_matches(&u, &original, st.cfg.origin.as_deref());
     if !ok_url {
         return deny("auth event u tag does not match this URL");
     }
@@ -273,6 +264,32 @@ async fn auth(State(st): State<AdminState>, req: Request, next: Next) -> Respons
         "authenticated admin request"
     );
     next.run(req).await
+}
+
+/// Whether the signed `u` tag names this request: same path, same query
+/// parameters, and when an origin is configured, exactly that origin.
+fn url_matches(signed: &str, request: &axum::http::Uri, origin: Option<&str>) -> bool {
+    let Ok(parsed) = url::Url::parse(signed) else {
+        return false;
+    };
+    if parsed.path() != request.path() {
+        return false;
+    }
+    let mut signed_q: Vec<(String, String)> = parsed.query_pairs().into_owned().collect();
+    let mut request_q: Vec<(String, String)> =
+        url::form_urlencoded::parse(request.query().unwrap_or("").as_bytes())
+            .into_owned()
+            .collect();
+    signed_q.sort();
+    request_q.sort();
+    if signed_q != request_q {
+        return false;
+    }
+    match origin.map(url::Url::parse) {
+        None => true,
+        Some(Ok(o)) => parsed.origin() == o.origin(),
+        Some(Err(_)) => false,
+    }
 }
 
 pub fn router(state: AdminState) -> Router {
@@ -710,6 +727,62 @@ async fn reset_relay(State(st): State<AdminState>, Query(q): Query<RelayResetQue
             Json(serde_json::json!({ "error": "reset failed" })),
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::url_matches;
+
+    fn uri(s: &str) -> axum::http::Uri {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn query_is_part_of_what_is_signed() {
+        let req = uri("/admin/scrape/reset?relay=wss%3A%2F%2Fa&from=2024-01-01");
+        assert!(url_matches(
+            "https://n.io/admin/scrape/reset?from=2024-01-01&relay=wss://a",
+            &req,
+            None
+        ));
+        assert!(!url_matches("https://n.io/admin/scrape/reset", &req, None));
+        assert!(!url_matches(
+            "https://n.io/admin/scrape/reset?relay=wss://b&from=2024-01-01",
+            &req,
+            None
+        ));
+        assert!(!url_matches(
+            "https://n.io/admin/scrape/reset?relay=wss://a",
+            &uri("/admin/scrape/reset"),
+            None
+        ));
+    }
+
+    #[test]
+    fn origin_must_match_exactly() {
+        let req = uri("/admin/ingest");
+        let origin = Some("https://archive.v0l.io");
+        assert!(url_matches(
+            "https://archive.v0l.io/admin/ingest",
+            &req,
+            origin
+        ));
+        assert!(!url_matches(
+            "https://archive.v0l.io.evil.com/admin/ingest",
+            &req,
+            origin
+        ));
+        assert!(!url_matches(
+            "http://archive.v0l.io/admin/ingest",
+            &req,
+            origin
+        ));
+        assert!(!url_matches(
+            "https://archive.v0l.io/admin/other",
+            &req,
+            origin
+        ));
     }
 }
 

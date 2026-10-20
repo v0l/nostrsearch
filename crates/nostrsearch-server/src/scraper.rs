@@ -54,18 +54,29 @@ impl Sink for NodeSink {
     }
 
     async fn missing(&self, ids: Vec<[u8; 32]>) -> Vec<[u8; 32]> {
-        let mut out = Vec::new();
-        for id in ids {
-            if self.in_dedupe(&id) {
-                continue;
-            }
-            let eid = EventId::from_byte_array(id);
-            match self.db.check_id(&eid).await {
-                Ok(DatabaseEventStatus::NotExistent) => out.push(id),
-                _ => {}
-            }
-        }
-        out
+        let dedupe = self.dedupe.clone();
+        let db = self.db.clone();
+        tokio::task::spawn_blocking(move || {
+            let indexed = match &dedupe {
+                Some(s) => s.contains_batch(&ids),
+                None => vec![false; ids.len()],
+            };
+            ids.into_iter()
+                .zip(indexed)
+                .filter(|(id, indexed)| {
+                    !indexed
+                        && matches!(
+                            futures::executor::block_on(
+                                db.check_id(&EventId::from_byte_array(*id))
+                            ),
+                            Ok(DatabaseEventStatus::NotExistent)
+                        )
+                })
+                .map(|(id, _)| id)
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
     }
 
     async fn process(&self, events: Vec<Event>) -> u64 {
@@ -247,29 +258,26 @@ pub fn spawn_scraper(
                     Ok(from_report)
                 };
 
-                match found {
-                    Ok(found) => {
-                        let existing: std::collections::HashMap<String, RelayInfo> =
-                            state.relays().into_iter().collect();
-                        let mut kept = 0;
-                        for (url, sources) in found
-                            .iter()
-                            .filter(|(_, n)| *n >= opts.min_sources as u64)
-                            .take(if opts.max_relays == 0 {
-                                usize::MAX
-                            } else {
-                                opts.max_relays
-                            })
-                        {
-                            let mut info = existing.get(url).cloned().unwrap_or_default();
-                            info.sources = *sources as u32;
-                            state.put_relay(url, &info);
-                            kept += 1;
-                        }
-                        tracing::info!(found = found.len(), kept, "scraper: relay discovery");
-                        state.set_last_discovery(now);
+                if let Ok(found) = found {
+                    let existing: std::collections::HashMap<String, RelayInfo> =
+                        state.relays().into_iter().collect();
+                    let mut kept = 0;
+                    for (url, sources) in found
+                        .iter()
+                        .filter(|(_, n)| *n >= opts.min_sources as u64)
+                        .take(if opts.max_relays == 0 {
+                            usize::MAX
+                        } else {
+                            opts.max_relays
+                        })
+                    {
+                        let mut info = existing.get(url).cloned().unwrap_or_default();
+                        info.sources = *sources as u32;
+                        state.put_relay(url, &info);
+                        kept += 1;
                     }
-                    Err(()) => {}
+                    tracing::info!(found = found.len(), kept, "scraper: relay discovery");
+                    state.set_last_discovery(now);
                 }
             }
 

@@ -492,3 +492,20 @@ fn a_reset_keeps_the_graph_even_if_its_directory_is_destroyed() {
         "ranks must rebuild from the still-attached graph"
     );
 }
+
+/// The writer records an id in the dedupe store only when `process` says a
+/// document was written. Claiming one that failed to index hides that event
+/// from every later ingest.
+#[test]
+fn process_reports_whether_the_event_reached_the_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut p = Pipeline::new(config(dir.path())).unwrap();
+    p.go_live();
+
+    let ok = ev(&"a".repeat(64), &"b".repeat(64), 1, 1_700_000_000, vec![]);
+    assert!(p.process(&ok));
+
+    std::fs::write(dir.path().join("index").join("2001-01"), b"not a shard").unwrap();
+    let blocked = ev(&"d".repeat(64), &"b".repeat(64), 1, 978_307_200, vec![]);
+    assert!(!p.process(&blocked));
+}

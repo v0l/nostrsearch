@@ -23,7 +23,7 @@ fn index_and_search_real_events() {
 
     // --- ingest ---
     let mut indexed = 0usize;
-    let mut kind1_content: Option<String> = None;
+    let kind1_content: Option<String>;
     {
         let cfg = ShardWriterConfig {
             commit_every_docs: 5_000,
@@ -43,7 +43,7 @@ fn index_and_search_real_events() {
                 .with_dedupe(false)
                 .walk_with_chunked_sync(
                     move |events: Vec<nostr_archive_cursor::NostrEventBorrowed>| {
-                        let mut m = mgr_cb.lock().unwrap();
+                        let m = mgr_cb.lock().unwrap();
                         for ev in &events {
                             let owned = NostrEvent {
                                 id: ev.id.to_string(),
@@ -75,7 +75,7 @@ fn index_and_search_real_events() {
             mgr.lock().unwrap().commit_all().unwrap();
         } else {
             // synthetic fallback
-            let mut mgr = ShardManager::new(&index_root, cfg);
+            let mgr = ShardManager::new(&index_root, cfg);
             for i in 0..1000u64 {
                 let ev = NostrEvent {
                     id: format!("{:064x}", i),
@@ -97,7 +97,7 @@ fn index_and_search_real_events() {
     eprintln!("indexed {indexed} events");
 
     // --- search ---
-    let mut reg = ShardRegistry::open(&index_root, ScoreWeights::default()).unwrap();
+    let reg = ShardRegistry::open(&index_root, ScoreWeights::default()).unwrap();
     let stats = reg.stats();
     eprintln!(
         "stats: {} docs across {} shards",
@@ -111,7 +111,7 @@ fn index_and_search_real_events() {
         let term = content
             .split_whitespace()
             .filter(|w| w.len() >= 5 && w.chars().all(|c| c.is_alphanumeric()))
-            .last()
+            .next_back()
             .unwrap_or("nostr")
             .to_lowercase();
         eprintln!("searching for term: {term}");
