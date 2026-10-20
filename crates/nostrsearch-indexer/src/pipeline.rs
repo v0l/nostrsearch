@@ -206,21 +206,8 @@ impl Pipeline {
     /// to fall back to scanning the index that one time.
     pub fn relay_targets(&self) -> Vec<(String, u64)> {
         self.registry
-            .snapshots()
-            .into_iter()
-            .find(|(n, _)| *n == "relays")
-            .and_then(|(_, v)| {
-                serde_json::from_value::<
-                    std::collections::HashMap<String, nostrsearch_stats::analyses::RelayStats>,
-                >(v)
-                .ok()
-            })
-            .map(|m| {
-                let mut out: Vec<(String, u64)> =
-                    m.into_iter().map(|(u, s)| (u, s.advertisers)).collect();
-                out.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
-                out
-            })
+            .get::<Relays>()
+            .map(Relays::ranked)
             .unwrap_or_default()
     }
 

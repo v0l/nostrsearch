@@ -45,9 +45,18 @@ pub struct RelayStats {
     pub advertisers: u64,
     /// Newest relay list that mentioned it.
     pub last_seen: u64,
-    /// Estimator backing `advertisers`. Not part of the report output.
+    /// Estimator backing `advertisers`. Persisted, never published.
     #[serde(default)]
     hll: Hll,
+}
+
+/// What the `relays` report publishes per relay. The sketch stays behind: at
+/// 16 KiB per relay it made the report ~270 MB of JSON, rebuilt as a
+/// `serde_json::Value` tree on every commit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelaySummary {
+    pub advertisers: u64,
+    pub last_seen: u64,
 }
 
 /// Relay advertisement counts, keyed by normalized URL.
@@ -73,7 +82,7 @@ impl Relays {
 }
 
 impl Analysis for Relays {
-    type Output = HashMap<String, RelayStats>;
+    type Output = HashMap<String, RelaySummary>;
 
     fn name(&self) -> &'static str {
         "relays"
@@ -120,7 +129,18 @@ impl Analysis for Relays {
     }
 
     fn snapshot(&self) -> Self::Output {
-        self.data.clone()
+        self.data
+            .iter()
+            .map(|(url, s)| {
+                (
+                    url.clone(),
+                    RelaySummary {
+                        advertisers: s.advertisers,
+                        last_seen: s.last_seen,
+                    },
+                )
+            })
+            .collect()
     }
 }
 
@@ -217,6 +237,17 @@ mod tests {
         let ev = relay_list(7, &["wss://r0.example.com"]);
         assert!(r.observe(&ev, &ctx_for(&ev, &world)));
         assert_eq!(r.data["wss://r0.example.com"].advertisers, 1);
+    }
+
+    #[test]
+    fn the_report_does_not_carry_the_sketch() {
+        let world = World::new();
+        let mut r = Relays::default();
+        let ev = relay_list(1, &["wss://relay.damus.io"]);
+        r.observe(&ev, &ctx_for(&ev, &world));
+        let json = serde_json::to_string(&r.snapshot()).unwrap();
+        assert!(json.len() < 100, "report entry is {} bytes: {json}", json.len());
+        assert_eq!(r.snapshot()["wss://relay.damus.io"].advertisers, 1);
     }
 
     #[test]

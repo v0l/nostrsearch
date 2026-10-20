@@ -300,26 +300,13 @@ impl ShardRegistry {
             .unwrap_or_default()
             .as_secs();
 
-        // Resolve the readers first -- that needs `&mut self` because a shard
-        // is opened and cached on first touch -- then query them concurrently.
-        //
-        // This loop used to run the shards one at a time. Each one is a full
-        // Tantivy search, and a text query with no date bound plans across every
-        // shard on the node: 374 of them here, ~70ms each, so a single query
-        // took 25-40 seconds. Worse, the caller holds one global registry mutex
-        // for the whole call, so that query also blocked /stats, /admin/* and
-        // every other search -- a 401 took seven seconds to come back.
-        //
-        // Shards are independent indices and a `Searcher` is `Sync`, so there is
-        // nothing to serialise here but the merge at the end.
-        let t_resolve = std::time::Instant::now();
-        let resolved: Vec<Arc<ShardReader>> = planned
-            .shards
-            .iter()
-            .filter_map(|id| self.shard(*id))
-            .collect();
-        let resolve_ms = t_resolve.elapsed().as_millis();
-
+        // Readers are opened inside the workers, one shard at a time, so a
+        // query planned across the whole corpus holds `workers` readers at
+        // once rather than all of them. Past the cache size, uncached shards
+        // are read through transient readers so the scan cannot evict the
+        // shards other searches are using.
+        let shard_ids = &planned.shards;
+        let cache_misses = shard_ids.len() > self.max_open;
         let weights = self.weights;
         let limit = filter.limit;
         let text_query = filter.search.is_some();
@@ -327,7 +314,7 @@ impl ShardRegistry {
         let workers = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4)
-            .min(resolved.len().max(1));
+            .min(shard_ids.len().max(1));
 
         let t_fan = std::time::Instant::now();
         // Per-shard wall time, so a slow tail is visible rather than averaged
@@ -338,13 +325,20 @@ impl ShardRegistry {
         let mut hits: Vec<SearchHit> = std::thread::scope(|scope| {
             let handles: Vec<_> = (0..workers)
                 .map(|_| {
-                    let (next, resolved, shard_us) = (&next, &resolved, &shard_us);
+                    let (next, shard_us) = (&next, &shard_us);
                     scope.spawn(move || {
                         let mut local: Vec<SearchHit> = Vec::new();
                         loop {
                             let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            let Some(shard) = resolved.get(i) else { break };
+                            let Some(&id) = shard_ids.get(i) else { break };
                             let t = std::time::Instant::now();
+                            let shard = if cache_misses {
+                                self.cached_or_transient(id)
+                            } else {
+                                self.shard(id)
+                            };
+                            let Some(shard) = shard else { continue };
+                            let shard = &shard;
                             Self::search_one(
                                 shard, query, text_query, limit, weights, now, &mut local,
                             );
@@ -376,10 +370,9 @@ impl ShardRegistry {
         let total_shard_ms: u128 = per.iter().map(|(_, us)| us / 1000).sum();
         tracing::info!(
             plan_ms,
-            resolve_ms,
             fan_ms,
             workers,
-            shards = resolved.len(),
+            shards = per.len(),
             planned = planned.shards.len(),
             shard_ms_sum = total_shard_ms,
             busiest = busiest.join(" "),

@@ -72,6 +72,34 @@ fn open_readers_stay_under_the_cap() {
     );
 }
 
+/// A query planned across more shards than the cache holds must not open
+/// them all, and must not evict the shards already cached for other searches.
+#[test]
+fn a_corpus_wide_query_leaves_the_cache_alone() {
+    let root = tempdir("wide");
+    make_shards(&root, 30);
+    let reg = ShardRegistry::open_with_capacity(&root, ScoreWeights::default(), 4).unwrap();
+
+    let recent = SearchFilter {
+        since: Some(1_640_995_200),
+        until: Some(1_643_673_600),
+        limit: 5,
+        ..Default::default()
+    };
+    reg.search(&recent).unwrap();
+    let before = reg.open_readers();
+    assert!(before <= 2);
+
+    let hits = reg
+        .search(&SearchFilter {
+            limit: 5,
+            ..Default::default()
+        })
+        .unwrap();
+    assert!(hits.is_empty());
+    assert_eq!(reg.open_readers(), before, "the wide scan went through the cache");
+}
+
 /// `/stats` is polled by the console every few seconds. Counting documents
 /// must not open readers, or every poll evicts the shards searches are using.
 #[test]

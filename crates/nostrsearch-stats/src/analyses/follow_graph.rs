@@ -45,8 +45,17 @@ impl FollowGraph {
     }
 }
 
+/// What the `follow_graph` report publishes. The per-pubkey counts feed the
+/// world; publishing them made a 100 MB report of 1.5M entries, rebuilt on
+/// every commit, that nothing read.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct FollowGraphSummary {
+    pub followed: usize,
+    pub by_tier: [u64; 5],
+}
+
 impl Analysis for FollowGraph {
-    type Output = HashMap<Pubkey, u32>;
+    type Output = FollowGraphSummary;
 
     fn name(&self) -> &'static str {
         "follow_graph"
@@ -162,7 +171,14 @@ impl Analysis for FollowGraph {
     }
 
     fn snapshot(&self) -> Self::Output {
-        self.counts.clone()
+        let mut by_tier = [0u64; 5];
+        for &count in self.counts.values() {
+            by_tier[Self::tier(count) as usize] += 1;
+        }
+        FollowGraphSummary {
+            followed: self.counts.len(),
+            by_tier,
+        }
     }
 }
 
@@ -235,6 +251,10 @@ mod tests {
             world.follower_count(&Pubkey::from_hex(&pk_hex(7)).unwrap()),
             0
         );
+
+        let summary = g.snapshot();
+        assert_eq!(summary.followed as u64, summary.by_tier.iter().sum::<u64>());
+        assert_eq!(summary.by_tier[0], summary.followed as u64);
 
         drop(g);
         drop(store);

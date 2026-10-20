@@ -44,6 +44,7 @@ pub trait DynAnalysis: Send + Sync {
     fn checkpoint_bin(&self) -> Result<Vec<u8>>;
     fn restore_bin(&mut self, bytes: &[u8]) -> Result<()>;
     fn into_any(self: Box<Self>) -> Box<dyn Any>;
+    fn as_any(&self) -> &dyn Any;
 }
 
 impl<A> DynAnalysis for A
@@ -112,6 +113,9 @@ where
         Ok(())
     }
     fn into_any(self: Box<Self>) -> Box<dyn Any> {
+        self
+    }
+    fn as_any(&self) -> &dyn Any {
         self
     }
 }
@@ -715,6 +719,13 @@ impl Registry {
                     })
             })
             .collect()
+    }
+
+    /// The registered analysis of type `A`, if any.
+    pub fn get<A: 'static>(&self) -> Option<&A> {
+        self.entries
+            .iter()
+            .find_map(|e| e.analysis.as_any().downcast_ref::<A>())
     }
 
     pub fn snapshots(&self) -> Vec<(&'static str, serde_json::Value)> {
