@@ -24,8 +24,18 @@ use std::sync::Arc;
 // server node, `ingest` and `stats` all agree on the same variables.
 use nostrsearch_indexer::env;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    let rt = tokio::runtime::Runtime::new()?;
+    let result = rt.block_on(run());
+    // A background archive pass (shard indexing, a replay, the scraper's
+    // reads) sits on the blocking pool and cannot be cancelled. Dropping the
+    // runtime waits for it, which on a cold HDD is longer than the
+    // container's grace period. Everything durable is flushed by now.
+    rt.shutdown_timeout(std::time::Duration::from_secs(5));
+    result
+}
+
+async fn run() -> anyhow::Result<()> {
     rustls::crypto::ring::default_provider()
         .install_default()
         .ok();
@@ -291,6 +301,7 @@ async fn main() -> anyhow::Result<()> {
 
     let has_admin = admin.is_some();
     let streams = reports.clone();
+    let archive_db = archive.as_ref().and_then(|a| a.db.clone());
     let app = nostrsearch_server::http::router_full_node(
         state,
         archive,
@@ -320,6 +331,11 @@ async fn main() -> anyhow::Result<()> {
     if let Some(h) = writer_handle {
         tracing::info!("flushing writer before exit");
         h.shutdown().await;
+    }
+    if let Some(db) = archive_db
+        && let Err(e) = db.flush().await
+    {
+        tracing::warn!(error = %e, "archive flush on exit failed");
     }
     tracing::info!("nostrsearch node stopped");
     Ok(())
