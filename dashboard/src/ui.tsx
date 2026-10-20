@@ -43,6 +43,10 @@ export const NOSTR_EPOCH = 1577836800; // 2020-01-01
  * down with it.
  */
 export function plausibleDay(unix: number): boolean {
+  return Number.isFinite(unix) && unix >= NOSTR_EPOCH && unix <= Date.now() / 1000;
+}
+
+function plausibleTime(unix: number): boolean {
   return (
     Number.isFinite(unix) &&
     unix >= NOSTR_EPOCH &&
@@ -52,7 +56,7 @@ export function plausibleDay(unix: number): boolean {
 
 /** `YYYY-MM-DD`, or an em dash when the timestamp cannot be one. */
 export function isoDay(unix: number): string {
-  if (!plausibleDay(unix)) return "—";
+  if (!plausibleTime(unix)) return "—";
   try {
     return new Date(unix * 1000).toISOString().slice(0, 10);
   } catch {
