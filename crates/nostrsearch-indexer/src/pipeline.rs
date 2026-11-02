@@ -543,12 +543,74 @@ impl Pipeline {
         self.registry.stage_kinds(&self.stages[self.pass])
     }
 
+    pub fn plan_replay(&mut self) -> usize {
+        let Ok(stages) = self.registry.stages() else {
+            return self.stages.len();
+        };
+        let entries = self.registry.entries();
+        let names: Vec<&str> = entries.iter().map(|e| e.name()).collect();
+        let pending: Vec<bool> = entries.iter().map(|e| e.needs_backfill()).collect();
+        let mut pass_of: Vec<usize> = vec![0; entries.len()];
+        for stage in &stages {
+            for &i in stage {
+                pass_of[i] = entries[i]
+                    .analysis
+                    .deps()
+                    .iter()
+                    .filter_map(|d| names.iter().position(|n| n == d))
+                    .filter(|&d| pending[d])
+                    .map(|d| pass_of[d] + 1)
+                    .max()
+                    .unwrap_or(0);
+            }
+        }
+        let passes = pass_of
+            .iter()
+            .zip(&pending)
+            .filter(|(_, p)| **p)
+            .map(|(n, _)| n + 1)
+            .max()
+            .unwrap_or(1);
+        let mut plan: Vec<Vec<usize>> = vec![Vec::new(); passes];
+        for (i, p) in pass_of.iter().enumerate() {
+            plan[(*p).min(passes - 1)].push(i);
+        }
+        self.stages = plan;
+        self.pass = 0;
+        passes
+    }
+
+    pub fn pass_file_done(&self, file: &str) -> bool {
+        self.registry.file_done_for(&self.stages[self.pass], file)
+    }
+
+    pub fn finish_pass_files(&mut self, files: &[String]) -> Result<()> {
+        let stage = self.stages[self.pass].clone();
+        for f in files {
+            self.registry.finish_file(&stage, f);
+        }
+        if let Some(store) = &self.store {
+            self.registry.persist(store)?;
+        }
+        self.last_persist = Instant::now();
+        Ok(())
+    }
+
+    pub fn plan_full_backfill(&mut self) -> usize {
+        if let Ok(stages) = self.registry.stages() {
+            self.stages = stages;
+        }
+        self.pass = 0;
+        self.stages.len()
+    }
+
     pub fn advance_pass(&mut self) -> bool {
         let stage = self.stages[self.pass].clone();
         let now_wall = Self::now();
         self.registry
             .materialize_stage(&stage, now_wall, &mut self.world);
         self.registry.mark_backfilled(&stage);
+        self.registry.clear_rebuild(&stage);
 
         // Publish the freshly materialized trust data to the index writer too,
         // so a later pass (and the live tail) score with real tiers.

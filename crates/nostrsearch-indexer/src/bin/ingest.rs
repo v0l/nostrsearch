@@ -657,6 +657,7 @@ async fn run(args: Config, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()>
                 dedupe: args.dedupe,
                 checkpoint_every: std::time::Duration::from_secs(args.checkpoint_secs),
                 index: true,
+                stop_after_files: None,
             },
             id_store.clone(),
             pending_ids.clone(),

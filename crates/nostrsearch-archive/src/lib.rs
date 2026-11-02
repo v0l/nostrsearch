@@ -216,7 +216,7 @@ const DUMP_EXTS: &[&str] = &[
     ".json.bz2",
 ];
 
-fn is_archive_dump(name: &str) -> bool {
+pub fn is_archive_dump(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     DUMP_EXTS.iter().any(|e| lower.ends_with(e))
 }

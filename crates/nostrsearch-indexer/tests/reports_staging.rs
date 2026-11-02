@@ -604,3 +604,150 @@ async fn a_replay_skips_stages_whose_analyses_are_already_backfilled() {
         "nothing needed rebuilding, so nothing should be read"
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replay_on_a_live_node_counts_each_event_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let day0 = 1_700_000_000 - (1_700_000_000 % DAY);
+    let dumps = dir.path().join("dumps");
+    let events = corpus(day0);
+    write_dump(&dumps, &events);
+
+    let mut fresh = Pipeline::new(config(dir.path())).unwrap();
+    run_all_passes(&mut fresh, &events);
+    let want = report(&fresh, "activity");
+    fresh.reset_analysis("activity").unwrap();
+    fresh.finish().unwrap();
+    drop(fresh);
+
+    let mut live = Pipeline::new(config(dir.path())).unwrap();
+    live.go_live();
+    let p = std::sync::Arc::new(std::sync::Mutex::new(live));
+    replay(p.clone(), &dumps, false).await;
+    let got = report(&p.lock().unwrap(), "activity");
+    assert_eq!(got, want, "a server-side replay must fold each event exactly once");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebuild_whose_dependencies_are_complete_reads_the_archive_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let day0 = 1_700_000_000 - (1_700_000_000 % DAY);
+    let dumps = dir.path().join("dumps");
+    let events = corpus(day0);
+    write_dump(&dumps, &events);
+
+    let mut fresh = Pipeline::new(config(dir.path())).unwrap();
+    run_all_passes(&mut fresh, &events);
+    let want = report(&fresh, "activity");
+    let want_users = report(&fresh, "new_users");
+    fresh.reset_analysis("activity").unwrap();
+    fresh.reset_analysis("new_users").unwrap();
+    fresh.finish().unwrap();
+    drop(fresh);
+
+    let mut live = Pipeline::new(config(dir.path())).unwrap();
+    live.go_live();
+    let p = std::sync::Arc::new(std::sync::Mutex::new(live));
+    let progress = replay(p.clone(), &dumps, false).await;
+    assert_eq!(
+        progress.seen.load(std::sync::atomic::Ordering::Relaxed),
+        events.len() as u64,
+        "follow_graph is already built, so a stage-0 and a stage-1 rebuild share one pass"
+    );
+    assert_eq!(report(&p.lock().unwrap(), "new_users"), want_users);
+    let guard = p.lock().unwrap();
+    assert_eq!(report(&guard, "activity"), want, "and the trusted split is still right");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_replay_on_the_same_node_starts_from_the_first_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let day0 = 1_700_000_000 - (1_700_000_000 % DAY);
+    let dumps = dir.path().join("dumps");
+    let events = corpus(day0);
+    write_dump(&dumps, &events);
+
+    let mut fresh = Pipeline::new(config(dir.path())).unwrap();
+    run_all_passes(&mut fresh, &events);
+    let want = report(&fresh, "new_users");
+    fresh.finish().unwrap();
+    drop(fresh);
+
+    let mut live = Pipeline::new(config(dir.path())).unwrap();
+    live.go_live();
+    let p = std::sync::Arc::new(std::sync::Mutex::new(live));
+    p.lock().unwrap().reset_analysis("follow_graph").unwrap();
+    let first = replay(p.clone(), &dumps, false).await;
+    assert_eq!(first.passes.load(std::sync::atomic::Ordering::Relaxed), 2);
+    p.lock().unwrap().reset_analysis("new_users").unwrap();
+    let progress = replay(p.clone(), &dumps, false).await;
+    assert_eq!(progress.seen.load(std::sync::atomic::Ordering::Relaxed), events.len() as u64);
+    assert_eq!(report(&p.lock().unwrap(), "new_users"), want);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebuild_killed_after_a_file_resumes_without_rereading_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let day0 = 1_700_000_000 - (1_700_000_000 % DAY);
+    let dumps = dir.path().join("dumps");
+    std::fs::create_dir_all(&dumps).unwrap();
+    let events = corpus(day0);
+    let (first, second) = events.split_at(events.len() / 2);
+    let write = |name: &str, evs: &[NostrEvent]| {
+        let lines: String = evs.iter().map(|e| serde_json::to_string(e).unwrap() + "\n").collect();
+        std::fs::write(dumps.join(name), lines).unwrap();
+    };
+    write("events_20231114.jsonl", first);
+    write("events_20231115.jsonl", second);
+
+    let mut fresh = Pipeline::new(config(dir.path())).unwrap();
+    run_all_passes(&mut fresh, &events);
+    let want = report(&fresh, "new_users");
+    fresh.reset_analysis("new_users").unwrap();
+    fresh.finish().unwrap();
+    drop(fresh);
+
+    {
+        let mut live = Pipeline::new(config(dir.path())).unwrap();
+        live.go_live();
+        let p = std::sync::Arc::new(std::sync::Mutex::new(live));
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let progress = std::sync::Arc::new(nostrsearch_indexer::archive_ingest::IngestProgress::default());
+        nostrsearch_indexer::archive_ingest::ingest(
+            p.clone(),
+            nostrsearch_indexer::archive_ingest::IngestOptions {
+                input_dir: dumps.clone(),
+                parallelism: 1,
+                chunk_size: 1,
+                index: false,
+                stop_after_files: Some(1),
+                ..Default::default()
+            },
+            None,
+            Default::default(),
+            progress,
+            cancel,
+        )
+        .await
+        .unwrap();
+        p.lock().unwrap().finish().unwrap();
+        for _ in 0..200 {
+            if std::sync::Arc::strong_count(&p) == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(std::sync::Arc::strong_count(&p), 1, "ingest must release the pipeline");
+    }
+
+    let mut live = Pipeline::new(config(dir.path())).unwrap();
+    live.go_live();
+    let p = std::sync::Arc::new(std::sync::Mutex::new(live));
+    let progress = replay(p.clone(), &dumps, false).await;
+    assert_eq!(
+        progress.seen.load(std::sync::atomic::Ordering::Relaxed),
+        second.len() as u64,
+        "the file finished before the restart must not be read again"
+    );
+    assert_eq!(report(&p.lock().unwrap(), "new_users"), want);
+}

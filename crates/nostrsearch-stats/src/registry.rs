@@ -215,6 +215,29 @@ impl Registry {
     pub fn entries(&self) -> &[Entry] {
         &self.entries
     }
+
+    pub fn file_done_for(&self, stage: &[usize], file: &str) -> bool {
+        stage
+            .iter()
+            .map(|&i| &self.entries[i])
+            .filter(|e| e.needs_backfill())
+            .all(|e| !e.progress.rebuild.needs(file))
+    }
+
+    pub fn finish_file(&mut self, stage: &[usize], file: &str) {
+        for &i in stage {
+            let e = &mut self.entries[i];
+            if e.needs_backfill() {
+                e.progress.rebuild.finish(file);
+            }
+        }
+    }
+
+    pub fn clear_rebuild(&mut self, stage: &[usize]) {
+        for &i in stage {
+            self.entries[i].progress.rebuild = Default::default();
+        }
+    }
     pub fn total_events(&self) -> u64 {
         self.total_events
     }

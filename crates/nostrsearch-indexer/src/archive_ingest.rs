@@ -62,6 +62,7 @@ pub struct IngestOptions {
     /// it, which Tantivy will happily do twice.
     pub checkpoint_every: std::time::Duration,
     pub index: bool,
+    pub stop_after_files: Option<usize>,
 }
 
 impl Default for IngestOptions {
@@ -74,6 +75,7 @@ impl Default for IngestOptions {
             dedupe: true,
             checkpoint_every: std::time::Duration::from_secs(60),
             index: true,
+            stop_after_files: None,
         }
     }
 }
@@ -196,7 +198,14 @@ async fn run_passes(
         })
     };
 
-    let passes = lock_pipeline(&pipeline).backfill_passes();
+    let passes = {
+        let mut p = lock_pipeline(&pipeline);
+        if opts.index {
+            p.plan_full_backfill()
+        } else {
+            p.plan_replay()
+        }
+    };
     progress.passes.store(passes as u64, Ordering::Relaxed);
     if passes > 1 {
         tracing::info!(
@@ -264,15 +273,46 @@ async fn run_passes(
         // Indexing handle, taken once: it is shared and needs no pipeline lock.
         let indexer = lock_pipeline(&pipeline).indexer();
 
+        let groups: Vec<Option<Vec<std::path::PathBuf>>> = if indexing_pass {
+            vec![None]
+        } else {
+            let mut files = archive_files(&input_dir);
+            let p = lock_pipeline(&pipeline);
+            files.retain(|f| !p.pass_file_done(&file_key(f)));
+            batch_files(files, parallelism.max(1), RESUME_BATCH_BYTES)
+                .into_iter()
+                .map(Some)
+                .collect()
+        };
+        let mut files_done = 0usize;
+        for file in groups {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        if opts.stop_after_files.is_some_and(|n| files_done >= n) {
+            cancel.store(true, Ordering::Relaxed);
+            break;
+        }
+        let input_dir = input_dir.clone();
+        let pipe = pipe.clone();
+        let ck_store = ck_store.clone();
+        let ck_pending = ck_pending.clone();
+        let prog = prog.clone();
+        let cancel_cb = cancel_cb.clone();
+        let indexer = indexer.clone();
+        let only = file.clone();
         tokio::task::spawn_blocking(move || {
             // The cursor's own dedupe keeps every event id it has seen in a
             // DashMap, which for a corpus this size is tens of gigabytes of
             // resident memory and the reason ingest kept being OOM-killed.
             // IdStore does the same job on disk and survives restarts, so the
             // in-memory copy is redundant as well as fatal.
-            let cursor = NostrCursor::new(input_dir)
+            let mut cursor = NostrCursor::new(input_dir)
                 .with_parallelism(parallelism)
                 .with_dedupe(false);
+            if let Some(files) = only {
+                cursor = cursor.with_files(files);
+            }
             cursor.walk_with_chunked_sync(
                 move |events: Vec<nostr_archive_cursor::NostrEventBorrowed>| {
                     if cancel_cb.load(Ordering::Relaxed) {
@@ -378,6 +418,18 @@ async fn run_passes(
         if cancel.load(Ordering::Relaxed) {
             break;
         }
+        if let Some(files) = file {
+            let pipe = pipeline.clone();
+            let keys: Vec<String> = files.iter().map(|f| file_key(f)).collect();
+            files_done += keys.len();
+            tokio::task::spawn_blocking(move || lock_pipeline(&pipe).finish_pass_files(&keys))
+                .await??;
+        }
+        }
+
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
 
         // Materialize this stage into the world so the next pass's consumers
         // can read it; stop when every stage has folded.
@@ -415,6 +467,58 @@ async fn run_passes(
         "archive ingest complete"
     );
     Ok(())
+}
+
+const RESUME_BATCH_BYTES: u64 = 8 << 30;
+
+fn batch_files(
+    files: Vec<std::path::PathBuf>,
+    width: usize,
+    max_bytes: u64,
+) -> Vec<Vec<std::path::PathBuf>> {
+    let mut out: Vec<Vec<std::path::PathBuf>> = Vec::new();
+    let mut cur: Vec<std::path::PathBuf> = Vec::new();
+    let mut bytes = 0u64;
+    for f in files {
+        let len = std::fs::metadata(&f).map(|m| m.len()).unwrap_or(0);
+        if !cur.is_empty() && (cur.len() >= width || bytes + len > max_bytes) {
+            out.push(std::mem::take(&mut cur));
+            bytes = 0;
+        }
+        bytes += len;
+        cur.push(f);
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+fn archive_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .map(|r| {
+            r.filter_map(|e| e.ok())
+                .filter(|e| e.file_type().map(|t| t.is_file()).unwrap_or(false))
+                .map(|e| e.path())
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(nostrsearch_archive::is_archive_dump)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    files.sort();
+    files
+}
+
+fn file_key(path: &std::path::Path) -> String {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    format!("{name}:{len}")
 }
 
 /// Materialize the finished stage on the blocking pool: it can take minutes
