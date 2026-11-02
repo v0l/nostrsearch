@@ -312,7 +312,7 @@ async fn run() -> anyhow::Result<()> {
                 admins,
                 origin,
             );
-            tracing::info!(max_bytes = cfg.max_bytes, "dump submissions enabled at /submit");
+            tracing::info!(min_free_bytes = cfg.min_free_bytes, "dump submissions enabled at /submit");
             Some(nostrsearch_server::submit::SubmitState::new(
                 cfg,
                 (**a.db.as_ref().unwrap()).clone(),

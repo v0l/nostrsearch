@@ -26,7 +26,7 @@ function Counts({ s }: { s: Submission }) {
   return (
     <div class="stack">
       <div class="row tight">
-        <Chip tone={s.state === "done" ? "ok" : s.state === "failed" ? "bad" : "warn"} dot={s.state === "processing"}>
+        <Chip tone={s.state === "done" ? "ok" : s.state === "failed" || s.state === "interrupted" ? "bad" : "warn"} dot={s.state === "processing"}>
           {s.state}
         </Chip>
         <Chip tone="mute">{num(s.lines)} lines</Chip>
@@ -59,7 +59,7 @@ export function Submit({ onDone }: { onDone?: () => void }) {
     for (;;) {
       const s = await api.submission(id);
       setResult(s);
-      if (s.state === "done" || s.state === "failed") {
+      if (s.state === "done" || s.state === "failed" || s.state === "interrupted") {
         onDone?.();
         return;
       }
@@ -147,7 +147,7 @@ function History({ reload }: { reload: number }) {
             <tr key={s.id}>
               <td>{s.name}</td>
               <td>
-                <Chip tone={s.state === "done" ? "ok" : s.state === "failed" ? "bad" : "warn"}>{s.state}</Chip>
+                <Chip tone={s.state === "done" ? "ok" : s.state === "failed" || s.state === "interrupted" ? "bad" : "warn"}>{s.state}</Chip>
               </td>
               <td class="num">{bytes(s.bytes)}</td>
               <td class="num">{num(s.lines)}</td>
@@ -223,15 +223,22 @@ export function UploadPage() {
                 Ephemeral events and events dated in the future are dropped. Old dates are kept, including backdated
                 imports.
               </li>
-              <li>The uploaded file is deleted once it is processed. Only the valid events are kept.</li>
+              <li>
+                JSON lines files are processed while they upload and are never stored. Only the valid events are kept.
+              </li>
               <li>You sign the upload with your nostr key, so each submission is tied to a pubkey.</li>
             </ul>
             {limits ? (
               <>
                 <h3 class="subhead">Limits</h3>
                 <ul class="plain">
-                  <li>Up to {gb(limits.max_bytes)} per file.</li>
-                  <li>Up to {gb(limits.daily_bytes)} per pubkey per day.</li>
+                  <li>No size limit on JSON lines files, however large.</li>
+                  <li>{limits.disk_note}</li>
+                  <li>{limits.resume_note}</li>
+                  <li>
+                    Uploads stop if free disk space drops below {gb(limits.min_free_bytes)}. {gb(limits.free_bytes)} is
+                    free now.
+                  </li>
                   <li>{limits.max_concurrent} uploads at a time across everyone.</li>
                 </ul>
               </>

@@ -147,18 +147,22 @@ async function signed<T>(path: string, method: "GET" | "POST" = "GET"): Promise<
 }
 
 export interface SubmitLimits {
-  max_bytes: number;
-  daily_bytes: number;
   max_concurrent: number;
   accepting: boolean;
+  min_free_bytes: number;
+  free_bytes: number;
   formats: string[];
+  streamed_formats: string[];
+  disk_formats: string[];
+  disk_note: string;
+  resume_note: string;
 }
 
 export interface Submission {
   id: string;
   pubkey: string;
   name: string;
-  state: "uploading" | "processing" | "done" | "failed";
+  state: "uploading" | "processing" | "done" | "failed" | "interrupted";
   error: string | null;
   started_at: number;
   finished_at: number;

@@ -135,10 +135,14 @@ Bun.serve({
 
     if (p === "/submit/limits")
       return json({
-        max_bytes: 20e9,
-        daily_bytes: 40e9,
         max_concurrent: 2,
         accepting: true,
+        min_free_bytes: 100e9,
+        free_bytes: 203e9,
+        streamed_formats: [".jsonl", ".jsonl.zst", ".jsonl.gz", ".jsonl.bz2"],
+        disk_formats: [".mdb", ".mdb.zst", ".mdb.gz"],
+        disk_note: "A strfry .mdb upload is written to disk first, so it is accepted only when its size plus the free-space floor fits.",
+        resume_note: "If a connection drops, upload the file again to continue. Events we already hold are skipped.",
         formats: [".jsonl", ".jsonl.zst", ".jsonl.gz", ".jsonl.bz2", ".mdb", ".mdb.zst", ".mdb.gz"],
       });
 

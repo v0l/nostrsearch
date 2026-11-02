@@ -32,7 +32,15 @@ impl Drop for Node {
     }
 }
 
-async fn serve(max_bytes: u64, min_free: u64, admins: HashSet<PublicKey>) -> anyhow::Result<Node> {
+async fn serve(_unused: u64, min_free: u64, admins: HashSet<PublicKey>) -> anyhow::Result<Node> {
+    serve_with(min_free, None, admins).await
+}
+
+async fn serve_with(
+    min_free: u64,
+    free_space: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
+    admins: HashSet<PublicKey>,
+) -> anyhow::Result<Node> {
     let root = tempfile::tempdir()?;
     let archive_dir = root.path().join("archive");
     std::fs::create_dir_all(&archive_dir)?;
@@ -57,10 +65,9 @@ async fn serve(max_bytes: u64, min_free: u64, admins: HashSet<PublicKey>) -> any
     )?;
     let cfg = SubmitConfig {
         dir: root.path().join("submissions"),
-        max_bytes,
         max_concurrent: 2,
-        daily_bytes_per_pubkey: u64::MAX,
         min_free_bytes: min_free,
+        free_space,
         origin: None,
         admins,
     };
@@ -118,7 +125,7 @@ async fn finished(node: &Node, keys: &Keys, id: &str) -> anyhow::Result<serde_js
     let url = format!("{}/submit/{id}", node.base);
     for _ in 0..100 {
         let v: serde_json::Value = reqwest::get(&url).await?.json().await?;
-        if v["state"] == "done" || v["state"] == "failed" {
+        if v["state"] == "done" || v["state"] == "failed" || v["state"] == "interrupted" {
             return Ok(v);
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -145,19 +152,14 @@ async fn limits_are_public_so_the_upload_page_can_show_them() -> anyhow::Result<
     let r = reqwest::get(format!("{}/submit/limits", node.base)).await?;
     assert_eq!(r.status(), 200);
     let v: serde_json::Value = r.json().await?;
-    assert_eq!(v["max_bytes"], 12_345);
-    assert!(v["daily_bytes"].as_u64().is_some());
+    assert!(v.get("max_bytes").is_none());
+    assert!(v.get("daily_bytes").is_none());
+    assert!(v["size_limit"].is_null());
+    assert!(v["disk_note"].as_str().is_some_and(|n| n.contains(".mdb")));
+    assert!(v["resume_note"].as_str().is_some_and(|n| n.contains("again")));
+    assert!(v["streamed_formats"].as_array().is_some_and(|f| f.iter().any(|x| x == ".jsonl.zst")));
     assert!(v["accepting"].as_bool().is_some());
     assert!(v["formats"].as_array().is_some_and(|f| f.iter().any(|x| x == ".mdb")));
-    Ok(())
-}
-
-#[tokio::test]
-async fn oversized_upload_is_refused() -> anyhow::Result<()> {
-    let node = serve(100, 0, HashSet::new()).await?;
-    let keys = Keys::generate();
-    let r = submit(&node, &keys, "a.jsonl", vec![b'x'; 5000]).await?;
-    assert_eq!(r.status(), 413);
     Ok(())
 }
 
@@ -589,7 +591,7 @@ async fn a_large_real_strfry_database_is_ingested_in_full() -> anyhow::Result<()
     let status_url = format!("{}/submit/{id}", node.base);
     let v = loop {
         let v: serde_json::Value = reqwest::get(&status_url).await?.json().await?;
-        if v["state"] == "done" || v["state"] == "failed" {
+        if v["state"] == "done" || v["state"] == "failed" || v["state"] == "interrupted" {
             break v;
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -618,5 +620,170 @@ async fn shutting_the_node_down_mid_processing_exits_cleanly() -> anyhow::Result
     let resp = submit(&node, &keys, "dump.jsonl", dump(&events)).await?;
     assert_eq!(resp.status(), 202);
     drop(node);
+    Ok(())
+}
+
+async fn list_jobs(node: &Node, keys: &Keys) -> Vec<serde_json::Value> {
+    let url = format!("{}/submit", node.base);
+    reqwest::Client::new()
+        .get(&url)
+        .header("authorization", nip98(keys, &url, "GET").await.unwrap())
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap()
+}
+
+async fn wait_for_job(
+    node: &Node,
+    keys: &Keys,
+    what: &str,
+    ok: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    for _ in 0..200 {
+        if let Some(j) = list_jobs(node, keys).await.into_iter().find(|j| ok(j)) {
+            return j;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("never saw: {what}: {:?}", list_jobs(node, keys).await);
+}
+
+type Chunk = Result<Vec<u8>, std::io::Error>;
+
+fn live_body() -> (tokio::sync::mpsc::Sender<Chunk>, reqwest::Body) {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Chunk>(4);
+    let stream = futures::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|c| (c, rx))
+    });
+    (tx, reqwest::Body::wrap_stream(stream))
+}
+
+async fn lines_of(keys: &Keys, prefix: &str, n: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    for i in 0..n {
+        out.extend_from_slice(note(keys, &format!("{prefix} {i}")).await.as_json().as_bytes());
+        out.push(b'\n');
+    }
+    out
+}
+
+fn start_post(node: &Node, keys: &Keys, name: &str, body: reqwest::Body) -> tokio::task::JoinHandle<()> {
+    let url = format!("{}/submit?name={name}", node.base);
+    let keys = keys.clone();
+    tokio::spawn(async move {
+        let auth = nip98(&keys, &url, "POST").await.unwrap();
+        let _ = reqwest::Client::new()
+            .post(&url)
+            .header("authorization", auth)
+            .body(body)
+            .send()
+            .await;
+    })
+}
+
+#[tokio::test]
+async fn upload_beyond_the_old_size_cap_is_accepted() -> anyhow::Result<()> {
+    let node = serve(100, 0, HashSet::new()).await?;
+    let keys = Keys::generate();
+    let body = lines_of(&keys, "big", 40).await;
+    assert!(body.len() > 100);
+    let r = submit(&node, &keys, "a.jsonl", body).await?;
+    assert_eq!(r.status(), 202);
+    let id = r.json::<serde_json::Value>().await?["id"].as_str().unwrap().to_string();
+    let v = finished(&node, &keys, &id).await?;
+    assert_eq!(v["state"], "done", "{v}");
+    assert_eq!(v["new"], 40, "{v}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn jsonl_is_ingested_while_it_streams_without_staging_on_disk() -> anyhow::Result<()> {
+    let node = serve(1 << 30, 0, HashSet::new()).await?;
+    let keys = Keys::generate();
+    let (tx, body) = live_body();
+    let post = start_post(&node, &keys, "live.jsonl.zst", body);
+    let first = lines_of(&keys, "first", 30).await;
+    let mut enc = zstd::stream::write::Encoder::new(Vec::new(), 1)?;
+    enc.write_all(&first)?;
+    enc.flush()?;
+    let part = std::mem::take(enc.get_mut());
+    tx.send(Ok(part)).await?;
+
+    let live = wait_for_job(&node, &keys, "30 events before upload ends", |j| j["new"] == 30).await;
+    assert_ne!(live["state"], "done", "{live}");
+    let staged = std::fs::read_dir(node._root.path().join("submissions"))
+        .map(|d| d.count())
+        .unwrap_or(0);
+    assert_eq!(staged, 0, "nothing may be staged in SUBMIT_DIR");
+
+    let second = lines_of(&keys, "second", 20).await;
+    enc.write_all(&second)?;
+    let tail = enc.finish()?;
+    tx.send(Ok(tail)).await?;
+    drop(tx);
+    post.await?;
+    let done = wait_for_job(&node, &keys, "done", |j| j["state"] == "done").await;
+    assert_eq!(done["new"], 50, "{done}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn dropped_connection_keeps_ingested_events_and_ends_interrupted() -> anyhow::Result<()> {
+    let node = serve(1 << 30, 0, HashSet::new()).await?;
+    let keys = Keys::generate();
+    let (tx, body) = live_body();
+    let post = start_post(&node, &keys, "cut.jsonl", body);
+    let mut chunk = lines_of(&keys, "kept", 25).await;
+    chunk.extend_from_slice(b"{\"id\":\"half a li");
+    tx.send(Ok(chunk)).await?;
+    wait_for_job(&node, &keys, "25 events", |j| j["new"] == 25).await;
+    tx.send(Err(std::io::Error::other("connection reset"))).await?;
+    drop(tx);
+    post.await?;
+    let v = wait_for_job(&node, &keys, "interrupted", |j| j["state"] == "interrupted").await;
+    assert_eq!(v["new"], 25, "{v}");
+    assert_eq!(v["malformed"], 0, "a cut line is not counted: {v}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn free_space_floor_stops_a_stream_midway_and_keeps_what_was_ingested() -> anyhow::Result<()> {
+    let free = Arc::new(std::sync::atomic::AtomicU64::new(10_000));
+    let f2 = free.clone();
+    let node = serve_with(
+        5_000,
+        Some(Arc::new(move || f2.load(std::sync::atomic::Ordering::SeqCst))),
+        HashSet::new(),
+    )
+    .await?;
+    let keys = Keys::generate();
+    let (tx, body) = live_body();
+    let post = start_post(&node, &keys, "floor.jsonl", body);
+    tx.send(Ok(lines_of(&keys, "before", 10).await)).await?;
+    wait_for_job(&node, &keys, "10 events", |j| j["new"] == 10).await;
+    free.store(100, std::sync::atomic::Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    let _ = tx.send(Ok(lines_of(&keys, "after", 10).await)).await;
+    drop(tx);
+    post.await?;
+    let v = wait_for_job(&node, &keys, "failed", |j| j["state"] == "failed").await;
+    assert_eq!(v["new"], 10, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("floor"), "{v}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn mdb_that_cannot_fit_on_disk_is_refused_but_jsonl_of_that_size_is_not() -> anyhow::Result<()> {
+    let node = serve_with(1_000, Some(Arc::new(|| 50_000)), HashSet::new()).await?;
+    let keys = Keys::generate();
+    let r = submit(&node, &keys, "big.mdb", vec![0u8; 49_500]).await?;
+    assert_eq!(r.status(), 507);
+    let body = lines_of(&keys, "j", 200).await;
+    assert!(body.len() > 49_000);
+    let r = submit(&node, &keys, "big.jsonl", body).await?;
+    assert_eq!(r.status(), 202);
     Ok(())
 }
