@@ -6,6 +6,7 @@ import type { RegistryStats, SyncStatus } from "./types";
 import { Analyses } from "./sections/Analyses";
 import { Corpus } from "./sections/Corpus";
 import { Ingest } from "./sections/Ingest";
+import { Submit } from "./sections/Submit";
 import { IndexPanel } from "./sections/IndexPanel";
 import { Relays } from "./sections/Relays";
 import { Reports } from "./sections/Reports";
@@ -201,6 +202,7 @@ function Console() {
         <Today reports={reports} />
         <Reports reports={reports} />
         <Corpus stats={stats.data} />
+        <Submit />
         {/* Operator controls, not public status: these panels are actions
             with a status readout attached, so they are hidden entirely rather
             than shown disabled. */}

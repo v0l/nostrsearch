@@ -9,11 +9,13 @@ pub use nostrsearch_archive as archive;
 pub mod dashboard;
 pub mod http;
 pub mod ingest_job;
+pub mod nip98;
 pub mod node;
 pub mod registry;
 pub mod relay;
 pub mod reports;
 pub mod scraper;
+pub mod submit;
 
 pub use archive::ArchiveState;
 pub use http::{AppState, SharedState, router};
