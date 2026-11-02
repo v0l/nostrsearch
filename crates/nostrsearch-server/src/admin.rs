@@ -266,31 +266,7 @@ async fn auth(State(st): State<AdminState>, req: Request, next: Next) -> Respons
     next.run(req).await
 }
 
-/// Whether the signed `u` tag names this request: same path, same query
-/// parameters, and when an origin is configured, exactly that origin.
-fn url_matches(signed: &str, request: &axum::http::Uri, origin: Option<&str>) -> bool {
-    let Ok(parsed) = url::Url::parse(signed) else {
-        return false;
-    };
-    if parsed.path() != request.path() {
-        return false;
-    }
-    let mut signed_q: Vec<(String, String)> = parsed.query_pairs().into_owned().collect();
-    let mut request_q: Vec<(String, String)> =
-        url::form_urlencoded::parse(request.query().unwrap_or("").as_bytes())
-            .into_owned()
-            .collect();
-    signed_q.sort();
-    request_q.sort();
-    if signed_q != request_q {
-        return false;
-    }
-    match origin.map(url::Url::parse) {
-        None => true,
-        Some(Ok(o)) => parsed.origin() == o.origin(),
-        Some(Err(_)) => false,
-    }
-}
+use crate::nip98::url_matches;
 
 pub fn router(state: AdminState) -> Router {
     Router::new()

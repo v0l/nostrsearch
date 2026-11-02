@@ -300,6 +300,28 @@ async fn run() -> anyhow::Result<()> {
     };
 
     let has_admin = admin.is_some();
+    let submit = match (&archive, &sink) {
+        (Some(a), Some(sink)) if a.db.is_some() => {
+            let admins = admin
+                .as_ref()
+                .map(|a| a.cfg.pubkeys.clone())
+                .unwrap_or_default();
+            let origin = admin.as_ref().and_then(|a| a.cfg.origin.clone());
+            let cfg = nostrsearch_server::submit::SubmitConfig::from_env(
+                env::state_dir().join("submissions"),
+                admins,
+                origin,
+            );
+            tracing::info!(max_bytes = cfg.max_bytes, "dump submissions enabled at /submit");
+            Some(nostrsearch_server::submit::SubmitState::new(
+                cfg,
+                (**a.db.as_ref().unwrap()).clone(),
+                sink.clone(),
+                shared_dedupe.clone(),
+            ))
+        }
+        _ => None,
+    };
     let streams = reports.clone();
     let archive_db = archive.as_ref().and_then(|a| a.db.clone());
     let app = nostrsearch_server::http::router_full_node(
@@ -310,6 +332,10 @@ async fn run() -> anyhow::Result<()> {
         scrape_state,
         admin,
     );
+    let app = match submit {
+        Some(s) => app.merge(nostrsearch_server::submit::router(s)),
+        None => app,
+    };
     tracing::info!(
         admin = has_admin,
         "operator console at / (admin panels need a key from ADMIN_PUBKEYS)"

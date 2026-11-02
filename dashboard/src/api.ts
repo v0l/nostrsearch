@@ -146,9 +146,58 @@ async function signed<T>(path: string, method: "GET" | "POST" = "GET"): Promise<
   return unwrap<T>(res);
 }
 
+export interface Submission {
+  id: string;
+  pubkey: string;
+  name: string;
+  state: "uploading" | "processing" | "done" | "failed";
+  error: string | null;
+  started_at: number;
+  finished_at: number;
+  bytes: number;
+  lines: number;
+  valid: number;
+  malformed: number;
+  bad_signature: number;
+  ephemeral: number;
+  future: number;
+  duplicate: number;
+  new: number;
+}
+
+async function uploadDump(
+  file: File,
+  onProgress: (sent: number, total: number) => void,
+): Promise<{ id: string }> {
+  const url = new URL(
+    `/submit?name=${encodeURIComponent(file.name)}`,
+    window.location.origin,
+  ).toString();
+  const authorization = await nip98(url, "POST");
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", url);
+    xhr.setRequestHeader("authorization", authorization);
+    xhr.upload.onprogress = (e) => onProgress(e.loaded, e.total);
+    xhr.onerror = () => reject(new ApiError(0, "Upload failed: network error."));
+    xhr.onload = () => {
+      let body: { error?: string; id?: string } = {};
+      try {
+        body = JSON.parse(xhr.responseText);
+      } catch {}
+      if (xhr.status >= 200 && xhr.status < 300 && body.id) resolve({ id: body.id });
+      else reject(new ApiError(xhr.status, body.error ?? `upload failed (${xhr.status})`));
+    };
+    xhr.send(file);
+  });
+}
+
 // --- endpoints -------------------------------------------------------------
 
 export const api = {
+  uploadDump,
+  submission: (id: string) => open<Submission>(`/submit/${encodeURIComponent(id)}`),
+  submissions: () => signed<Submission[]>("/submit"),
   stats: () => open<RegistryStats>("/stats"),
   // No trailing slashes: axum's nest("/sync", …) with a "/" child matches the
   // prefix exactly, and 404s on "/sync/".
