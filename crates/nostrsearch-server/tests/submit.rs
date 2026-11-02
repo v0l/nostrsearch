@@ -10,7 +10,26 @@ use std::sync::Arc;
 
 struct Node {
     base: String,
+    writer: Option<nostrsearch_server::WriterHandle>,
+    server: tokio::task::JoinHandle<()>,
     _root: tempfile::TempDir,
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        self.server.abort();
+        if let Some(writer) = self.writer.take() {
+            std::thread::spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap()
+                    .block_on(writer.shutdown());
+            })
+            .join()
+            .unwrap();
+        }
+    }
 }
 
 async fn serve(max_bytes: u64, min_free: u64, admins: HashSet<PublicKey>) -> anyhow::Result<Node> {
@@ -36,7 +55,6 @@ async fn serve(max_bytes: u64, min_free: u64, admins: HashSet<PublicKey>) -> any
         1_000,
         std::time::Duration::from_millis(200),
     )?;
-    std::mem::forget(handle);
     let cfg = SubmitConfig {
         dir: root.path().join("submissions"),
         max_bytes,
@@ -51,11 +69,13 @@ async fn serve(max_bytes: u64, min_free: u64, admins: HashSet<PublicKey>) -> any
         .merge(nostrsearch_server::submit::router(submit));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    tokio::spawn(async move {
+    let server = tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
     Ok(Node {
         base: format!("http://{addr}"),
+        writer: Some(handle),
+        server,
         _root: root,
     })
 }
@@ -546,5 +566,19 @@ async fn a_real_strfry_database_uploaded_compressed_is_ingested_in_full() -> any
         .sum::<u64>();
     assert_eq!(accounted, 299, "{v}");
     assert!(v["new"].as_u64().unwrap() > 250, "{v}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn shutting_the_node_down_mid_processing_exits_cleanly() -> anyhow::Result<()> {
+    let node = serve(1 << 30, 0, HashSet::new()).await?;
+    let keys = Keys::generate();
+    let mut events = vec![];
+    for i in 0..300 {
+        events.push(note(&keys, &format!("in flight {i}")).await.as_json());
+    }
+    let resp = submit(&node, &keys, "dump.jsonl", dump(&events)).await?;
+    assert_eq!(resp.status(), 202);
+    drop(node);
     Ok(())
 }
