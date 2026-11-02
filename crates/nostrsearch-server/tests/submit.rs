@@ -482,3 +482,56 @@ async fn corrupt_strfry_database_fails_cleanly() -> anyhow::Result<()> {
     assert_eq!(ok["state"], "done", "{ok}");
     Ok(())
 }
+
+#[test]
+fn reads_a_database_written_by_real_strfry() {
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/strfry");
+    let dir = tempfile::tempdir().unwrap();
+    let mdb = dir.path().join("data.mdb");
+    let packed = std::fs::read(fixtures.join("data.mdb.zst")).unwrap();
+    std::fs::write(&mdb, zstd::decode_all(&packed[..]).unwrap()).unwrap();
+    let expected: std::collections::HashSet<String> =
+        String::from_utf8(zstd::decode_all(&std::fs::read(fixtures.join("expected.jsonl.zst")).unwrap()[..]).unwrap())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["id"].as_str().unwrap().to_string())
+            .collect();
+    assert_eq!(expected.len(), 299);
+
+    let db = nostrsearch_server::strfry::Lmdb::open(&mdb).unwrap();
+    db.check_meta().unwrap();
+    let mut got = std::collections::HashSet::new();
+    let mut undecodable = 0u64;
+    db.for_each_event(4 << 20, |p| {
+        match p {
+            nostrsearch_server::strfry::Payload::Json(j) => {
+                let v: serde_json::Value = serde_json::from_slice(&j).unwrap();
+                got.insert(v["id"].as_str().unwrap().to_string());
+            }
+            nostrsearch_server::strfry::Payload::Undecodable => undecodable += 1,
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(undecodable, 0);
+    assert_eq!(got, expected);
+}
+
+#[tokio::test]
+async fn a_real_strfry_database_uploaded_compressed_is_ingested_in_full() -> anyhow::Result<()> {
+    let node = serve(1 << 30, 0, HashSet::new()).await?;
+    let keys = Keys::generate();
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/strfry");
+    let v = run(&node, &keys, "data.mdb.zst", std::fs::read(fixtures.join("data.mdb.zst"))?).await;
+    assert_eq!(v["state"], "done", "{v}");
+    assert_eq!(v["lines"], 299, "{v}");
+    assert_eq!(v["undecodable"], 0, "{v}");
+    assert_eq!(v["malformed"], 0, "{v}");
+    let accounted = ["new", "duplicate", "bad_signature", "ephemeral", "future"]
+        .iter()
+        .map(|k| v[*k].as_u64().unwrap_or(0))
+        .sum::<u64>();
+    assert_eq!(accounted, 299, "{v}");
+    assert!(v["new"].as_u64().unwrap() > 250, "{v}");
+    Ok(())
+}
