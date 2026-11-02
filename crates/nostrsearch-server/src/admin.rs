@@ -395,7 +395,7 @@ async fn reset_all(State(st): State<AdminState>) -> Response {
     // Re-index everything: the analyses are empty, and after a reset the
     // dedupe store is not a safe gate -- if it has drifted ahead of the index,
     // every attempt to refill the gap is skipped as already-done.
-    let started = crate::ingest_job::start(&rp, false, default_parallelism());
+    let started = crate::ingest_job::start(&rp, false, true, default_parallelism());
 
     match started {
         Ok(()) => Json(ResetResult {
@@ -485,7 +485,7 @@ async fn reset_analysis(State(st): State<AdminState>, Path(name): Path<String>) 
     let rebuild = match st.replay.as_ref() {
         // Dedupe on: this analysis's state is gone, but the index is intact,
         // so events already indexed only need folding, not re-indexing.
-        Some(rp) => crate::ingest_job::start(rp, true, default_parallelism()).is_ok(),
+        Some(rp) => crate::ingest_job::start(rp, true, false, default_parallelism()).is_ok(),
         None => false,
     };
 
@@ -538,6 +538,7 @@ async fn start_ingest(
     axum::extract::RawQuery(raw): axum::extract::RawQuery,
 ) -> Response {
     let dedupe = wants_dedupe(raw.as_deref());
+    let index = !query_flag(raw.as_deref(), "index", "false");
     let Some(rp) = st.replay.clone() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -546,10 +547,11 @@ async fn start_ingest(
             .into_response();
     };
 
-    match crate::ingest_job::start(&rp, dedupe, default_parallelism()) {
+    match crate::ingest_job::start(&rp, dedupe, index, default_parallelism()) {
         Ok(()) => Json(serde_json::json!({
             "started": true,
             "dedupe": dedupe,
+            "index": index,
             "detail": "reading the archive; poll GET /admin/ingest",
         }))
         .into_response(),
@@ -568,8 +570,12 @@ async fn start_ingest(
 /// span of this corpus -- every run skips the missing events as already-done
 /// and no amount of retrying fills the gap. `?dedupe=false` is the repair.
 fn wants_dedupe(raw: Option<&str>) -> bool {
-    let Some(raw) = raw else { return true };
-    !url::form_urlencoded::parse(raw.as_bytes()).any(|(k, v)| k == "dedupe" && v == "false")
+    !query_flag(raw, "dedupe", "false")
+}
+
+fn query_flag(raw: Option<&str>, key: &str, value: &str) -> bool {
+    let Some(raw) = raw else { return false };
+    url::form_urlencoded::parse(raw.as_bytes()).any(|(k, v)| k == key && v == value)
 }
 
 /// Reader threads for an archive pass.

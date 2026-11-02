@@ -509,3 +509,98 @@ fn process_reports_whether_the_event_reached_the_index() {
     let blocked = ev(&"d".repeat(64), &"b".repeat(64), 1, 978_307_200, vec![]);
     assert!(!p.process(&blocked));
 }
+
+fn write_dump(dir: &std::path::Path, events: &[NostrEvent]) {
+    std::fs::create_dir_all(dir).unwrap();
+    let lines: String = events
+        .iter()
+        .map(|e| serde_json::to_string(e).unwrap() + "\n")
+        .collect();
+    std::fs::write(dir.join("events_20231114.jsonl"), lines).unwrap();
+}
+
+async fn replay(
+    p: std::sync::Arc<std::sync::Mutex<Pipeline>>,
+    dir: &std::path::Path,
+    index: bool,
+) -> std::sync::Arc<nostrsearch_indexer::archive_ingest::IngestProgress> {
+    let progress = std::sync::Arc::new(Default::default());
+    nostrsearch_indexer::archive_ingest::ingest(
+        p,
+        nostrsearch_indexer::archive_ingest::IngestOptions {
+            input_dir: dir.to_path_buf(),
+            parallelism: 1,
+            index,
+            ..Default::default()
+        },
+        None,
+        Default::default(),
+        std::sync::Arc::clone(&progress),
+        Default::default(),
+    )
+    .await
+    .unwrap();
+    progress
+}
+
+fn index_docs(root: &std::path::Path) -> u64 {
+    let Ok(dirs) = std::fs::read_dir(root.join("index")) else {
+        return 0;
+    };
+    dirs.filter_map(|e| e.ok())
+        .filter(|e| e.path().is_dir())
+        .map(|e| {
+            tantivy::Index::open_in_dir(e.path())
+                .and_then(|i| i.reader())
+                .map(|r| r.searcher().num_docs())
+                .unwrap_or(0)
+        })
+        .sum()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stats_only_replay_rebuilds_analyses_without_writing_documents() {
+    let dir = tempfile::tempdir().unwrap();
+    let day0 = 1_700_000_000 - (1_700_000_000 % DAY);
+    let dumps = dir.path().join("dumps");
+    write_dump(&dumps, &corpus(day0));
+
+    let p = std::sync::Arc::new(std::sync::Mutex::new(Pipeline::new(config(dir.path())).unwrap()));
+    let progress = replay(p.clone(), &dumps, false).await;
+
+    assert_eq!(index_docs(dir.path()), 0, "a stats-only replay must not index anything");
+    let guard = p.lock().unwrap();
+    let users = report(&guard, "active_users");
+    let day = users["daily"][day0.to_string()]["users"].clone();
+    assert_eq!(
+        day["trusted"].as_u64().unwrap() + day["untrusted"].as_u64().unwrap(),
+        13,
+        "every author in the corpus was folded: {day}"
+    );
+    assert!(
+        progress.seen.load(std::sync::atomic::Ordering::Relaxed) > 0,
+        "the dependent pass still read the archive"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replay_skips_stages_whose_analyses_are_already_backfilled() {
+    let dir = tempfile::tempdir().unwrap();
+    let day0 = 1_700_000_000 - (1_700_000_000 % DAY);
+    let dumps = dir.path().join("dumps");
+    let events = corpus(day0);
+    write_dump(&dumps, &events);
+
+    let mut fresh = Pipeline::new(config(dir.path())).unwrap();
+    run_all_passes(&mut fresh, &events);
+    fresh.finish().unwrap();
+    drop(fresh);
+
+    let p = std::sync::Arc::new(std::sync::Mutex::new(Pipeline::new(config(dir.path())).unwrap()));
+    let progress = replay(p, &dumps, false).await;
+    assert_eq!(
+        progress.seen.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "nothing needed rebuilding, so nothing should be read"
+    );
+}

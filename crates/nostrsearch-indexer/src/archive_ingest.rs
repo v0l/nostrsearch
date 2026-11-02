@@ -61,6 +61,7 @@ pub struct IngestOptions {
     /// costs re-indexing the entire run into an index that already contains
     /// it, which Tantivy will happily do twice.
     pub checkpoint_every: std::time::Duration,
+    pub index: bool,
 }
 
 impl Default for IngestOptions {
@@ -72,6 +73,7 @@ impl Default for IngestOptions {
             sort_batches: true,
             dedupe: true,
             checkpoint_every: std::time::Duration::from_secs(60),
+            index: true,
         }
     }
 }
@@ -210,8 +212,16 @@ async fn run_passes(
         }
 
         let pass = lock_pipeline(&pipeline).current_pass();
-        let indexing_pass = pass == 0;
+        let indexing_pass = pass == 0 && opts.index;
         progress.pass.store(pass as u64, Ordering::Relaxed);
+
+        if !indexing_pass && !lock_pipeline(&pipeline).pass_has_pending_analyses() {
+            tracing::info!(pass, "every analysis in this pass is up to date; skipping read");
+            if !advance(&pipeline).await? {
+                break;
+            }
+            continue;
+        }
 
         // A stage whose analyses consume no events has nothing to read.
         //

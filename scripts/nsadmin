@@ -15,6 +15,7 @@
 #   reset-all                  clear every analysis and rebuild from the archive
 #   analyses                   per-analysis progress
 #   ingest [file]...           replay archive dumps (all dumps if none given)
+#   rebuild-stats              replay the archive into analyses that need it, without indexing
 #   ingest-status              replay progress
 #   ingest-cancel              stop a running replay
 #   scrape [query]             scrape state, e.g. 'relay=wss://x&from=2026-01-01'
@@ -131,6 +132,9 @@ case "$cmd" in
     q=""
     for f in "$@"; do q="${q}${q:+&}file=${f}"; done
     call POST "/admin/ingest${q:+?$q}" ;;
+
+  rebuild-stats)
+    call POST "/admin/ingest?index=false" ;;
 
   scrape)        call GET  "/admin/scrape${1:+?$1}" ;;
   reset-scrape)

@@ -656,6 +656,7 @@ async fn run(args: Config, pipeline: Arc<Mutex<Pipeline>>) -> anyhow::Result<()>
                 sort_batches,
                 dedupe: args.dedupe,
                 checkpoint_every: std::time::Duration::from_secs(args.checkpoint_secs),
+                index: true,
             },
             id_store.clone(),
             pending_ids.clone(),

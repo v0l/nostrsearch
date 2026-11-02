@@ -110,7 +110,12 @@ impl IngestState {
 /// `dedupe` off re-indexes everything the archive holds, which is what a store
 /// that has drifted ahead of the index needs: with it on, every attempt to
 /// refill a gap is skipped as already-done.
-pub fn start(ctx: &IngestCtx, dedupe: bool, parallelism: usize) -> Result<(), String> {
+pub fn start(
+    ctx: &IngestCtx,
+    dedupe: bool,
+    index: bool,
+    parallelism: usize,
+) -> Result<(), String> {
     // Claim the slot first: two ingests over one pipeline would interleave
     // passes and produce a world neither of them intended.
     if ctx
@@ -130,6 +135,7 @@ pub fn start(ctx: &IngestCtx, dedupe: bool, parallelism: usize) -> Result<(), St
         input_dir: ctx.dir.clone(),
         parallelism,
         dedupe,
+        index,
         ..Default::default()
     };
     let id_store = ctx.dedupe.clone();

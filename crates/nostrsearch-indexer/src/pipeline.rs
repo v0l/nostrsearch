@@ -524,6 +524,14 @@ impl Pipeline {
     /// A stage whose analyses consume no events -- pagerank derives entirely
     /// from `follow_graph`'s on-disk adjacency -- has nothing to read. Such a
     /// pass only needs its refresh and materialize step.
+    pub fn pass_has_pending_analyses(&self) -> bool {
+        let entries = self.registry.entries();
+        self.stages[self.pass].iter().any(|&i| {
+            let e = &entries[i];
+            e.needs_backfill() && e.analysis.kinds_dyn().is_none_or(|k| !k.is_empty())
+        })
+    }
+
     pub fn pass_needs_corpus(&self) -> bool {
         !matches!(self.pass_kinds(), Some(ks) if ks.is_empty())
     }
