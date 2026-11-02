@@ -32,5 +32,8 @@ clap = { version = "4.6.5", features = ["derive"] }
 
 [dev-dependencies]
 tempfile = "3"
+nostr-relay-builder = "0.44"
+tokio-tungstenite = "0.26"
+futures = { workspace = true }
 reqwest = { workspace = true }
 zstd = { workspace = true }

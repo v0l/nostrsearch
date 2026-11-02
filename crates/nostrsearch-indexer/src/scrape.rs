@@ -249,7 +249,7 @@ pub struct RelayTotals {
 /// the presented id set (counts pinned at 10k/40k, the rest never fetched),
 /// and the pre-backoff scraper recorded `seen=0` days against relays that
 /// were failing from our side (auth-gated, connect races, SYN drops).
-pub const SYNC_EPOCH: u32 = 1;
+pub const SYNC_EPOCH: u32 = 2;
 
 /// Outcome of one fully-scraped (relay, day).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1788,7 +1788,7 @@ async fn scrape_relay_day<S: Sink>(
 /// Scrape one (relay, day): negentropy id-reconciliation with gap fetch when
 /// supported, adaptive since/until bisection otherwise.
 #[allow(clippy::too_many_arguments)]
-async fn scrape_day<S: Sink>(
+pub async fn scrape_day<S: Sink>(
     client: &nostr_sdk::Client,
     url: &str,
     info: &mut RelayInfo,
@@ -1878,14 +1878,10 @@ async fn scrape_day<S: Sink>(
                     for chunk in missing.chunks(500) {
                         let ids: Vec<EventId> =
                             chunk.iter().map(|b| EventId::from_byte_array(*b)).collect();
-                        let events = client
-                            .fetch_events_from(
-                                [url],
-                                Filter::new().ids(ids),
-                                std::time::Duration::from_secs(30),
-                            )
-                            .await?;
-                        new += sink.process(events.into_iter().collect()).await;
+                        let relay = client.relay(url).await?;
+                        let events =
+                            req_window(&relay, Filter::new().ids(ids), REQ_WINDOW_TIMEOUT).await?;
+                        new += sink.process(events).await;
                     }
                     synced_any = true;
                     state.live_update(url, |u| {
@@ -1935,43 +1931,156 @@ async fn scrape_day<S: Sink>(
         }
     }
 
-    // 2. Windowed since/until with adaptive bisection. Relays cap result
-    // counts silently, so a window that returns >= the relay's observed
-    // ceiling is assumed truncated and split, down to the floor window.
-    let mut stack = vec![(start, end)];
     state.live_update(url, |u| {
         u.phase = "req";
         u.windows_done = 0;
-        u.windows_total = stack.len() as u32;
+        u.windows_total = 1;
     });
-    while let Some((s, e)) = stack.pop() {
-        state.live_update(url, |u| u.window_start = s);
+    let relay = client.relay(url).await?;
+    let mut until = end - 1;
+    let mut have: HashSet<EventId> = HashSet::new();
+    loop {
+        state.live_update(url, |u| u.window_start = until);
         let filter = Filter::new()
-            .since(Timestamp::from(s))
-            .until(Timestamp::from(e - 1))
+            .since(Timestamp::from(start))
+            .until(Timestamp::from(until))
             .limit(10_000);
-        let events = client
-            .fetch_events_from([url], filter, std::time::Duration::from_secs(30))
-            .await?;
-        let n = events.len() as u64;
-        info.cap = info.cap.max(n as u32);
-        let ceiling = (info.cap.max(500)) as u64;
-        if n >= ceiling && (e - s) / 2 >= floor_secs {
-            let mid = s + (e - s) / 2;
-            stack.push((s, mid));
-            stack.push((mid, e));
-            state.live_update(url, |u| u.windows_total += 1);
-            continue;
+        let mut page = req_window(&relay, filter.clone(), REQ_WINDOW_TIMEOUT).await?;
+        if page.is_empty() && until + 1 < end {
+            tokio::time::sleep(EMPTY_PAGE_RECHECK).await;
+            page = req_window(&relay, filter, REQ_WINDOW_TIMEOUT).await?;
         }
-        seen += n;
-        new += sink.process(events.into_iter().collect()).await;
+        info.cap = info.cap.max(page.len() as u32);
+        let Some(oldest) = page.iter().map(|e| e.created_at.as_secs()).min() else {
+            break;
+        };
+        let fresh: Vec<Event> = page.into_iter().filter(|e| have.insert(e.id)).collect();
+        if fresh.is_empty() {
+            if oldest == until && until > start {
+                until -= 1;
+                continue;
+            }
+            break;
+        }
+        seen += fresh.len() as u64;
+        new += sink.process(fresh).await;
         state.live_update(url, |u| {
             u.windows_done += 1;
             u.seen = seen;
             u.new = new;
         });
+        if oldest <= start {
+            break;
+        }
+        until = oldest;
     }
     Ok((seen, new))
+}
+
+const REQ_WINDOW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const RATE_LIMIT_RETRIES: u32 = 12;
+const EMPTY_PAGE_RECHECK: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReqError {
+    #[error("relay closed the subscription: {0}")]
+    Closed(String),
+    #[error("no EOSE within {0:?}")]
+    Timeout(std::time::Duration),
+    #[error("relay disconnected mid-subscription")]
+    Disconnected,
+    #[error(transparent)]
+    Relay(#[from] nostr_sdk::pool::relay::Error),
+}
+
+impl ReqError {
+    fn is_rate_limit(&self) -> bool {
+        match self {
+            ReqError::Closed(m) => {
+                let m = m.to_ascii_lowercase();
+                m.starts_with("rate-limited")
+                    || m.contains("rate limit")
+                    || m.contains("budget")
+                    || m.contains("too many")
+                    || m.contains("slow down")
+            }
+            _ => false,
+        }
+    }
+}
+
+async fn req_once(
+    relay: &nostr_sdk::Relay,
+    filter: nostr_sdk::Filter,
+    timeout: std::time::Duration,
+) -> Result<Vec<nostr_sdk::Event>, ReqError> {
+    use nostr_sdk::prelude::*;
+    let mut notes = relay.notifications();
+    let id = SubscriptionId::generate();
+    relay.send_msg(ClientMessage::req(id.clone(), vec![filter]))?;
+    let mut events = Vec::new();
+    let outcome = tokio::time::timeout(timeout, async {
+        loop {
+            match notes.recv().await {
+                Ok(RelayNotification::Message { message }) => match message {
+                    RelayMessage::Event {
+                        subscription_id,
+                        event,
+                    } if *subscription_id == id => {
+                        events.push(event.into_owned());
+                    }
+                    RelayMessage::EndOfStoredEvents(sid) if *sid == id => return Ok(()),
+                    RelayMessage::Closed {
+                        subscription_id,
+                        message,
+                    } if *subscription_id == id => {
+                        return Err(ReqError::Closed(message.into_owned()));
+                    }
+                    _ => {}
+                },
+                Ok(RelayNotification::RelayStatus {
+                    status:
+                        RelayStatus::Disconnected | RelayStatus::Terminated | RelayStatus::Banned,
+                }) => {
+                    return Err(ReqError::Disconnected);
+                }
+                Ok(RelayNotification::Shutdown) => return Err(ReqError::Disconnected),
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    return Err(ReqError::Disconnected);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    return Err(ReqError::Disconnected);
+                }
+            }
+        }
+    })
+    .await;
+    let _ = relay.send_msg(ClientMessage::close(id));
+    match outcome {
+        Ok(Ok(())) => Ok(events),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(ReqError::Timeout(timeout)),
+    }
+}
+
+pub async fn req_window(
+    relay: &nostr_sdk::Relay,
+    filter: nostr_sdk::Filter,
+    timeout: std::time::Duration,
+) -> Result<Vec<nostr_sdk::Event>, ReqError> {
+    let mut attempt = 0u32;
+    loop {
+        match req_once(relay, filter.clone(), timeout).await {
+            Err(e) if e.is_rate_limit() && attempt < RATE_LIMIT_RETRIES => {
+                attempt += 1;
+                let wait = std::time::Duration::from_secs((5u64 << attempt.min(4)).min(60));
+                tracing::debug!(relay = %relay.url(), error = %e, ?wait, "rate limited; backing off");
+                tokio::time::sleep(wait).await;
+            }
+            r => return r,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2792,5 +2901,152 @@ mod scrape_concurrency_tests {
             peak <= limit,
             "at most {limit} relay/day queries may be in flight, saw {peak}"
         );
+    }
+}
+
+#[cfg(test)]
+mod req_window_tests {
+    use futures::{SinkExt, StreamExt};
+    use nostr_sdk::prelude::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use tokio_tungstenite::tungstenite::Message;
+
+    #[derive(Clone, Copy)]
+    enum Behaviour {
+        CapAt(usize),
+        BudgetCloseOnce,
+    }
+
+    fn corpus(start: u64, n: u64, step: u64) -> Vec<Event> {
+        let keys = Keys::generate();
+        (0..n)
+            .map(|i| {
+                EventBuilder::text_note(format!("n{i}"))
+                    .custom_created_at(Timestamp::from(start + i * step))
+                    .sign_with_keys(&keys)
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    async fn fake_relay(events: Vec<Event>, behaviour: Behaviour) -> (String, Arc<AtomicU32>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let closes = Arc::new(AtomicU32::new(0));
+        let events = Arc::new(events);
+        let closes_t = closes.clone();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let events = events.clone();
+                let closes = closes_t.clone();
+                tokio::spawn(async move {
+                    let Ok(mut ws) = tokio_tungstenite::accept_async(tcp).await else {
+                        return;
+                    };
+                    while let Some(Ok(msg)) = ws.next().await {
+                        let Message::Text(txt) = msg else { continue };
+                        let Ok(ClientMessage::Req {
+                            subscription_id,
+                            filters,
+                        }) = ClientMessage::from_json(txt.as_str())
+                        else {
+                            continue;
+                        };
+                        let f = filters[0].clone().into_owned();
+                        let sid = subscription_id.into_owned();
+                        let mut hits: Vec<&Event> = events
+                            .iter()
+                            .filter(|e| {
+                                f.since.is_none_or(|s| e.created_at >= s)
+                                    && f.until.is_none_or(|u| e.created_at <= u)
+                                    && f.ids.as_ref().is_none_or(|ids| ids.contains(&e.id))
+                            })
+                            .collect();
+                        hits.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+                        let (send, closed) = match behaviour {
+                            Behaviour::CapAt(cap) => (hits.len().min(cap), None),
+                            Behaviour::BudgetCloseOnce => {
+                                if closes.fetch_add(1, Ordering::SeqCst) == 0 {
+                                    (
+                                        hits.len().min(3),
+                                        Some(
+                                            "error: read bandwidth budget exhausted (1048570 bytes/min per IP)",
+                                        ),
+                                    )
+                                } else {
+                                    (hits.len(), None)
+                                }
+                            }
+                        };
+                        for e in &hits[..send] {
+                            let m = RelayMessage::event(sid.clone(), (*e).clone()).as_json();
+                            if ws.send(Message::text(m)).await.is_err() {
+                                return;
+                            }
+                        }
+                        let tail = match closed {
+                            Some(reason) => RelayMessage::closed(sid.clone(), reason),
+                            None => RelayMessage::eose(sid.clone()),
+                        };
+                        let _ = ws.send(Message::text(tail.as_json())).await;
+                    }
+                });
+            }
+        });
+        (url, closes)
+    }
+
+    struct Collect(std::sync::Mutex<std::collections::HashSet<EventId>>);
+    impl super::Sink for Collect {
+        async fn missing(&self, ids: Vec<[u8; 32]>) -> Vec<[u8; 32]> {
+            ids
+        }
+        async fn process(&self, events: Vec<Event>) -> u64 {
+            let mut set = self.0.lock().unwrap();
+            events.into_iter().filter(|e| set.insert(e.id)).count() as u64
+        }
+    }
+
+    async fn scrape(url: &str, start: u64, end: u64) -> anyhow::Result<(u64, Arc<Collect>)> {
+        let dir = tempfile::tempdir().unwrap();
+        let state = super::ScrapeState::open(dir.path()).unwrap();
+        let client = Client::default();
+        client.add_relay(url).await.unwrap();
+        client
+            .try_connect_relay(url, std::time::Duration::from_secs(5))
+            .await
+            .unwrap();
+        let sink = Arc::new(Collect(Default::default()));
+        let mut info = super::RelayInfo {
+            negentropy: Some(false),
+            ..Default::default()
+        };
+        let (_, new) =
+            super::scrape_day(&client, url, &mut info, &sink, &state, start, end, 600).await?;
+        Ok((new, sink))
+    }
+
+    #[tokio::test]
+    async fn a_day_capped_at_500_per_req_is_fetched_in_full() {
+        let day = 1_790_985_600u64;
+        let (url, _) = fake_relay(corpus(day, 5_000, 1), Behaviour::CapAt(500)).await;
+        let (new, _) = scrape(&url, day, day + 86_400).await.unwrap();
+        assert_eq!(
+            new, 5_000,
+            "a relay that caps every REQ at 500 must still yield the whole day"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_close_is_retried_not_recorded_as_the_whole_window() {
+        let day = 1_790_985_600u64;
+        let (url, closes) = fake_relay(corpus(day, 40, 60), Behaviour::BudgetCloseOnce).await;
+        let (new, _) = scrape(&url, day, day + 86_400).await.unwrap();
+        assert!(
+            closes.load(Ordering::SeqCst) >= 2,
+            "the closed REQ must be retried"
+        );
+        assert_eq!(new, 40);
     }
 }
