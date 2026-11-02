@@ -23,6 +23,17 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 const DAY: u64 = 60 * 60 * 24;
 const WEEK: u64 = DAY * 7;
 
+pub(crate) fn month_start(ts: u64) -> u64 {
+    use chrono::{Datelike, TimeZone, Utc};
+    let Some(dt) = Utc.timestamp_opt(ts as i64, 0).single() else {
+        return ts - (ts % DAY);
+    };
+    Utc.with_ymd_and_hms(dt.year(), dt.month(), 1, 0, 0, 0)
+        .single()
+        .map(|m| m.timestamp() as u64)
+        .unwrap_or(ts - (ts % DAY))
+}
+
 /// Active-user counts for one bucket.
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct ActiveUsersBucket {
@@ -41,6 +52,8 @@ pub struct ActiveUsersBucket {
 pub struct ActiveUsersReport {
     pub daily: BTreeMap<u64, ActiveUsersBucket>,
     pub weekly: BTreeMap<u64, ActiveUsersBucket>,
+    #[serde(default)]
+    pub monthly: BTreeMap<u64, ActiveUsersBucket>,
 }
 
 /// Unique publishers per day and per week, as fixed-size sketches.
@@ -50,6 +63,8 @@ pub struct ActiveUsers {
     daily_trusted: HashMap<u64, Hll>,
     weekly: HashMap<u64, Hll>,
     weekly_trusted: HashMap<u64, Hll>,
+    monthly: HashMap<u64, Hll>,
+    monthly_trusted: HashMap<u64, Hll>,
     /// Buckets whose counts changed since the last drain. Realtime-only, so
     /// skipped during (de)serialization: a restored analysis starts with
     /// nothing pending.
@@ -57,6 +72,8 @@ pub struct ActiveUsers {
     dirty_daily: HashSet<u64>,
     #[serde(skip)]
     dirty_weekly: HashSet<u64>,
+    #[serde(skip)]
+    dirty_monthly: HashSet<u64>,
 }
 
 fn union_into(dst: &mut HashMap<u64, Hll>, src: HashMap<u64, Hll>) {
@@ -121,7 +138,7 @@ impl Analysis for ActiveUsers {
     /// sketches. The layouts are not compatible, so pre-sketch checkpoints must
     /// be discarded rather than mis-parsed.
     fn epoch(&self) -> u32 {
-        1
+        2
     }
 
     fn deps(&self) -> &'static [&'static str] {
@@ -129,42 +146,43 @@ impl Analysis for ActiveUsers {
     }
 
     fn observe(&mut self, ev: &NostrEvent, ctx: &AnalysisCtx) -> bool {
+        if ev.uses_throwaway_key() {
+            return false;
+        }
         let day = ev.created_at - (ev.created_at % DAY);
         let week = ev.created_at - (ev.created_at % WEEK);
+        let month = month_start(ev.created_at);
 
         let fresh_day = self.daily.entry(day).or_default().insert(&ctx.author);
         let fresh_week = self.weekly.entry(week).or_default().insert(&ctx.author);
+        let fresh_month = self.monthly.entry(month).or_default().insert(&ctx.author);
 
-        let mut new_trust = false;
+        let (mut trust_day, mut trust_week, mut trust_month) = (false, false, false);
         if ctx.author_trusted() {
-            new_trust |= self
-                .daily_trusted
-                .entry(day)
-                .or_default()
-                .insert(&ctx.author);
-            new_trust |= self
-                .weekly_trusted
-                .entry(week)
-                .or_default()
-                .insert(&ctx.author);
+            trust_day = self.daily_trusted.entry(day).or_default().insert(&ctx.author);
+            trust_week = self.weekly_trusted.entry(week).or_default().insert(&ctx.author);
+            trust_month = self.monthly_trusted.entry(month).or_default().insert(&ctx.author);
         }
 
-        // Only mark dirty when a count actually moved, so a busy relay of
-        // already-seen publishers produces no dashboard traffic.
-        if fresh_day || new_trust {
+        if fresh_day || trust_day {
             self.dirty_daily.insert(day);
         }
-        if fresh_week || new_trust {
+        if fresh_week || trust_week {
             self.dirty_weekly.insert(week);
         }
+        if fresh_month || trust_month {
+            self.dirty_monthly.insert(month);
+        }
 
-        // "Folded" = this event contributed a new unique user somewhere.
-        fresh_day || fresh_week
+        fresh_day || fresh_week || fresh_month
     }
 
     fn merge(&mut self, other: Self) {
         self.dirty_daily.extend(other.daily.keys().copied());
         self.dirty_weekly.extend(other.weekly.keys().copied());
+        self.dirty_monthly.extend(other.monthly.keys().copied());
+        union_into(&mut self.monthly, other.monthly);
+        union_into(&mut self.monthly_trusted, other.monthly_trusted);
         union_into(&mut self.daily, other.daily);
         union_into(&mut self.daily_trusted, other.daily_trusted);
         union_into(&mut self.weekly, other.weekly);
@@ -175,15 +193,27 @@ impl Analysis for ActiveUsers {
         ActiveUsersReport {
             daily: buckets(&self.daily, &self.daily_trusted),
             weekly: buckets(&self.weekly, &self.weekly_trusted),
+            monthly: buckets(&self.monthly, &self.monthly_trusted),
         }
     }
 
     /// Emits only the day/week buckets whose counts moved. Both sides are keyed
     /// by bucket start, so this is a plain merge patch over the snapshot.
     fn drain_delta(&mut self) -> Option<serde_json::Value> {
-        if self.dirty_daily.is_empty() && self.dirty_weekly.is_empty() {
+        if self.dirty_daily.is_empty()
+            && self.dirty_weekly.is_empty()
+            && self.dirty_monthly.is_empty()
+        {
             return None;
         }
+        let monthly: serde_json::Map<String, serde_json::Value> = self
+            .dirty_monthly
+            .drain()
+            .filter_map(|s| {
+                let b = bucket_at(&self.monthly, &self.monthly_trusted, s)?;
+                Some((s.to_string(), serde_json::to_value(b).ok()?))
+            })
+            .collect();
         let daily: serde_json::Map<String, serde_json::Value> = self
             .dirty_daily
             .drain()
@@ -207,6 +237,9 @@ impl Analysis for ActiveUsers {
         }
         if !weekly.is_empty() {
             patch.insert("weekly".into(), serde_json::Value::Object(weekly));
+        }
+        if !monthly.is_empty() {
+            patch.insert("monthly".into(), serde_json::Value::Object(monthly));
         }
         Some(serde_json::Value::Object(patch))
     }
@@ -315,6 +348,38 @@ mod tests {
         let patch = a.drain_delta().unwrap();
         crate::merge_patch(&mut held, &patch);
         assert_eq!(held, serde_json::to_value(a.snapshot()).unwrap());
+    }
+
+    #[test]
+    fn throwaway_key_kinds_are_not_users() {
+        let world = crate::World::new();
+        let t0 = 1_793_577_600;
+        let mut a = ActiveUsers::default();
+        for (i, kind) in [1059u16, 445, 24133, 20001, 29999].iter().enumerate() {
+            let pk = format!("{:064x}", i + 1);
+            let mut e = ev(t0, &pk);
+            e.kind = *kind;
+            assert!(!a.observe(&e, &ctx_for(t0, &pk, &world)), "kind {kind}");
+        }
+        let pk = "b".repeat(64);
+        assert!(a.observe(&ev(t0, &pk), &ctx_for(t0, &pk, &world)));
+        assert_eq!(a.dau(t0), 1, "only the note author is a user");
+    }
+
+    #[test]
+    fn monthly_buckets_count_each_user_once_per_calendar_month() {
+        let world = crate::World::new();
+        let oct_31 = 1_793_404_800u64;
+        let nov_1 = oct_31 + DAY;
+        let mut a = ActiveUsers::default();
+        let pk = "b".repeat(64);
+        a.observe(&ev(oct_31, &pk), &ctx_for(nov_1, &pk, &world));
+        a.observe(&ev(oct_31 + 60, &pk), &ctx_for(nov_1, &pk, &world));
+        a.observe(&ev(nov_1, &pk), &ctx_for(nov_1, &pk, &world));
+        let m = a.snapshot().monthly;
+        assert_eq!(m.len(), 2);
+        assert_eq!(m.get(&month_start(oct_31)).unwrap().users.untrusted, 1);
+        assert_eq!(month_start(nov_1), nov_1, "2026-11-01 starts a month");
     }
 
     #[test]

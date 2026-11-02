@@ -316,7 +316,10 @@ impl Registry {
                 g
             }
         };
-        let ctx = crate::AttachCtx { graph };
+        let ctx = crate::AttachCtx {
+            graph,
+            dir: dir.to_path_buf(),
+        };
         for e in &mut self.entries {
             e.analysis.attach(&ctx)?;
         }

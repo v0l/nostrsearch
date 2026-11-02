@@ -1,31 +1,95 @@
-//! Trending hashtags via a time-decayed score — an example of a "trending
-//! algo" the framework is meant to host. Each `t` tag gains weight that decays
-//! with the event's age relative to `ctx.now`, optionally boosted by author
-//! WoT tier so a handful of bots can't dominate a trend.
+//! Trending hashtags: what is being written about now.
+//!
+//! Mentions are kept in hourly buckets over a fixed window and decayed to the
+//! moment the snapshot is taken, so a tag that was big last week fades out on
+//! its own. Each author counts at most once per tag per hour, so one account
+//! repeating a tag cannot make it trend, and authors inside the web of trust
+//! weigh more.
 
 use crate::{Analysis, AnalysisCtx};
 use nostrsearch_core::event::NostrEvent;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 
-/// Half-life (seconds) of a hashtag mention's contribution to the trend score.
-const HALF_LIFE_SECS: f64 = 6.0 * 3600.0;
+const HOUR: u64 = 3600;
+const WINDOW_HOURS: u64 = 7 * 24;
+const HALF_LIFE_HOURS: f64 = 24.0;
+const MAX_TAG_LEN: usize = 64;
+const TOP: usize = 100;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrendingTag {
     pub tag: String,
     pub score: f64,
     pub mentions: u64,
+    pub authors_24h: u64,
 }
 
-/// Time-decayed trending hashtag scores. Kind-pre-filtered to text kinds.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct HourBucket {
+    weight: HashMap<String, f64>,
+    mentions: HashMap<String, u64>,
+    #[serde(skip)]
+    seen: HashSet<(String, crate::types::Pubkey)>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TrendingHashtags {
-    scores: HashMap<String, f64>,
-    mentions: HashMap<String, u64>,
+    hours: BTreeMap<u64, HourBucket>,
+    #[serde(skip)]
+    now: u64,
 }
 
-const TEXT_KINDS: &[u16] = &[1, 1111, 9802, 30023];
+const TEXT_KINDS: &[u16] = &[1, 20, 21, 22, 1111, 9802, 30023];
+
+fn normalize(tag: &str) -> Option<String> {
+    let t = tag.trim().trim_start_matches('#').to_lowercase();
+    (!t.is_empty() && t.len() <= MAX_TAG_LEN).then_some(t)
+}
+
+impl TrendingHashtags {
+    fn prune(&mut self, now: u64) {
+        let floor = (now / HOUR).saturating_sub(WINDOW_HOURS) * HOUR;
+        self.hours = self.hours.split_off(&floor);
+    }
+
+    fn ranked(&self, now: u64) -> Vec<TrendingTag> {
+        let now_hour = now / HOUR;
+        let mut score: HashMap<&str, f64> = HashMap::new();
+        let mut mentions: HashMap<&str, u64> = HashMap::new();
+        let mut recent: HashMap<&str, u64> = HashMap::new();
+        for (&start, b) in &self.hours {
+            let age = now_hour.saturating_sub(start / HOUR) as f64;
+            let decay = 0.5_f64.powf(age / HALF_LIFE_HOURS);
+            for (tag, w) in &b.weight {
+                *score.entry(tag).or_default() += w * decay;
+            }
+            for (tag, n) in &b.mentions {
+                *mentions.entry(tag).or_default() += n;
+                if age < 24.0 {
+                    *recent.entry(tag).or_default() += n;
+                }
+            }
+        }
+        let mut out: Vec<TrendingTag> = score
+            .into_iter()
+            .map(|(tag, score)| TrendingTag {
+                tag: tag.to_string(),
+                score,
+                mentions: mentions.get(tag).copied().unwrap_or(0),
+                authors_24h: recent.get(tag).copied().unwrap_or(0),
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| a.tag.cmp(&b.tag))
+        });
+        out.truncate(TOP);
+        out
+    }
+}
 
 impl Analysis for TrendingHashtags {
     type Output = Vec<TrendingTag>;
@@ -34,61 +98,82 @@ impl Analysis for TrendingHashtags {
         "trending_hashtags"
     }
 
+    fn epoch(&self) -> u32 {
+        1
+    }
+
+    fn deps(&self) -> &'static [&'static str] {
+        &["follow_graph"]
+    }
+
     fn kinds(&self) -> Option<&[u16]> {
         Some(TEXT_KINDS)
     }
 
-    fn observe(&mut self, ev: &NostrEvent, ctx: &AnalysisCtx) -> bool {
-        // Age-based decay: weight = 0.5 ^ (age / half_life). Future-dated events
-        // are clamped to weight 1.
-        let age = ctx.now.saturating_sub(ev.created_at) as f64;
-        let decay = 0.5_f64.powf(age / HALF_LIFE_SECS);
-        // WoT boost: tier 0 → ×1, each tier adds 50%.
-        let boost = 1.0 + 0.5 * ctx.author_tier() as f64;
-        let weight = decay * boost;
+    fn refresh_interval(&self) -> Option<std::time::Duration> {
+        Some(std::time::Duration::from_secs(HOUR))
+    }
 
+    fn refresh(&mut self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(self.now);
+        self.prune(now);
+    }
+
+    fn observe(&mut self, ev: &NostrEvent, ctx: &AnalysisCtx) -> bool {
+        self.now = self.now.max(ctx.now);
+        let floor = (ctx.now / HOUR).saturating_sub(WINDOW_HOURS) * HOUR;
+        if ev.created_at < floor || ev.created_at > ctx.now + HOUR {
+            return false;
+        }
+        let hour = ev.created_at - (ev.created_at % HOUR);
+        let weight = 1.0 + 0.5 * ctx.author_tier() as f64;
+        let bucket = self.hours.entry(hour).or_default();
         let mut folded = false;
-        for tag in ev.tag_values("t") {
-            let key = tag.to_lowercase();
-            *self.scores.entry(key.clone()).or_default() += weight;
-            *self.mentions.entry(key).or_default() += 1;
+        let tags: HashSet<String> = ev.tag_values("t").filter_map(normalize).collect();
+        for tag in tags {
+            if !bucket.seen.insert((tag.clone(), ctx.author)) {
+                continue;
+            }
+            *bucket.weight.entry(tag.clone()).or_default() += weight;
+            *bucket.mentions.entry(tag).or_default() += 1;
             folded = true;
+        }
+        if self.hours.len() as u64 > WINDOW_HOURS + 2 {
+            self.prune(ctx.now);
         }
         folded
     }
 
     fn merge(&mut self, other: Self) {
-        for (k, v) in other.scores {
-            *self.scores.entry(k).or_default() += v;
+        for (start, b) in other.hours {
+            let slot = self.hours.entry(start).or_default();
+            for (k, v) in b.weight {
+                *slot.weight.entry(k).or_default() += v;
+            }
+            for (k, v) in b.mentions {
+                *slot.mentions.entry(k).or_default() += v;
+            }
+            slot.seen.extend(b.seen);
         }
-        for (k, v) in other.mentions {
-            *self.mentions.entry(k).or_default() += v;
-        }
+        self.now = self.now.max(other.now);
     }
 
     fn snapshot(&self) -> Self::Output {
-        let mut out: Vec<TrendingTag> = self
-            .scores
-            .iter()
-            .map(|(tag, &score)| TrendingTag {
-                tag: tag.clone(),
-                score,
-                mentions: self.mentions.get(tag).copied().unwrap_or(0),
-            })
-            .collect();
-        out.sort_by(|a, b| {
-            b.score
-                .partial_cmp(&a.score)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        out.truncate(100);
-        out
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(self.now);
+        self.ranked(now)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{Hash32, Pubkey};
 
     fn ev(created_at: u64, tags: &[&str]) -> NostrEvent {
         NostrEvent {
@@ -105,23 +190,63 @@ mod tests {
         }
     }
 
+    fn ctx(world: &crate::World, now: u64, seed: u8) -> AnalysisCtx<'_> {
+        AnalysisCtx::new(now, Hash32([seed; 32]), Pubkey::ZERO, world)
+    }
+
     #[test]
-    fn recent_tags_outrank_old_and_only_text_kinds() {
-        let now = 1_700_000_000;
-        let ctx = AnalysisCtx::bare(now);
+    fn many_authors_beat_one_author_repeating_a_tag() {
+        let now = 1_793_600_000;
+        let world = crate::World::new();
         let mut t = TrendingHashtags::default();
-
-        // recent #nostr, old #bitcoin (2 half-lives ago)
-        t.observe(&ev(now, &["nostr"]), &ctx);
-        t.observe(&ev(now - (12 * 3600), &["bitcoin"]), &ctx);
-
-        let out = t.snapshot();
+        for _ in 0..500 {
+            t.observe(&ev(now - 60, &["spam"]), &ctx(&world, now, 1));
+        }
+        for seed in 10..20 {
+            t.observe(&ev(now - 60, &["nostr"]), &ctx(&world, now, seed));
+        }
+        let out = t.ranked(now);
         assert_eq!(out[0].tag, "nostr");
-        assert!(out[0].score > out[1].score);
+        assert_eq!(out.iter().find(|x| x.tag == "spam").unwrap().mentions, 1);
+    }
 
-        // a non-text kind is filtered out
-        let mut e = ev(now, &["reaction"]);
-        e.kind = 7;
-        assert!(!t.wants(&e));
+    #[test]
+    fn last_weeks_big_tag_fades_below_todays() {
+        let now = 1_793_600_000;
+        let world = crate::World::new();
+        let mut t = TrendingHashtags::default();
+        for seed in 0..50 {
+            t.observe(&ev(now - 6 * 24 * HOUR, &["olympics"]), &ctx(&world, now, seed));
+        }
+        for seed in 100..110 {
+            t.observe(&ev(now - HOUR, &["election"]), &ctx(&world, now, seed));
+        }
+        let out = t.ranked(now);
+        assert_eq!(out[0].tag, "election", "{out:?}");
+    }
+
+    #[test]
+    fn events_outside_the_window_are_ignored_and_pruned() {
+        let now = 1_793_600_000;
+        let world = crate::World::new();
+        let mut t = TrendingHashtags::default();
+        assert!(!t.observe(&ev(now - 30 * 24 * HOUR, &["old"]), &ctx(&world, now, 1)));
+        assert!(t.hours.is_empty());
+        for h in 0..(WINDOW_HOURS + 10) {
+            t.observe(&ev(now - h * HOUR, &["x"]), &ctx(&world, now, 1));
+        }
+        assert!(t.hours.len() as u64 <= WINDOW_HOURS + 3);
+    }
+
+    #[test]
+    fn tags_are_normalized_and_counted_once_per_event() {
+        let now = 1_793_600_000;
+        let world = crate::World::new();
+        let mut t = TrendingHashtags::default();
+        t.observe(&ev(now, &["Bitcoin", "#bitcoin", "BITCOIN"]), &ctx(&world, now, 1));
+        let out = t.ranked(now);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].tag, "bitcoin");
+        assert_eq!(out[0].mentions, 1);
     }
 }

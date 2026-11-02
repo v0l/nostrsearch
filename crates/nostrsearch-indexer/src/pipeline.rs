@@ -15,7 +15,9 @@
 use crate::shard_writer::{ShardManager, ShardWriterConfig};
 use anyhow::Result;
 use nostrsearch_core::event::NostrEvent;
-use nostrsearch_stats::analyses::{ActiveUsers, Activity, Clients, FollowGraph, Pagerank, Relays};
+use nostrsearch_stats::analyses::{
+    ActiveUsers, Activity, Clients, FollowGraph, NewUsers, Pagerank, Relays, TrendingHashtags,
+};
 use nostrsearch_stats::{Registry, SharedWot, StatStore, World, WotIndex};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -111,6 +113,8 @@ impl Pipeline {
         registry
             .register(Activity::default())
             .register(ActiveUsers::default())
+            .register(NewUsers::default())
+            .register(TrendingHashtags::default())
             .register(Clients::default())
             // Feeds the scraper its relay targets, replacing a full-index scan
             // that ran on every boot.

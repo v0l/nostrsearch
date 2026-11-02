@@ -54,6 +54,19 @@ function plausibleTime(unix: number): boolean {
   );
 }
 
+export const COVERAGE_GAPS: { from: string; to: string; why: string }[] = [
+  { from: "2024-10-01", to: "2025-08-19", why: "no archive was recording and relays have since pruned it" },
+  { from: "2025-11-20", to: "2025-12-08", why: "archive outage" },
+  { from: "2026-07-16", to: "2026-07-28", why: "archive outage" },
+  { from: "2026-08-26", to: "2026-10-19", why: "archive outage during the move off the old node" },
+];
+
+export function coverageGap(start: number, end = start + 86_400): string | undefined {
+  const a = isoDay(start);
+  const b = isoDay(end - 1);
+  return COVERAGE_GAPS.find((g) => a <= g.to && b >= g.from)?.why;
+}
+
 /** `YYYY-MM-DD`, or an em dash when the timestamp cannot be one. */
 export function isoDay(unix: number): string {
   if (!plausibleTime(unix)) return "—";
@@ -224,6 +237,7 @@ export function Meter(props: { value: number; max: number; tone?: "brass" | "rus
 
 export interface BarDatum {
   key: string;
+  gap?: boolean;
   /** Bar height as a fraction of the tallest bar, 0–1. */
   height: number;
   /** Solid share rising from the baseline, 0–1. */
@@ -253,7 +267,7 @@ export function Bars(props: {
         {props.items.map((d, i) => (
           <div
             key={d.key}
-            class="bar"
+            class={d.gap ? "bar gap" : "bar"}
             style={{
               height: `${Math.max(2, d.height * 100)}%`,
               animationDelay: `${i * 14}ms`,

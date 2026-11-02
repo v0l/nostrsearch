@@ -5,9 +5,11 @@ import {
   asArray,
   asRecord,
   total,
+  type ActiveUsersBucket,
   type ActiveUsersReport,
   type ClientStats,
   type DailyActivity,
+  type NewUsersReport,
   type Reports as ReportsState,
   type TrendingTag,
   type TrustedCount,
@@ -15,10 +17,12 @@ import {
 import { dayEvents, dayTrusted, kindLabel } from "./Today";
 import {
   Bars,
+  COVERAGE_GAPS,
   Meter,
   Panel,
   ago,
   compact,
+  coverageGap,
   isoDay,
   num,
   plural,
@@ -51,8 +55,48 @@ function ReadoutSmall(props: { value: string; label: string; sub?: string }) {
 
 // --- activity --------------------------------------------------------------
 
+type Range = "90d" | "all";
+
+function RangeToggle(props: { value: Range; onChange: (r: Range) => void }) {
+  return (
+    <span class="range">
+      {(["90d", "all"] as Range[]).map((r) => (
+        <button
+          key={r}
+          class="tiny"
+          aria-pressed={props.value === r}
+          onClick={() => props.onChange(r)}
+        >
+          {r === "90d" ? "90 days" : "all time"}
+        </button>
+      ))}
+    </span>
+  );
+}
+
+const monthLabel = (unix: number): string => isoDay(unix).slice(0, 7);
+
+function monthOf(unix: number): number {
+  const d = new Date(unix * 1000);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 1) / 1000;
+}
+
+function nextMonth(unix: number): number {
+  const d = new Date(unix * 1000);
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth() + 1, 1) / 1000;
+}
+
+function GapNote() {
+  return (
+    <p class="panel-note gap-note">
+      {`Striped bars fall in periods the archive did not record (${COVERAGE_GAPS.map((g) => `${g.from} to ${g.to}`).join(", ")}). Counts there are only what relays still held when they were scraped, so read them as a floor.`}
+    </p>
+  );
+}
+
 function Activity({ raw }: { raw: unknown }) {
-  const days = Object.entries(asRecord<DailyActivity>(raw))
+  const [range, setRange] = useState<Range>("90d");
+  const all = Object.entries(asRecord<DailyActivity>(raw))
     .map(([start, d]) => ({
       start: Number(start),
       events: dayEvents(d),
@@ -60,49 +104,64 @@ function Activity({ raw }: { raw: unknown }) {
       zaps: total(d.zaps_sent_sats ?? { trusted: 0, untrusted: 0 }),
       zapCount: d.zap_count ?? 0,
     }))
-    // Drop buckets built from broken created_at values: they sort after every
-    // real day, so without this the "last 90" window is entirely junk.
     .filter((d) => plausibleDay(d.start))
-    .sort((a, b) => a.start - b.start)
-    .slice(-90);
+    .sort((a, b) => a.start - b.start);
 
-  const peak = Math.max(1, ...days.map((d) => d.events));
-  const zapSats = days.reduce((n, d) => n + d.zaps, 0);
-  const zapCount = days.reduce((n, d) => n + d.zapCount, 0);
-  const events = days.reduce((n, d) => n + d.events, 0);
+  let rows = all;
+  let unit = "day";
+  if (range === "all") {
+    const by = new Map<number, (typeof all)[number]>();
+    for (const d of all) {
+      const m = monthOf(d.start);
+      const slot = by.get(m) ?? { start: m, events: 0, trusted: 0, zaps: 0, zapCount: 0 };
+      slot.events += d.events;
+      slot.trusted += d.trusted;
+      slot.zaps += d.zaps;
+      slot.zapCount += d.zapCount;
+      by.set(m, slot);
+    }
+    rows = [...by.values()].sort((a, b) => a.start - b.start);
+    unit = "month";
+  } else {
+    rows = all.slice(-90);
+  }
+  const label = range === "all" ? monthLabel : day;
+  const end = (start: number) => (range === "all" ? nextMonth(start) : start + 86_400);
+
+  const peak = Math.max(1, ...rows.map((d) => d.events));
+  const zapSats = rows.reduce((n, d) => n + d.zaps, 0);
+  const zapCount = rows.reduce((n, d) => n + d.zapCount, 0);
+  const events = rows.reduce((n, d) => n + d.events, 0);
 
   return (
     <Panel
       id="activity"
       label="Activity"
-      aside={days.length ? plural(days.length, "day") : undefined}
-      note="Events published per day, with the share from inside the web of trust filled in. A tall hollow bar is a day the corpus grew without trusted people writing."
+      aside={<RangeToggle value={range} onChange={setRange} />}
+      note={`Events published per ${unit}, with the share from inside the web of trust filled in.`}
     >
       <Bars
-        items={days.map((d) => ({
-          key: String(d.start),
-          height: d.events / peak,
-          fill: d.events > 0 ? d.trusted / d.events : 0,
-          title: `${day(d.start)} — ${num(d.events)} events, ${num(d.trusted)} trusted, ${num(d.zaps)} sats zapped`,
-        }))}
+        items={rows.map((d) => {
+          const gap = coverageGap(d.start, end(d.start));
+          return {
+            key: String(d.start),
+            height: d.events / peak,
+            fill: d.events > 0 ? d.trusted / d.events : 0,
+            gap: !!gap,
+            title: `${label(d.start)}: ${num(d.events)} events, ${num(d.trusted)} trusted, ${num(d.zaps)} sats zapped${gap ? ` (${gap})` : ""}`,
+          };
+        })}
         height={112}
-        left={days.length ? day(days[0].start) : undefined}
-        center={days.length ? `peak ${compact(peak)} events/day` : undefined}
-        right={days.length ? day(days[days.length - 1].start) : undefined}
+        left={rows.length ? label(rows[0].start) : undefined}
+        center={rows.length ? `peak ${compact(peak)} events/${unit}` : undefined}
+        right={rows.length ? label(rows[rows.length - 1].start) : undefined}
         empty="No activity recorded yet. Days appear as the analysis consumes events."
       />
+      <GapNote />
 
       <div class="readouts" style={{ marginTop: "18px" }}>
-        <ReadoutSmall
-          value={compact(events)}
-          label="Events recorded"
-          sub={`over ${plural(days.length, "day")}`}
-        />
-        <ReadoutSmall
-          value={compact(zapSats)}
-          label="Sats zapped"
-          sub={plural(zapCount, "receipt")}
-        />
+        <ReadoutSmall value={compact(events)} label="Events recorded" sub={`over ${plural(rows.length, unit)}`} />
+        <ReadoutSmall value={compact(zapSats)} label="Sats zapped" sub={plural(zapCount, "receipt")} />
       </div>
     </Panel>
   );
@@ -110,56 +169,90 @@ function Activity({ raw }: { raw: unknown }) {
 
 // --- active users ----------------------------------------------------------
 
-function ActiveUsers({ raw }: { raw: unknown }) {
-  const rep = (raw ?? {}) as Partial<ActiveUsersReport>;
-  const daily = Object.values(asRecord<ActiveUsersReport["daily"][string]>(rep.daily))
-    // Same trap as Activity: junk buckets sort last, so an unfiltered
-    // "last 90" window shows none of the real days.
-    .filter((b) => b && plausibleDay(b.start))
-    .sort((a, b) => a.start - b.start)
-    .slice(-90);
-  const weekly = Object.values(asRecord<ActiveUsersReport["weekly"][string]>(rep.weekly))
+function sorted(rec: Record<string, ActiveUsersBucket> | undefined): ActiveUsersBucket[] {
+  return Object.values(asRecord<ActiveUsersBucket>(rec))
     .filter((b) => b && plausibleDay(b.start))
     .sort((a, b) => a.start - b.start);
+}
 
-  const peak = Math.max(1, ...daily.map((b) => total(b.users)));
-  const last = daily[daily.length - 1];
+function ActiveUsers({ raw, fresh }: { raw: unknown; fresh: unknown }) {
+  const [range, setRange] = useState<Range>("90d");
+  const rep = (raw ?? {}) as Partial<ActiveUsersReport>;
+  const newRep = (fresh ?? {}) as Partial<NewUsersReport>;
+  const newDaily = asRecord<number>(newRep.daily);
+  const newMonthly = asRecord<number>(newRep.monthly);
+
+  const daily = sorted(rep.daily);
+  const weekly = sorted(rep.weekly);
+  const monthly = sorted(rep.monthly);
+
+  const rows = range === "all" ? monthly : daily.slice(-90);
+  const newOf = (start: number) => (range === "all" ? newMonthly[String(start)] : newDaily[String(start)]) ?? 0;
+  const label = range === "all" ? monthLabel : day;
+  const unit = range === "all" ? "month" : "day";
+  const end = (start: number) => (range === "all" ? nextMonth(start) : start + 86_400);
+  const peak = Math.max(1, ...rows.map((b) => total(b.users)));
+  const newPeak = Math.max(1, ...rows.map((b) => newOf(b.start)));
+
+  const lastDay = daily[daily.length - 1];
   const lastWeek = weekly[weekly.length - 1];
+  const lastMonth = monthly[monthly.length - 1];
+  const newLast30 = daily.slice(-30).reduce((n, b) => n + (newDaily[String(b.start)] ?? 0), 0);
 
   return (
     <Panel
       id="publishers"
-      label="Publishers"
-      aside={last ? `${compact(total(last.users))} on the last day` : undefined}
-      note="Distinct pubkeys that published, counted with HyperLogLog sketches — close, not exact, and cheap enough to keep per day forever."
+      label="Active users"
+      aside={<RangeToggle value={range} onChange={setRange} />}
+      note="Distinct pubkeys that published anything signed by their own key. Gift wraps, MLS messages, bunker requests and ephemeral events use one-off keys and are left out. Counted with HyperLogLog sketches, so within about 2%."
     >
-      <Bars
-        items={daily.map((b) => ({
-          key: String(b.start),
-          height: total(b.users) / peak,
-          fill: total(b.users) > 0 ? b.users.trusted / total(b.users) : 0,
-          title: `${day(b.start)} — ${num(total(b.users))} publishers, ${num(b.users.trusted)} trusted`,
-        }))}
-        // Deliberately shorter than the activity chart: same instrument,
-        // secondary series, so the two do not compete.
-        height={64}
-        left={daily.length ? day(daily[0].start) : undefined}
-        right={last ? day(last.start) : undefined}
-        empty="No publisher counts yet."
-      />
+      {range === "all" && monthly.length === 0 ? (
+        <p class="empty">Monthly counts appear once the active_users analysis has replayed the archive.</p>
+      ) : (
+        <Bars
+          items={rows.map((b) => {
+            const gap = coverageGap(b.start, end(b.start));
+            return {
+              key: String(b.start),
+              height: total(b.users) / peak,
+              fill: total(b.users) > 0 ? b.users.trusted / total(b.users) : 0,
+              gap: !!gap,
+              title: `${label(b.start)}: ${num(total(b.users))} active, ${num(b.users.trusted)} trusted, ${num(newOf(b.start))} new${gap ? ` (${gap})` : ""}`,
+            };
+          })}
+          height={96}
+          left={rows.length ? label(rows[0].start) : undefined}
+          center={rows.length ? `peak ${compact(peak)} per ${unit}` : undefined}
+          right={rows.length ? label(rows[rows.length - 1].start) : undefined}
+          empty="No publisher counts yet."
+        />
+      )}
 
       <div class="readouts" style={{ marginTop: "18px" }}>
-        <ReadoutSmall
-          value={compact(last ? total(last.users) : undefined)}
-          label="Publishers, last day"
-          sub={last ? trustShare(last.users) : undefined}
-        />
-        <ReadoutSmall
-          value={compact(lastWeek ? total(lastWeek.users) : undefined)}
-          label="Publishers, last week"
-          sub={lastWeek ? trustShare(lastWeek.users) : undefined}
-        />
+        <ReadoutSmall value={compact(lastDay ? total(lastDay.users) : undefined)} label="Daily active" sub={lastDay ? trustShare(lastDay.users) : undefined} />
+        <ReadoutSmall value={compact(lastWeek ? total(lastWeek.users) : undefined)} label="Weekly active" sub={lastWeek ? trustShare(lastWeek.users) : undefined} />
+        <ReadoutSmall value={compact(lastMonth ? total(lastMonth.users) : undefined)} label="Monthly active" sub={lastMonth ? `${monthLabel(lastMonth.start)}, ${trustShare(lastMonth.users)}` : undefined} />
+        <ReadoutSmall value={compact(newLast30)} label="New users" sub="first seen in the last 30 days" />
       </div>
+
+      <h3 class="subhead">New users per {unit}</h3>
+      <p class="panel-note">A pubkey counts as new on the day of the oldest event the archive holds from it.</p>
+      <Bars
+        items={rows.map((b) => {
+          const gap = coverageGap(b.start, end(b.start));
+          return {
+            key: `n${b.start}`,
+            height: newOf(b.start) / newPeak,
+            fill: 1,
+            gap: !!gap,
+            title: `${label(b.start)}: ${num(newOf(b.start))} new pubkeys${gap ? ` (${gap})` : ""}`,
+          };
+        })}
+        height={64}
+        left={rows.length ? label(rows[0].start) : undefined}
+        right={rows.length ? label(rows[rows.length - 1].start) : undefined}
+        empty="No new-user counts yet."
+      />
     </Panel>
   );
 }
@@ -175,7 +268,7 @@ function Trending({ raw }: { raw: unknown }) {
       id="trending"
       label="Trending"
       aside={tags.length ? `top ${tags.length}` : undefined}
-      note="Hashtag scores decay with a six-hour half-life, so this is what is being written about now rather than what has been written most."
+      note="Hashtags from the last seven days, scored by how many different people used them and decayed with a one-day half-life. One account repeating a tag counts once per hour. The number is distinct authors in the last 24 hours."
     >
       {tags.length === 0 ? (
         <p class="empty">No hashtag scores yet.</p>
@@ -188,7 +281,9 @@ function Trending({ raw }: { raw: unknown }) {
               <span class="track">
                 <Meter value={t.score} max={peak} />
               </span>
-              <span class="count">{num(t.mentions)}</span>
+              <span class="count" title={`${num(t.mentions)} authors over 7 days`}>
+                {num(t.authors_24h ?? t.mentions)}
+              </span>
             </li>
           ))}
         </ol>
@@ -205,31 +300,50 @@ function Trending({ raw }: { raw: unknown }) {
  * trusted/untrusted counts, so the panel works either way rather than sitting
  * empty on a node that never registered the standalone analysis.
  */
-function Kinds({ breakdown, activity }: { breakdown: unknown; activity: unknown }) {
-  const direct = asRecord<TrustedCount>(breakdown);
-  const derived: Record<string, TrustedCount> = {};
-  if (Object.keys(direct).length === 0) {
-    for (const d of Object.values(asRecord<DailyActivity>(activity))) {
-      for (const [kind, c] of Object.entries(d.kinds ?? {})) {
-        const slot = (derived[kind] ??= { trusted: 0, untrusted: 0 });
+function Kinds({ activity }: { activity: unknown }) {
+  const days = Object.entries(asRecord<DailyActivity>(activity))
+    .map(([k, d]) => [Number(k), d] as const)
+    .filter(([k, d]) => plausibleDay(k) && d)
+    .sort((a, b) => a[0] - b[0]);
+  const lastDay = days.length ? days[days.length - 1][0] : 0;
+  const recentFrom = lastDay - 29 * 86_400;
+  const priorFrom = recentFrom - 30 * 86_400;
+
+  const recent: Record<string, TrustedCount> = {};
+  const prior: Record<string, number> = {};
+  for (const [start, d] of days) {
+    if (start < priorFrom) continue;
+    for (const [kind, c] of Object.entries(d.kinds ?? {})) {
+      if (start >= recentFrom) {
+        const slot = (recent[kind] ??= { trusted: 0, untrusted: 0 });
         slot.trusted += c.trusted ?? 0;
         slot.untrusted += c.untrusted ?? 0;
+      } else {
+        prior[kind] = (prior[kind] ?? 0) + total(c);
       }
     }
   }
-  const fromActivity = Object.keys(direct).length === 0;
-  const entries = Object.entries(fromActivity ? derived : direct)
-    .filter(([, c]) => c && total(c) > 0)
+  const grand = Object.values(recent).reduce((n, c) => n + total(c), 0);
+  const entries = Object.entries(recent)
+    .filter(([, c]) => total(c) > 0)
     .sort((a, b) => total(b[1]) - total(a[1]))
-    .slice(0, 14);
+    .slice(0, 20);
   const peak = entries.length ? total(entries[0][1]) : 1;
+  const priorGap = coverageGap(priorFrom, recentFrom) ?? coverageGap(recentFrom, lastDay + 86_400);
+  const change = (kind: string, now: number): string => {
+    if (priorGap) return "—";
+    const before = prior[kind] ?? 0;
+    if (before === 0) return now > 0 ? "new" : "—";
+    const pct = ((now - before) / before) * 100;
+    return `${pct >= 0 ? "+" : ""}${pct.toFixed(0)}%`;
+  };
 
   return (
     <Panel
       id="kinds"
       label="Kinds"
-      aside={fromActivity && entries.length ? "from activity" : undefined}
-      note="What the corpus is made of, split by whether the author is inside the web of trust."
+      aside="last 30 days"
+      note={`What was published in the last 30 days by kind, against the 30 days before. Trusted is the share from authors inside the web of trust.${priorGap ? ` The comparison is hidden because the earlier window falls in a coverage gap (${priorGap}).` : ""}`}
     >
       {entries.length === 0 ? (
         <p class="empty">No kind counts yet.</p>
@@ -240,8 +354,10 @@ function Kinds({ breakdown, activity }: { breakdown: unknown; activity: unknown 
               <tr>
                 <th>Kind</th>
                 <th class="num">Events</th>
+                <th class="num">Share</th>
+                <th class="num">vs prior 30d</th>
                 <th class="num">Trusted</th>
-                <th>Split</th>
+                <th>Volume</th>
               </tr>
             </thead>
             <tbody>
@@ -251,8 +367,10 @@ function Kinds({ breakdown, activity }: { breakdown: unknown; activity: unknown 
                     {kind} · {kindLabel(kind)}
                   </td>
                   <td class="num">{num(total(c))}</td>
+                  <td class="num">{grand > 0 ? `${((total(c) / grand) * 100).toFixed(1)}%` : "—"}</td>
+                  <td class="num">{change(kind, total(c))}</td>
                   <td class="num">{trustPct(c)}</td>
-                  <td style={{ width: "40%" }}>
+                  <td style={{ width: "28%" }}>
                     <Meter value={total(c)} max={peak} />
                   </td>
                 </tr>
@@ -268,18 +386,19 @@ function Kinds({ breakdown, activity }: { breakdown: unknown; activity: unknown 
 // --- clients ---------------------------------------------------------------
 
 function Clients({ raw }: { raw: unknown }) {
-  const entries = Object.entries(asRecord<ClientStats>(raw))
-    .filter(([, s]) => s && typeof s.sum === "number")
-    .sort((a, b) => b[1].sum - a[1].sum);
+  const all = Object.entries(asRecord<ClientStats>(raw)).filter(([, s]) => s && typeof s.sum === "number");
+  const untagged = all.find(([name]) => name === "N/A")?.[1].sum ?? 0;
+  const entries = all.filter(([name]) => name !== "N/A").sort((a, b) => b[1].sum - a[1].sum);
   const grand = entries.reduce((n, [, s]) => n + s.sum, 0);
   const top = entries.slice(0, 14);
+  const taggedPct = grand + untagged > 0 ? ((grand / (grand + untagged)) * 100).toFixed(1) : "0";
 
   return (
     <Panel
       id="clients"
       label="Clients"
       aside={entries.length ? `${num(entries.length)} seen` : undefined}
-      note="Taken from the client tag, which is self-reported and optional — events without one are counted as N/A rather than guessed at."
+      note={`From the client tag, which is self-reported and optional. Only ${taggedPct}% of events carry one, so shares are of tagged events only.`}
     >
       {top.length === 0 ? (
         <p class="empty">No client tags yet.</p>
@@ -382,7 +501,7 @@ function Rank({ raw }: { raw: unknown }) {
       id="rank"
       label="Rank"
       aside={rows.length ? `top ${rows.length}` : undefined}
-      note="PageRank over the follow graph, recomputed on a schedule rather than per event. This is the signal that decides whose events count as trusted everywhere else on this page."
+      note="PageRank over the follow graph, recomputed daily. Trust everywhere else on this page comes from follower counts; this list is who the graph says carries the most weight."
     >
       {rows.length === 0 ? (
         <p class="empty">No ranks computed yet.</p>
@@ -448,11 +567,9 @@ export function Reports({ reports }: { reports: ReportsState }) {
   return (
     <section id="reports" class="stack" style={{ gap: "40px" }}>
       {has("activity") ? <Activity raw={data.activity} /> : null}
-      {has("active_users") ? <ActiveUsers raw={data.active_users} /> : null}
+      {has("active_users") ? <ActiveUsers raw={data.active_users} fresh={data.new_users} /> : null}
       {has("trending_hashtags") ? <Trending raw={data.trending_hashtags} /> : null}
-      {has("kind_breakdown") || has("activity") ? (
-        <Kinds breakdown={data.kind_breakdown} activity={data.activity} />
-      ) : null}
+      {has("activity") ? <Kinds activity={data.activity} /> : null}
       {has("client_tags") ? <Clients raw={data.client_tags} /> : null}
       {has("pagerank") ? <Rank raw={data.pagerank} /> : null}
     </section>

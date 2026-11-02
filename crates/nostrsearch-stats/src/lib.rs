@@ -54,6 +54,7 @@ pub struct AttachCtx {
     /// The on-disk follow graph, shared by every analysis that needs it so
     /// there is exactly one copy.
     pub graph: crate::graph::SharedGraph,
+    pub dir: std::path::PathBuf,
 }
 use nostrsearch_core::event::NostrEvent;
 use serde::Serialize;

@@ -227,6 +227,7 @@ mod tests {
         let mut g = FollowGraph::default();
         g.attach(&AttachCtx {
             graph: store.clone(),
+            dir: dir.clone(),
         })
         .unwrap();
 

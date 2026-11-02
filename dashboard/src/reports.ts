@@ -160,6 +160,13 @@ export interface TrendingTag {
   tag: string;
   score: number;
   mentions: number;
+  authors_24h?: number;
+}
+
+/** `new_users`: bucket start → pubkeys seen for the first time. */
+export interface NewUsersReport {
+  daily: Record<string, number>;
+  monthly: Record<string, number>;
 }
 
 /** `active_users`: bucket start → unique publishers, from HLL sketches. */
@@ -171,6 +178,7 @@ export interface ActiveUsersBucket {
 export interface ActiveUsersReport {
   daily: Record<string, ActiveUsersBucket>;
   weekly: Record<string, ActiveUsersBucket>;
+  monthly?: Record<string, ActiveUsersBucket>;
 }
 
 export const asRecord = <T>(v: unknown): Record<string, T> =>

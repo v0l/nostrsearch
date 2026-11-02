@@ -24,6 +24,7 @@ use std::str::FromStr;
 
 const DAY: u64 = 60 * 60 * 24;
 const ZAP_RECEIPT: u16 = 9735;
+const MAX_ZAP_MSATS: u64 = 21_000_000 * 100_000_000 * 1000;
 
 /// One UTC day bucket.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -156,6 +157,10 @@ impl Analysis for Activity {
         "activity"
     }
 
+    fn epoch(&self) -> u32 {
+        1
+    }
+
     fn deps(&self) -> &'static [&'static str] {
         &["follow_graph"]
     }
@@ -177,7 +182,8 @@ impl Analysis for Activity {
                 .tag_values("bolt11")
                 .next()
                 .and_then(parse_invoice_msats)
-                .or_else(|| req.as_ref().and_then(request_msats));
+                .or_else(|| req.as_ref().and_then(request_msats))
+                .filter(|m| *m <= MAX_ZAP_MSATS);
 
             if let Some(msats) = msats {
                 let sats = msats / 1000;
@@ -271,6 +277,25 @@ mod tests {
         assert_eq!(parse_invoice_msats("lnbc2500u1pvjluezpp5qqqsyq"), None);
         assert_eq!(parse_invoice_msats("not-an-invoice"), None);
         assert_eq!(parse_invoice_msats(""), None);
+    }
+
+    #[test]
+    fn a_receipt_claiming_more_than_all_bitcoin_is_not_counted() {
+        let world = crate::World::new();
+        let ctx = AnalysisCtx::new(
+            1_700_000_100,
+            Pubkey::from_hex(&"b".repeat(64)).unwrap(),
+            Pubkey::ZERO,
+            &world,
+        );
+        let mut a = Activity::default();
+        let huge = r#"{"kind":9734,"tags":[["amount","18000000000000000000"]]}"#;
+        a.observe(&ev(9735, 1_700_000_000, vec![vec!["description", huge]]), &ctx);
+        let day = 1_700_000_000 - (1_700_000_000 % DAY);
+        let d = &a.snapshot()[&day];
+        assert_eq!(d.zaps_sats(), 0);
+        assert_eq!(d.zap_count, 0);
+        assert_eq!(d.kinds[&9735].total(), 1, "the receipt is still an event");
     }
 
     #[test]

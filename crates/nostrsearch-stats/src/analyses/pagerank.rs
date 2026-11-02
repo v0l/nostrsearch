@@ -25,10 +25,11 @@ use std::time::Duration;
 /// Node cap for the in-RAM power iteration (~64 bytes per node for the index
 /// alone, before adjacency). 5M nodes is roughly 1GB of index.
 fn default_max_nodes() -> usize {
-    5_000_000
+    20_000_000
 }
 const DAMPING: f32 = 0.85;
 const ITERATIONS: usize = 20;
+const KEEP_RANKS: usize = 1_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pagerank {
@@ -75,21 +76,6 @@ impl Pagerank {
     pub fn with_interval(mut self, d: Duration) -> Self {
         self.interval_secs = d.as_secs().max(1);
         self
-    }
-
-    /// Coarse WoT tier from a pagerank score (relative to the graph's max).
-    fn tier(score: f32, max: f32) -> u8 {
-        if max <= 0.0 {
-            return 0;
-        }
-        let r = score / max;
-        match r {
-            x if x >= 0.5 => 4,
-            x if x >= 0.2 => 3,
-            x if x >= 0.05 => 2,
-            x if x >= 0.01 => 1,
-            _ => 0,
-        }
     }
 }
 
@@ -166,91 +152,93 @@ impl Analysis for Pagerank {
             return;
         };
 
-        // Pass 1: dense node index over everyone who appears.
-        //
-        // NOTE: this pass and the next materialize the whole graph in RAM
-        // (~64 bytes per pubkey for the index, plus 24 bytes per node and 8
-        // per edge for the adjacency). That is fine for a modest graph and
-        // fatal for a corpus-scale one, so the node count is capped and the
-        // refresh is skipped rather than allowed to OOM the process. A
-        // scalable version needs interned ids and an on-disk CSR.
-        let mut idx: HashMap<Pubkey, usize> = HashMap::new();
+        let mut keys: Vec<Pubkey> = Vec::new();
+        let mut edges = 0usize;
+        let mut compact_at = 1_000_000usize;
         store.for_each(|author, f| {
-            idx.entry(author).or_insert(0);
-            for p in &f.follows {
-                idx.entry(*p).or_insert(0);
+            keys.push(author);
+            keys.extend_from_slice(&f.follows);
+            edges += f.follows.len();
+            if keys.len() > compact_at {
+                keys.sort_unstable();
+                keys.dedup();
+                compact_at = keys.len() * 2 + 1_000_000;
             }
         });
+        keys.sort_unstable();
+        keys.dedup();
+        keys.shrink_to_fit();
 
-        if idx.len() > self.max_nodes {
+        if keys.len() > self.max_nodes {
             let why = format!(
                 "graph has {} nodes, over the {} cap; ranks not recomputed",
-                idx.len(),
+                keys.len(),
                 self.max_nodes
             );
-            tracing::error!(
-                "pagerank refresh skipped: {why} (raise PAGERANK_MAX_NODES, or leave \
-                 pagerank disabled — follow_graph still provides WoT tiers)"
-            );
+            tracing::error!("pagerank refresh skipped: {why}");
             self.unhealthy = Some(why);
             return;
         }
-        let n = idx.len();
+        let n = keys.len();
         if n == 0 {
-            // Do NOT clear. An empty graph is a statement about the graph, not
-            // about authority in the network, and clearing here meant a single
-            // failed attach or an unbuilt graph silently replaced real ranks
-            // with zeroes that every downstream consumer read as fact.
             let why = "graph is empty; ranks left as they were";
             tracing::error!("pagerank refresh produced nothing: {why}");
             self.unhealthy = Some(why.into());
             return;
         }
-        for (i, v) in idx.values_mut().enumerate() {
-            *v = i;
-        }
-        // Pass 2: out-adjacency by index.
-        let mut out: Vec<Vec<usize>> = vec![Vec::new(); n];
+        let index_of = |pk: &Pubkey| keys.binary_search(pk).ok().map(|i| i as u32);
+
+        let mut start = vec![0u64; n];
+        let mut deg = vec![0u32; n];
+        let mut dst: Vec<u32> = Vec::with_capacity(edges);
         store.for_each(|author, f| {
-            let ai = idx[&author];
-            for p in &f.follows {
-                out[ai].push(idx[p]);
-            }
+            let Some(a) = index_of(&author) else { return };
+            start[a as usize] = dst.len() as u64;
+            dst.extend(f.follows.iter().filter_map(index_of));
+            deg[a as usize] = (dst.len() as u64 - start[a as usize]) as u32;
         });
 
         let base = (1.0 - DAMPING) / n as f32;
         let mut rank = vec![1.0f32 / n as f32; n];
+        let mut next = vec![0f32; n];
         for _ in 0..ITERATIONS {
-            let mut next = vec![base; n];
+            next.fill(base);
             let mut dangling = 0.0f32;
-            for i in 0..n {
-                if out[i].is_empty() {
-                    dangling += rank[i];
+            for a in 0..n {
+                let d = deg[a];
+                if d == 0 {
+                    dangling += rank[a];
                     continue;
                 }
-                let share = DAMPING * rank[i] / out[i].len() as f32;
-                for &j in &out[i] {
-                    next[j] += share;
+                let share = DAMPING * rank[a] / d as f32;
+                let s = start[a] as usize;
+                for &b in &dst[s..s + d as usize] {
+                    next[b as usize] += share;
                 }
             }
-            // redistribute dangling mass uniformly
             let dangle = DAMPING * dangling / n as f32;
             for v in next.iter_mut() {
                 *v += dangle;
             }
-            rank = next;
+            std::mem::swap(&mut rank, &mut next);
         }
+        drop((start, deg, dst, next));
 
-        self.ranks = idx.into_iter().map(|(pk, i)| (pk, rank[i])).collect();
+        let mut ranked: Vec<(Pubkey, f32)> = keys.into_iter().zip(rank).collect();
+        if ranked.len() > KEEP_RANKS {
+            ranked.select_nth_unstable_by(KEEP_RANKS, |a, b| {
+                b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            ranked.truncate(KEEP_RANKS);
+        }
+        self.ranks = ranked.into_iter().collect();
         // Derived from a real graph: this output stands on its own.
         self.unhealthy = None;
     }
 
     fn contribute(&self, world: &mut World) {
-        let max = self.ranks.values().copied().fold(0.0f32, f32::max);
         for (pk, &score) in &self.ranks {
             world.set_pagerank(*pk, score);
-            world.set_wot_tier(*pk, Self::tier(score, max));
         }
     }
 
@@ -335,7 +323,11 @@ mod tests {
 
         let mut p = Pagerank::default();
         assert!(Analysis::health(&p).is_some(), "starts unrefreshed");
-        p.attach(&AttachCtx { graph: store }).unwrap();
+        p.attach(&AttachCtx {
+            graph: store,
+            dir: dir.clone(),
+        })
+        .unwrap();
         Analysis::refresh(&mut p);
 
         assert!(!p.ranks.is_empty(), "a real graph must produce ranks");
@@ -372,6 +364,7 @@ mod tests {
         let mut pr = Pagerank::default();
         pr.attach(&AttachCtx {
             graph: store.clone(),
+            dir: dir.clone(),
         })
         .unwrap();
         pr.refresh();
@@ -382,7 +375,11 @@ mod tests {
             world.pagerank(&pk(9)) > world.pagerank(&pk(1)),
             "the hub everyone follows should rank highest"
         );
-        assert!(world.wot_tier(&pk(9)) >= world.wot_tier(&pk(1)));
+        assert_eq!(
+            world.wot_tier(&pk(9)),
+            0,
+            "trust tiers come from follower counts; pagerank must not overwrite them"
+        );
 
         drop(pr);
         drop(store);

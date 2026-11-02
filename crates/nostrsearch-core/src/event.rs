@@ -63,6 +63,10 @@ impl NostrEvent {
         (20_000..30_000).contains(&self.kind)
     }
 
+    pub fn uses_throwaway_key(&self) -> bool {
+        matches!(self.kind, 445 | 1059 | 24133) || self.is_ephemeral()
+    }
+
     /// Whether this is a deletion request (kind 5).
     pub fn is_deletion(&self) -> bool {
         self.kind == 5
@@ -159,6 +163,12 @@ mod tests {
         assert!(ev(30_023, vec![]).is_addressable());
         assert!(ev(20_000, vec![]).is_ephemeral());
         assert!(ev(5, vec![]).is_deletion());
+        for k in [445, 1059, 24133, 20_000, 29_999] {
+            assert!(ev(k, vec![]).uses_throwaway_key(), "kind {k} is signed by a one-off key");
+        }
+        for k in [0, 1, 3, 4, 7, 1111, 9735, 10002, 30023] {
+            assert!(!ev(k, vec![]).uses_throwaway_key(), "kind {k} is signed by its author");
+        }
         assert!(ev(1, vec![]).is_text_kind());
         assert!(!ev(4, vec![]).is_text_kind());
     }
