@@ -967,6 +967,7 @@ pub struct ScrapeConfig {
     ///
     /// Set equal to `usage_percentile` to disable widening and pin the cut.
     pub usage_percentile_min: u32,
+    pub pinned_relays: Vec<String>,
 }
 
 impl Default for ScrapeConfig {
@@ -982,6 +983,7 @@ impl Default for ScrapeConfig {
             nip11_recheck_secs: 7 * 24 * 3600,
             usage_percentile: 80,
             usage_percentile_min: 2,
+            pinned_relays: Vec::new(),
         }
     }
 }
@@ -1041,7 +1043,7 @@ pub async fn run_pass<S: Sink>(
     );
 
     let scraped_relays =
-        top_by_usage_weight(state.relays(), percentile, cfg.concurrency).len();
+        scrape_targets(state.relays(), percentile, cfg.concurrency, &cfg.pinned_relays).len();
     tracing::info!(
         relays = scraped_relays,
         discovered = all_relays,
@@ -1129,7 +1131,8 @@ pub async fn run_pass<S: Sink>(
             let blocks = blocks.clone();
             let mut prng = <rand::rngs::StdRng as rand::SeedableRng>::from_entropy();
             tokio::task::spawn_blocking(move || {
-                let targets = top_by_usage_weight(state.relays(), percentile, cfg.concurrency);
+                let targets =
+                    scrape_targets(state.relays(), percentile, cfg.concurrency, &cfg.pinned_relays);
                 plan_batch(
                     &targets, &state, &cfg, batch_size, &mut prng, &blocks, &in_flight,
                 )
@@ -1158,7 +1161,8 @@ pub async fn run_pass<S: Sink>(
             let blocks = blocks.clone();
             let mut prng = <rand::rngs::StdRng as rand::SeedableRng>::from_entropy();
             batch = tokio::task::spawn_blocking(move || {
-                let targets = top_by_usage_weight(state.relays(), percentile, cfg.concurrency);
+                let targets =
+                    scrape_targets(state.relays(), percentile, cfg.concurrency, &cfg.pinned_relays);
                 plan_batch(
                     &targets, &state, &cfg, batch_size, &mut prng, &blocks, &in_flight,
                 )
@@ -1394,6 +1398,25 @@ pub fn top_by_usage_weight(
     }
     targets.truncate(keep.max(min_keep.max(1)));
     targets
+}
+
+pub fn scrape_targets(
+    all: Vec<(String, RelayInfo)>,
+    percentile: u32,
+    min_keep: usize,
+    pins: &[String],
+) -> Vec<(String, RelayInfo)> {
+    let norm = |u: &str| u.trim_end_matches('/').to_ascii_lowercase();
+    let pins: HashSet<String> = pins.iter().map(|p| norm(p)).collect();
+    let pinned: Vec<(String, RelayInfo)> = all
+        .iter()
+        .filter(|(u, i)| pins.contains(&norm(u)) && i.nip11 != Some(false))
+        .cloned()
+        .collect();
+    let mut kept = top_by_usage_weight(all, percentile, min_keep);
+    let have: HashSet<String> = kept.iter().map(|(u, _)| norm(u)).collect();
+    kept.extend(pinned.into_iter().filter(|(u, _)| !have.contains(&norm(u))));
+    kept
 }
 
 /// Widen the usage cut as the backlog drains.
@@ -2691,6 +2714,26 @@ mod scrape_concurrency_tests {
             80,
             "every relay that answers is fully scraped, so the cut must widen"
         );
+    }
+
+    #[test]
+    fn pinned_relays_are_scraped_even_when_nobody_advertises_them() {
+        let mk = |url: &str, n: u32| {
+            let mut i = super::RelayInfo::default();
+            i.sources = n;
+            (url.to_string(), i)
+        };
+        let all = vec![
+            mk("wss://big.example", 10_000),
+            mk("wss://njump.me", 3),
+            mk("wss://staging.yabu.me", 0),
+        ];
+        let pins = vec!["wss://njump.me".to_string(), "wss://staging.yabu.me/".to_string()];
+        let kept = super::scrape_targets(all, 2, 1, &pins);
+        let urls: Vec<&str> = kept.iter().map(|(u, _)| u.as_str()).collect();
+        assert!(urls.contains(&"wss://big.example"));
+        assert!(urls.contains(&"wss://njump.me"), "{urls:?}");
+        assert!(urls.contains(&"wss://staging.yabu.me"), "{urls:?}");
     }
 
     /// The cut covers a share of usage, not a share of the relay list.

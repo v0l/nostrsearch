@@ -132,6 +132,7 @@ pub struct ScraperOptions {
     pub usage_percentile: u32,
     /// Where the cut starts while the backlog is large.
     pub usage_percentile_min: u32,
+    pub pinned_relays: Vec<String>,
     /// Idle time between passes.
     ///
     /// A pass ends when no relay in scope has an unscraped day anywhere in the
@@ -177,6 +178,7 @@ impl ScraperOptions {
             nip11_recheck_secs: u("SCRAPE_NIP11_RECHECK_HOURS", 168) * 3600,
             usage_percentile: u("SCRAPE_USAGE_PERCENTILE", 80) as u32,
             usage_percentile_min: u("SCRAPE_USAGE_PERCENTILE_MIN", 2) as u32,
+            pinned_relays: env::list("SCRAPE_PIN_RELAYS"),
             pass_interval: std::time::Duration::from_secs(u("SCRAPE_PASS_INTERVAL_SECS", 120)),
             rediscover_interval: std::time::Duration::from_secs(u(
                 "SCRAPE_REDISCOVER_SECS",
@@ -281,6 +283,13 @@ pub fn spawn_scraper(
                 }
             }
 
+            for url in &opts.pinned_relays {
+                let url = url.trim_end_matches('/');
+                if !state.relays().iter().any(|(u, _)| u.trim_end_matches('/') == url) {
+                    state.put_relay(url, &RelayInfo::default());
+                }
+            }
+
             if !state.relays().is_empty() {
                 let cfg = ScrapeConfig {
                     min_date: opts.min_date,
@@ -300,6 +309,7 @@ pub fn spawn_scraper(
                     // the weight is not.
                     usage_percentile: opts.usage_percentile,
                     usage_percentile_min: opts.usage_percentile_min,
+                    pinned_relays: opts.pinned_relays.clone(),
                 };
                 nostrsearch_indexer::scrape::run_pass(state.clone(), node_sink.clone(), cfg).await;
                 tracing::info!(

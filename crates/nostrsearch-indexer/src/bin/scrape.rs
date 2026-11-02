@@ -334,6 +334,7 @@ async fn run(args: Args, state: Arc<ScrapeState>, sink: Arc<PipelineSink>) -> an
         nip11_recheck_secs: 7 * 24 * 3600,
         usage_percentile: args.usage_percentile,
         usage_percentile_min: args.usage_percentile_min,
+        pinned_relays: Vec::new(),
         ..Default::default()
     };
     nostrsearch_indexer::scrape::run_pass(state, sink.clone(), cfg).await;
