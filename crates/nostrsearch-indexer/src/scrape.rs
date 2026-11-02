@@ -1032,11 +1032,7 @@ pub async fn run_pass<S: Sink>(
     // since-excluded junk URLs from before NIP-11 filtering -- which
     // inflated `done` past `expected` and snapped the cut straight to the
     // ceiling on a node that had barely started on the relays that matter.
-    let done_in_scope: u64 = kept_at_min
-        .iter()
-        .map(|(u, _)| progress.by_relay.get(u).map(|t| t.days).unwrap_or(0))
-        .sum();
-    let expected = (kept_at_min.len() as u64).saturating_mul(total_days.max(1));
+    let (done_in_scope, expected) = scope_coverage(&kept_at_min, &progress, total_days);
     let percentile = adaptive_percentile(
         done_in_scope,
         expected,
@@ -1421,6 +1417,21 @@ pub fn adaptive_percentile(done: u64, expected: u64, min: u32, max: u32) -> u32 
     }
     let frac = (done as f64 / expected as f64).clamp(0.0, 1.0);
     min + (f64::from(max - min) * frac).round() as u32
+}
+
+pub fn scope_coverage(
+    kept: &[(String, RelayInfo)],
+    progress: &ScrapeProgress,
+    total_days: u64,
+) -> (u64, u64) {
+    let answering: Vec<&(String, RelayInfo)> =
+        kept.iter().filter(|(_, i)| i.last_ok > 0).collect();
+    let done = answering
+        .iter()
+        .map(|(u, _)| progress.by_relay.get(u).map(|t| t.days).unwrap_or(0))
+        .sum();
+    let expected = (answering.len() as u64).saturating_mul(total_days.max(1));
+    (done, expected)
 }
 
 /// Seconds a relay must wait after its `n`th consecutive failure before it
@@ -2543,6 +2554,34 @@ mod scrape_concurrency_tests {
         // Degenerate inputs.
         assert_eq!(super::adaptive_percentile(0, 0, 2, 80), 2, "unknown workload starts narrow");
         assert_eq!(super::adaptive_percentile(0, 100, 80, 80), 80, "equal bounds pins the cut");
+    }
+
+    #[test]
+    fn relays_that_never_answer_do_not_pin_the_cut() {
+        let total_days = 1766u64;
+        let mut kept = Vec::new();
+        let mut progress = super::ScrapeProgress::default();
+        for n in 0..37 {
+            let url = format!("wss://ok{n}.example");
+            let mut i = super::RelayInfo::default();
+            i.last_ok = 1_793_577_684;
+            progress.by_relay.insert(
+                url.clone(),
+                super::RelayTotals { days: total_days, ..Default::default() },
+            );
+            kept.push((url, i));
+        }
+        for n in 0..13 {
+            let mut i = super::RelayInfo::default();
+            i.fails = 5;
+            kept.push((format!("wss://gone{n}.example"), i));
+        }
+        let (done, expected) = super::scope_coverage(&kept, &progress, total_days);
+        assert_eq!(
+            super::adaptive_percentile(done, expected, 2, 80),
+            80,
+            "every relay that answers is fully scraped, so the cut must widen"
+        );
     }
 
     /// The cut covers a share of usage, not a share of the relay list.
