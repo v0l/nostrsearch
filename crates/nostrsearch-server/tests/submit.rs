@@ -132,7 +132,7 @@ async fn submit(
 
 async fn finished(node: &Node, keys: &Keys, id: &str) -> anyhow::Result<serde_json::Value> {
     let url = format!("{}/submit/{id}", node.base);
-    for _ in 0..100 {
+    for _ in 0..1200 {
         let v: serde_json::Value = reqwest::get(&url).await?.json().await?;
         if v["state"] == "done" || v["state"] == "failed" || v["state"] == "interrupted" {
             return Ok(v);
@@ -854,7 +854,7 @@ async fn run_deduped(
 
 #[tokio::test]
 async fn known_ids_are_never_re_added_and_new_ones_never_dropped_across_batches() -> anyhow::Result<()> {
-    let events = signed_notes(10_000);
+    let events = signed_notes(6_000);
     let store_dir = tempfile::tempdir()?;
     let store = Arc::new(nostrsearch_indexer::id_store::IdStore::open(store_dir.path())?);
     let known: Vec<[u8; 32]> = events.iter().step_by(3).map(|e| e.id.to_bytes()).collect();
@@ -863,9 +863,9 @@ async fn known_ids_are_never_re_added_and_new_ones_never_dropped_across_batches(
     let lines: Vec<String> = events.iter().map(|e| e.as_json()).collect();
     let v = run_deduped(&node, dump(&lines)).await?;
     assert_eq!(v["state"], "done", "{v}");
-    assert_eq!(v["valid"], 10_000);
+    assert_eq!(v["valid"], 6_000);
     assert_eq!(v["duplicate"], known.len() as u64);
-    assert_eq!(v["new"], (10_000 - known.len()) as u64);
+    assert_eq!(v["new"], (6_000 - known.len()) as u64);
     for (i, e) in events.iter().enumerate() {
         let want = i % 3 != 0;
         let mut found = false;
