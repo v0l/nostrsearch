@@ -41,6 +41,15 @@ async fn serve_with(
     free_space: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
     admins: HashSet<PublicKey>,
 ) -> anyhow::Result<Node> {
+    serve_deduped(min_free, free_space, admins, None).await
+}
+
+async fn serve_deduped(
+    min_free: u64,
+    free_space: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
+    admins: HashSet<PublicKey>,
+    dedupe: Option<Arc<nostrsearch_indexer::id_store::IdStore>>,
+) -> anyhow::Result<Node> {
     let root = tempfile::tempdir()?;
     let archive_dir = root.path().join("archive");
     std::fs::create_dir_all(&archive_dir)?;
@@ -71,7 +80,7 @@ async fn serve_with(
         origin: None,
         admins,
     };
-    let submit = SubmitState::new(cfg, (*db).clone(), sink, None);
+    let submit = SubmitState::new(cfg, (*db).clone(), sink, dedupe);
     let app = nostrsearch_server::http::router_full(state, Some(archive), None)
         .merge(nostrsearch_server::submit::router(submit));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -785,5 +794,124 @@ async fn mdb_that_cannot_fit_on_disk_is_refused_but_jsonl_of_that_size_is_not() 
     assert!(body.len() > 49_000);
     let r = submit(&node, &keys, "big.jsonl", body).await?;
     assert_eq!(r.status(), 202);
+    Ok(())
+}
+
+
+fn signed_notes(n: usize) -> Vec<Event> {
+    let keys = Keys::generate();
+    (0..n)
+        .map(|i| {
+            EventBuilder::text_note(format!("bench event number {i} with a little body text"))
+                .custom_created_at(Timestamp::from_secs(1_700_000_000 + i as u64))
+                .sign_with_keys(&keys)
+                .unwrap()
+        })
+        .collect()
+}
+
+#[tokio::test]
+#[ignore]
+async fn bench_stage_costs() -> anyhow::Result<()> {
+    let n: usize = std::env::var("BENCH_EVENTS").ok().and_then(|v| v.parse().ok()).unwrap_or(40_000);
+    let events = signed_notes(n);
+    let store_dir = tempfile::tempdir()?;
+    let store = Arc::new(nostrsearch_indexer::id_store::IdStore::open(store_dir.path())?);
+    let known: Vec<[u8; 32]> = events.iter().step_by(2).map(|e| e.id.to_bytes()).collect();
+    store.flush(known.iter())?;
+    let node = serve_deduped(0, None, HashSet::new(), Some(store)).await?;
+    let keys = Keys::generate();
+    let lines: Vec<String> = events.iter().map(|e| e.as_json()).collect();
+    let started = std::time::Instant::now();
+    let r = submit(&node, &keys, "bench.jsonl", dump(&lines)).await?;
+    let id = r.json::<serde_json::Value>().await?["id"].as_str().unwrap().to_string();
+    let url = format!("{}/submit/{id}", node.base);
+    let v = loop {
+        let v: serde_json::Value = reqwest::get(&url).await?.json().await?;
+        if v["state"] == "done" || v["state"] == "failed" {
+            break v;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    let secs = started.elapsed().as_secs_f64();
+    println!("events {n} in {secs:.2}s = {:.0}/s", n as f64 / secs);
+    println!("{}", serde_json::to_string_pretty(&v)?);
+    assert_eq!(v["new"], (n / 2) as u64);
+    assert_eq!(v["duplicate"], (n / 2) as u64);
+    Ok(())
+}
+
+
+async fn run_deduped(
+    node: &Node,
+    body: Vec<u8>,
+) -> anyhow::Result<serde_json::Value> {
+    let keys = Keys::generate();
+    let r = submit(node, &keys, "batch.jsonl", body).await?;
+    let id = r.json::<serde_json::Value>().await?["id"].as_str().unwrap().to_string();
+    finished(node, &keys, &id).await
+}
+
+#[tokio::test]
+async fn known_ids_are_never_re_added_and_new_ones_never_dropped_across_batches() -> anyhow::Result<()> {
+    let events = signed_notes(10_000);
+    let store_dir = tempfile::tempdir()?;
+    let store = Arc::new(nostrsearch_indexer::id_store::IdStore::open(store_dir.path())?);
+    let known: Vec<[u8; 32]> = events.iter().step_by(3).map(|e| e.id.to_bytes()).collect();
+    store.flush(known.iter())?;
+    let node = serve_deduped(0, None, HashSet::new(), Some(store.clone())).await?;
+    let lines: Vec<String> = events.iter().map(|e| e.as_json()).collect();
+    let v = run_deduped(&node, dump(&lines)).await?;
+    assert_eq!(v["state"], "done", "{v}");
+    assert_eq!(v["valid"], 10_000);
+    assert_eq!(v["duplicate"], known.len() as u64);
+    assert_eq!(v["new"], (10_000 - known.len()) as u64);
+    for (i, e) in events.iter().enumerate() {
+        let want = i % 3 != 0;
+        let mut found = false;
+        for _ in 0..40 {
+            let r = reqwest::get(format!("{}/event/{}", node.base, e.id.to_hex())).await?;
+            found = r.status() == 200;
+            if found || !want {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        if i % 997 == 0 || i % 3 == 0 && i < 30 {
+            assert_eq!(found, want, "event {i}");
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn an_event_repeated_across_a_batch_boundary_is_added_once() -> anyhow::Result<()> {
+    let events = signed_notes(3);
+    let node = serve_deduped(0, None, HashSet::new(), None).await?;
+    let mut lines = Vec::new();
+    for i in 0..9_000 {
+        lines.push(events[i % 3].as_json());
+    }
+    let v = run_deduped(&node, dump(&lines)).await?;
+    assert_eq!(v["state"], "done", "{v}");
+    assert_eq!(v["valid"], 9_000);
+    assert_eq!(v["new"], 3);
+    assert_eq!(v["duplicate"], 8_997);
+    Ok(())
+}
+
+#[tokio::test]
+async fn dedupe_is_asked_in_batches_not_one_id_at_a_time() -> anyhow::Result<()> {
+    let events = signed_notes(5_000);
+    let store_dir = tempfile::tempdir()?;
+    let store = Arc::new(nostrsearch_indexer::id_store::IdStore::open(store_dir.path())?);
+    let node = serve_deduped(0, None, HashSet::new(), Some(store.clone())).await?;
+    let lines: Vec<String> = events.iter().map(|e| e.as_json()).collect();
+    let v = run_deduped(&node, dump(&lines)).await?;
+    assert_eq!(v["new"], 5_000);
+    let lookups = store.lookups();
+    assert_eq!(lookups.single, 0, "per-event reads are the cost being removed");
+    assert_eq!(lookups.batched_ids, 5_000);
+    assert!(lookups.batches >= 1 && lookups.batches <= 5, "{lookups:?}");
     Ok(())
 }

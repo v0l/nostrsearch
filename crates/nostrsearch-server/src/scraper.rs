@@ -33,15 +33,6 @@ struct NodeSink {
     new: AtomicU64,
 }
 
-impl NodeSink {
-    fn in_dedupe(&self, id: &[u8; 32]) -> bool {
-        self.dedupe
-            .as_ref()
-            .map(|s| s.contains(id))
-            .unwrap_or(false)
-    }
-}
-
 impl Sink for NodeSink {
     async fn local_items(&self, since: u64, until: u64) -> Vec<(EventId, Timestamp)> {
         // The archive's time index knows exactly which events we hold for the
@@ -82,10 +73,17 @@ impl Sink for NodeSink {
     async fn process(&self, events: Vec<Event>) -> u64 {
         self.seen.fetch_add(events.len() as u64, Ordering::Relaxed);
         let mut new = 0u64;
-        for ev in events {
-            // Dump-ingested events are already in the index (but not the
-            // archive); archiving them again would double-index.
-            if self.in_dedupe(&ev.id.to_bytes()) {
+        let indexed = match self.dedupe.clone() {
+            Some(store) => {
+                let ids: Vec<[u8; 32]> = events.iter().map(|e| e.id.to_bytes()).collect();
+                tokio::task::spawn_blocking(move || store.contains_batch(&ids))
+                    .await
+                    .unwrap_or_default()
+            }
+            None => Vec::new(),
+        };
+        for (i, ev) in events.into_iter().enumerate() {
+            if indexed.get(i).copied().unwrap_or(false) {
                 continue;
             }
             match self.db.save_event(&ev).await {

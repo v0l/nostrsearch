@@ -24,6 +24,10 @@ use tokio::sync::mpsc;
 const MAX_LINE_BYTES: u64 = 1 << 20;
 const FUTURE_SLACK_SECS: u64 = 86_400;
 const CHANNEL_CHUNKS: usize = 8;
+const BATCH_LINES: usize = 4096;
+const BATCH_BYTES: usize = 32 << 20;
+const VERIFY_THREADS: usize = 8;
+const SAVE_THREADS: usize = 32;
 const FLOOR_CHECK_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
 const STREAMED_FORMATS: [&str; 4] = [".jsonl", ".jsonl.zst", ".jsonl.gz", ".jsonl.bz2"];
 const DISK_FORMATS: [&str; 3] = [".mdb", ".mdb.zst", ".mdb.gz"];
@@ -92,6 +96,18 @@ struct Counts {
     duplicate: AtomicU64,
     new: AtomicU64,
     bytes: AtomicU64,
+    parse_ns: AtomicU64,
+    verify_ns: AtomicU64,
+    dedupe_ns: AtomicU64,
+    save_ns: AtomicU64,
+    sink_ns: AtomicU64,
+}
+
+fn timed<T>(slot: &AtomicU64, f: impl FnOnce() -> T) -> T {
+    let t = std::time::Instant::now();
+    let out = f();
+    slot.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    out
 }
 
 #[derive(Clone, Copy, Serialize, PartialEq, Eq, Debug)]
@@ -134,6 +150,16 @@ pub struct JobView {
     future: u64,
     duplicate: u64,
     new: u64,
+    stage_ms: StageMs,
+}
+
+#[derive(Serialize)]
+struct StageMs {
+    parse: u64,
+    verify: u64,
+    dedupe: u64,
+    save: u64,
+    sink: u64,
 }
 
 impl Job {
@@ -168,6 +194,13 @@ impl Job {
             future: g(&c.future),
             duplicate: g(&c.duplicate),
             new: g(&c.new),
+            stage_ms: StageMs {
+                parse: g(&c.parse_ns) / 1_000_000,
+                verify: g(&c.verify_ns) / 1_000_000,
+                dedupe: g(&c.dedupe_ns) / 1_000_000,
+                save: g(&c.save_ns) / 1_000_000,
+                sink: g(&c.sink_ns) / 1_000_000,
+            },
         }
     }
 }
@@ -326,12 +359,27 @@ struct ChannelReader {
     rx: mpsc::Receiver<bytes::Bytes>,
     cur: bytes::Bytes,
     job: Arc<Job>,
+    pending: Arc<Mutex<Batch>>,
+    st: SubmitState,
+    rt: tokio::runtime::Handle,
 }
 
 impl Read for ChannelReader {
     fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
         while self.cur.is_empty() {
-            match self.rx.blocking_recv() {
+            let next = match self.rx.try_recv() {
+                Ok(b) => Some(b),
+                Err(mpsc::error::TryRecvError::Disconnected) => None,
+                Err(mpsc::error::TryRecvError::Empty) => {
+                    self.pending
+                        .lock()
+                        .unwrap()
+                        .flush(&self.st, &self.job, &self.rt)
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    self.rx.blocking_recv()
+                }
+            };
+            match next {
                 Some(b) => self.cur = b,
                 None if self.job.complete.load(Ordering::SeqCst) => return Ok(0),
                 None => {
@@ -435,9 +483,17 @@ async fn upload(
         let lower = lower.clone();
         tokio::task::spawn_blocking(move || {
             let _slot = slot;
-            let reader = ChannelReader { rx, cur: bytes::Bytes::new(), job: job2.clone() };
+            let pending = Arc::new(Mutex::new(Batch::default()));
+            let reader = ChannelReader {
+                rx,
+                cur: bytes::Bytes::new(),
+                job: job2.clone(),
+                pending: pending.clone(),
+                st: st2.clone(),
+                rt: handle.clone(),
+            };
             let outcome = decoded(&lower, reader)
-                .and_then(|r| process(&st2, &job2, r, &handle));
+                .and_then(|r| process(&st2, &job2, r, &handle, &pending));
             match outcome {
                 Ok(()) => job2.set(Phase::Done, None),
                 Err(e) => {
@@ -508,6 +564,7 @@ fn process(
     job: &Job,
     source: Box<dyn Read + Send>,
     rt: &tokio::runtime::Handle,
+    pending: &Mutex<Batch>,
 ) -> anyhow::Result<()> {
     let mut reader = BufReader::with_capacity(1 << 20, source);
     if crate::strfry::has_lmdb_magic(reader.fill_buf()?) {
@@ -517,7 +574,14 @@ fn process(
     let mut buf = Vec::new();
     loop {
         buf.clear();
-        let n = (&mut reader).take(MAX_LINE_BYTES + 1).read_until(b'\n', &mut buf)?;
+        let read = (&mut reader).take(MAX_LINE_BYTES + 1).read_until(b'\n', &mut buf);
+        let n = match read {
+            Ok(n) => n,
+            Err(e) => {
+                let _ = pending.lock().unwrap().flush(st, job, rt);
+                return Err(e.into());
+            }
+        };
         if n == 0 {
             break;
         }
@@ -533,9 +597,9 @@ fn process(
             continue;
         }
         c.lines.fetch_add(1, Ordering::Relaxed);
-        ingest_line(st, job, line, rt)?;
+        pending.lock().unwrap().push(st, job, line, rt)?;
     }
-    Ok(())
+    pending.lock().unwrap().flush(st, job, rt)
 }
 
 fn spill_to_disk(
@@ -578,65 +642,175 @@ fn process_lmdb(
     let c = &job.counts;
     let result = (|| {
         let db = crate::strfry::Lmdb::open(&path)?;
+        let mut batch = Batch::default();
         db.for_each_event(MAX_LINE_BYTES as usize, |payload| {
             c.lines.fetch_add(1, Ordering::Relaxed);
             match payload {
-                crate::strfry::Payload::Json(json) => ingest_line(st, job, json.trim_ascii(), rt),
+                crate::strfry::Payload::Json(json) => batch.push(st, job, json.trim_ascii(), rt),
                 crate::strfry::Payload::Undecodable => {
                     c.undecodable.fetch_add(1, Ordering::Relaxed);
                     Ok(())
                 }
             }
-        })
+        })?;
+        batch.flush(st, job, rt)
     })();
     let _ = std::fs::remove_file(&path);
     result
 }
 
-fn ingest_line(
-    st: &SubmitState,
-    job: &Job,
-    line: &[u8],
-    rt: &tokio::runtime::Handle,
-) -> anyhow::Result<()> {
+#[derive(Default)]
+struct Batch {
+    lines: Vec<Vec<u8>>,
+    bytes: usize,
+}
+
+impl Batch {
+    fn push(
+        &mut self,
+        st: &SubmitState,
+        job: &Job,
+        line: &[u8],
+        rt: &tokio::runtime::Handle,
+    ) -> anyhow::Result<()> {
+        self.bytes += line.len();
+        self.lines.push(line.to_vec());
+        if self.lines.len() >= BATCH_LINES || self.bytes >= BATCH_BYTES {
+            self.flush(st, job, rt)?;
+        }
+        Ok(())
+    }
+
+    fn flush(
+        &mut self,
+        st: &SubmitState,
+        job: &Job,
+        rt: &tokio::runtime::Handle,
+    ) -> anyhow::Result<()> {
+        let lines = std::mem::take(&mut self.lines);
+        self.bytes = 0;
+        if lines.is_empty() {
+            return Ok(());
+        }
+        ingest_batch(st, job, &lines, rt)
+    }
+}
+
+fn screen(job: &Job, line: &[u8]) -> Option<Event> {
     let c = &job.counts;
-    let Ok(ev) = serde_json::from_slice::<Event>(line) else {
+    let Ok(ev) = timed(&c.parse_ns, || serde_json::from_slice::<Event>(line)) else {
         c.malformed.fetch_add(1, Ordering::Relaxed);
-        return Ok(());
+        return None;
     };
-    if ev.verify().is_err() {
+    if timed(&c.verify_ns, || ev.verify()).is_err() {
         c.bad_signature.fetch_add(1, Ordering::Relaxed);
-        return Ok(());
+        return None;
     }
     if ev.kind.is_ephemeral() {
         c.ephemeral.fetch_add(1, Ordering::Relaxed);
-        return Ok(());
+        return None;
     }
     if ev.created_at.as_secs() > nip98::unix_now() + FUTURE_SLACK_SECS {
         c.future.fetch_add(1, Ordering::Relaxed);
-        return Ok(());
+        return None;
     }
     c.valid.fetch_add(1, Ordering::Relaxed);
+    Some(ev)
+}
 
-    if st
-        .dedupe
-        .as_ref()
-        .is_some_and(|d| d.contains(&ev.id.to_bytes()))
-    {
-        c.duplicate.fetch_add(1, Ordering::Relaxed);
-        return Ok(());
-    }
-    match rt.block_on(st.db.save_event(&ev)) {
-        Ok(SaveEventStatus::Success) => {
-            rt.block_on(st.sink.send(to_core(&ev)));
-            c.new.fetch_add(1, Ordering::Relaxed);
-        }
-        Ok(_) => {
+fn screen_all(job: &Job, lines: &[Vec<u8>]) -> Vec<Event> {
+    let threads = VERIFY_THREADS.min(lines.len().div_ceil(256)).max(1);
+    let per = lines.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        lines
+            .chunks(per)
+            .map(|part| {
+                scope.spawn(move || part.iter().filter_map(|l| screen(job, l)).collect::<Vec<_>>())
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flat_map(|h| h.join().expect("screen thread"))
+            .collect()
+    })
+}
+
+fn save_all(
+    job: &Job,
+    db: &DefaultJsonFilesDatabase,
+    events: &[Event],
+    rt: &tokio::runtime::Handle,
+) -> Vec<Result<SaveEventStatus, DatabaseError>> {
+    let threads = SAVE_THREADS.min(events.len()).max(1);
+    let per = events.len().div_ceil(threads).max(1);
+    timed(&job.counts.save_ns, || {
+        std::thread::scope(|scope| {
+            events
+                .chunks(per)
+                .map(|part| {
+                    scope.spawn(move || {
+                        part.iter()
+                            .map(|ev| rt.block_on(db.save_event(ev)))
+                            .collect::<Vec<_>>()
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .flat_map(|h| h.join().expect("save thread"))
+                .collect()
+        })
+    })
+}
+
+fn ingest_batch(
+    st: &SubmitState,
+    job: &Job,
+    lines: &[Vec<u8>],
+    rt: &tokio::runtime::Handle,
+) -> anyhow::Result<()> {
+    let c = &job.counts;
+    let screened = screen_all(job, lines);
+
+    let mut in_batch = HashSet::with_capacity(screened.len());
+    let mut unique = Vec::with_capacity(screened.len());
+    for ev in screened {
+        if in_batch.insert(ev.id) {
+            unique.push(ev);
+        } else {
             c.duplicate.fetch_add(1, Ordering::Relaxed);
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "archive save failed during submission");
-            return Err(anyhow::anyhow!("archive save failed: {e}"));
+    }
+
+    let fresh: Vec<Event> = match st.dedupe.as_ref() {
+        Some(d) => {
+            let ids: Vec<[u8; 32]> = unique.iter().map(|e| e.id.to_bytes()).collect();
+            let known = timed(&c.dedupe_ns, || d.contains_batch(&ids));
+            let mut keep = Vec::with_capacity(unique.len());
+            for (ev, known) in unique.into_iter().zip(known) {
+                if known {
+                    c.duplicate.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    keep.push(ev);
+                }
+            }
+            keep
+        }
+        None => unique,
+    };
+
+    let statuses = save_all(job, &st.db, &fresh, rt);
+    for (ev, status) in fresh.iter().zip(statuses) {
+        match status {
+            Ok(SaveEventStatus::Success) => {
+                timed(&c.sink_ns, || rt.block_on(st.sink.send(to_core(ev))));
+                c.new.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(_) => {
+                c.duplicate.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "archive save failed during submission");
+                return Err(anyhow::anyhow!("archive save failed: {e}"));
+            }
         }
     }
     Ok(())
