@@ -20,6 +20,6 @@ pub mod submit;
 
 pub use archive::ArchiveState;
 pub use http::{AppState, SharedState, router};
-pub use node::{EventSink, NodeDb, spawn_firehose, spawn_writer};
+pub use node::{EventSink, NodeDb, WriterHandle, spawn_firehose, spawn_writer};
 pub use registry::{RegistryStats, SearchHit, ShardRegistry};
 pub use relay::RelayState;
