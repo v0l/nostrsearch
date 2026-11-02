@@ -15,6 +15,7 @@ pub mod registry;
 pub mod relay;
 pub mod reports;
 pub mod scraper;
+pub mod strfry;
 pub mod submit;
 
 pub use archive::ArchiveState;

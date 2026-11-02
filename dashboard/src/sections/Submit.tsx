@@ -2,7 +2,7 @@ import { useRef, useState } from "preact/hooks";
 import { ApiError, NO_SIGNER, api, hasSigner, type Submission } from "../api";
 import { Bars, Chip, Panel, bytes, num, useNotify } from "../ui";
 
-const ACCEPT = ".jsonl,.jsonl.zst,.jsonl.gz,.jsonl.bz2";
+const ACCEPT = ".jsonl,.jsonl.zst,.jsonl.gz,.jsonl.bz2,.mdb,.mdb.zst,.mdb.gz";
 
 function Counts({ s }: { s: Submission }) {
   const rows: [string, number][] = [
@@ -10,6 +10,7 @@ function Counts({ s }: { s: Submission }) {
     ["duplicate", s.duplicate],
     ["bad signature", s.bad_signature],
     ["malformed", s.malformed],
+    ["undecodable", s.undecodable],
     ["ephemeral", s.ephemeral],
     ["future", s.future],
   ];
@@ -81,7 +82,7 @@ export function Submit() {
     <Panel
       id="submit"
       label="Submit a dump"
-      note="Send a relay export or personal backup (.jsonl, .jsonl.zst, .jsonl.gz, .jsonl.bz2). Every event's signature is checked and only events we do not have are added. You sign the upload with your nostr key."
+      note="Send a relay export or personal backup (.jsonl, .jsonl.zst, .jsonl.gz, .jsonl.bz2) or a strfry database (data.mdb, optionally .zst or .gz). Every event's signature is checked and only events we do not have are added. You sign the upload with your nostr key."
     >
       <div class="stack">
         <div class="row tight">

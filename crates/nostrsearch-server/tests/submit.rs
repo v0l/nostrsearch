@@ -282,3 +282,203 @@ async fn listing_is_scoped_to_the_caller_and_open_to_admins() -> anyhow::Result<
     assert_eq!(list(admin).await.len(), 1);
     Ok(())
 }
+
+const TABLE: &str = "rasgueadb_defaultDb__";
+
+fn fb_meta(version: u64, endianness: u64) -> Vec<u8> {
+    let mut b = vec![0u8; 48];
+    b[0..4].copy_from_slice(&16u32.to_le_bytes());
+    b[4..6].copy_from_slice(&10u16.to_le_bytes());
+    b[6..8].copy_from_slice(&32u16.to_le_bytes());
+    b[8..10].copy_from_slice(&8u16.to_le_bytes());
+    b[10..12].copy_from_slice(&16u16.to_le_bytes());
+    b[12..14].copy_from_slice(&24u16.to_le_bytes());
+    b[16..20].copy_from_slice(&12i32.to_le_bytes());
+    b[24..32].copy_from_slice(&version.to_le_bytes());
+    b[32..40].copy_from_slice(&endianness.to_le_bytes());
+    b
+}
+
+fn fb_dict(dict: &[u8]) -> Vec<u8> {
+    let mut b = vec![0u8; 20];
+    b[0..4].copy_from_slice(&12u32.to_le_bytes());
+    b[4..6].copy_from_slice(&6u16.to_le_bytes());
+    b[6..8].copy_from_slice(&8u16.to_le_bytes());
+    b[8..10].copy_from_slice(&4u16.to_le_bytes());
+    b[12..16].copy_from_slice(&8i32.to_le_bytes());
+    b[16..20].copy_from_slice(&4u32.to_le_bytes());
+    b.extend_from_slice(&(dict.len() as u32).to_le_bytes());
+    b.extend_from_slice(dict);
+    b
+}
+
+fn strfry_db(endianness: u64, version: u64, events: &[(String, Option<u32>)], dict: &[u8]) -> Vec<u8> {
+    use heed::types::Bytes;
+    use heed::{DatabaseFlags, EnvOpenOptions};
+    let dir = tempfile::tempdir().unwrap();
+    let env = unsafe {
+        EnvOpenOptions::new()
+            .map_size(256 << 20)
+            .max_dbs(64)
+            .open(dir.path())
+            .unwrap()
+    };
+    let wtxn = env.write_txn().unwrap();
+    env.create_databases_and_commit(wtxn, |opener, txn| -> Result<_, heed::Error> {
+        let open = |name: &str, txn: &mut heed::RwTxn| {
+            let full = format!("{TABLE}{name}");
+            opener
+                .database_options()
+                .types::<Bytes, Bytes>()
+                .flags(DatabaseFlags::INTEGER_KEY)
+                .name(&full)
+                .create(txn)
+        };
+        let meta = open("Meta", txn)?;
+        meta.put(txn, &1u64.to_ne_bytes(), &fb_meta(version, endianness))?;
+        let dicts = open("CompressionDictionary", txn)?;
+        dicts.put(txn, &7u64.to_ne_bytes(), &fb_dict(dict))?;
+        let payloads = open("EventPayload", txn)?;
+        let mut comp = zstd::bulk::Compressor::with_dictionary(3, dict).unwrap();
+        for (i, (json, dict_id)) in events.iter().enumerate() {
+            let mut v = Vec::new();
+            match dict_id {
+                None => {
+                    v.push(0);
+                    v.extend_from_slice(json.as_bytes());
+                }
+                Some(id) => {
+                    v.push(1);
+                    v.extend_from_slice(&id.to_ne_bytes());
+                    v.extend_from_slice(&comp.compress(json.as_bytes()).unwrap());
+                }
+            }
+            payloads.put(txn, &(i as u64 + 1).to_ne_bytes(), &v)?;
+        }
+        Ok(heed::CommitOrAbort::<(), ()>::Commit(()))
+    })
+    .unwrap();
+    env.prepare_for_closing().wait();
+    std::fs::read(dir.path().join("data.mdb")).unwrap()
+}
+
+const DICT: &[u8] = br#"{"id":"","pubkey":"","created_at":0,"kind":1,"tags":[],"content":"","sig":""}"#;
+
+async fn run(node: &Node, keys: &Keys, name: &str, body: Vec<u8>) -> serde_json::Value {
+    let r = submit(node, keys, name, body).await.unwrap();
+    assert_eq!(r.status(), 202);
+    let id = r.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    finished(node, keys, &id).await.unwrap()
+}
+
+#[tokio::test]
+async fn strfry_database_with_plain_and_compressed_payloads_is_ingested() -> anyhow::Result<()> {
+    let node = serve(1 << 30, 0, HashSet::new()).await?;
+    let keys = Keys::generate();
+    let mut events = vec![];
+    for i in 0..300 {
+        let text = format!("strfry note {i} {}", "padding ".repeat(i % 40));
+        let dict_id = (i % 2 == 0).then_some(7u32);
+        events.push((note(&keys, &text).await.as_json(), dict_id));
+    }
+    let tampered = note(&keys, "tampered").await;
+    let mut forged = serde_json::to_value(&tampered)?;
+    forged["content"] = "changed".into();
+    events.push((forged.to_string(), None));
+    events.push((note(&keys, "bad dict").await.as_json(), Some(99)));
+    let old = EventBuilder::text_note("2007 tweet")
+        .custom_created_at(Timestamp::from_secs(1_190_000_000))
+        .sign(&keys)
+        .await?;
+    events.push((old.as_json(), Some(7)));
+    let db = strfry_db(1, 3, &events, DICT);
+    assert_eq!(&db[16..20], &0xBEEFC0DEu32.to_le_bytes());
+
+    let v = run(&node, &keys, "data.mdb", db.clone()).await;
+    assert_eq!(v["state"], "done", "{v}");
+    assert_eq!(v["lines"], 303);
+    assert_eq!(v["valid"], 301);
+    assert_eq!(v["new"], 301);
+    assert_eq!(v["bad_signature"], 1);
+    assert_eq!(v["undecodable"], 1);
+
+    let zst = zstd::encode_all(&db[..], 3)?;
+    let v = run(&node, &keys, "x.mdb.zst", zst).await;
+    assert_eq!(v["state"], "done", "{v}");
+    assert_eq!(v["valid"], 301);
+    assert_eq!(v["new"], 0);
+    assert_eq!(v["duplicate"], 301);
+
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gz.write_all(&db)?;
+    let v = run(&node, &keys, "x.mdb.gz", gz.finish()?).await;
+    assert_eq!(v["state"], "done", "{v}");
+    assert_eq!(v["duplicate"], 301);
+
+    let v = run(&node, &keys, "renamed.jsonl", db).await;
+    assert_eq!(v["state"], "done", "{v}");
+    assert_eq!(v["duplicate"], 301, "magic number, not the name, decides: {v}");
+
+    let r = reqwest::get(format!("{}/event/{}", node.base, old.id.to_hex())).await?;
+    let mut ok = r.status() == 200;
+    for _ in 0..40 {
+        if ok {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        ok = reqwest::get(format!("{}/event/{}", node.base, old.id.to_hex()))
+            .await?
+            .status()
+            == 200;
+    }
+    assert!(ok, "old compressed event should be fetchable");
+    Ok(())
+}
+
+#[tokio::test]
+async fn strfry_database_with_foreign_endianness_or_version_is_refused() -> anyhow::Result<()> {
+    let node = serve(1 << 30, 0, HashSet::new()).await?;
+    let keys = Keys::generate();
+    let ev = vec![(note(&keys, "x").await.as_json(), None)];
+    for (endianness, version) in [(0u64, 3u64), (1, 2), (1, 4)] {
+        let name = format!("e{endianness}v{version}.mdb");
+        let v = run(&node, &keys, &name, strfry_db(endianness, version, &ev, DICT)).await;
+        assert_eq!(v["state"], "failed", "{endianness}/{version}: {v}");
+        assert_eq!(v["new"], 0);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn corrupt_strfry_database_fails_cleanly() -> anyhow::Result<()> {
+    let node = serve(1 << 30, 0, HashSet::new()).await?;
+    let keys = Keys::generate();
+    let mut events = vec![];
+    for i in 0..200 {
+        events.push((note(&keys, &format!("c{i}")).await.as_json(), None));
+    }
+    let db = strfry_db(1, 3, &events, DICT);
+
+    let truncated = db[..db.len() / 2].to_vec();
+    let v = run(&node, &keys, "truncated.mdb", truncated).await;
+    assert_eq!(v["state"], "failed", "{v}");
+
+    let mut garbage = db.clone();
+    for b in garbage[8192..].iter_mut() {
+        *b = 0xA5;
+    }
+    let v = run(&node, &keys, "garbage.mdb", garbage).await;
+    assert_eq!(v["state"], "failed", "{v}");
+
+    let mut header_only = db[..4096].to_vec();
+    header_only.resize(4096 * 3, 0);
+    let v = run(&node, &keys, "header.mdb", header_only).await;
+    assert_eq!(v["state"], "failed", "{v}");
+
+    let ok = run(&node, &keys, "ok.jsonl", dump(&[note(&keys, "still alive").await.as_json()])).await;
+    assert_eq!(ok["state"], "done", "{ok}");
+    Ok(())
+}

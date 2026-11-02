@@ -213,6 +213,7 @@ Bun.serve({
         events: 21_400_000,
         new: 900_000,
         malformed: 4,
+        undecodable: 0,
         current: "combined.jsonl",
         current_progress: {
           name: "combined.jsonl",

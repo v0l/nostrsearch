@@ -23,7 +23,15 @@ use tokio::io::AsyncWriteExt;
 const MAX_LINE_BYTES: u64 = 1 << 20;
 const FUTURE_SLACK_SECS: u64 = 86_400;
 const DAY_SECS: u64 = 86_400;
-const FORMATS: [&str; 4] = [".jsonl", ".jsonl.zst", ".jsonl.gz", ".jsonl.bz2"];
+const FORMATS: [&str; 7] = [
+    ".jsonl",
+    ".jsonl.zst",
+    ".jsonl.gz",
+    ".jsonl.bz2",
+    ".mdb",
+    ".mdb.zst",
+    ".mdb.gz",
+];
 
 pub struct SubmitConfig {
     pub dir: PathBuf,
@@ -67,6 +75,7 @@ impl SubmitConfig {
 struct Counts {
     lines: AtomicU64,
     malformed: AtomicU64,
+    undecodable: AtomicU64,
     bad_signature: AtomicU64,
     ephemeral: AtomicU64,
     future: AtomicU64,
@@ -107,6 +116,7 @@ pub struct JobView {
     lines: u64,
     valid: u64,
     malformed: u64,
+    undecodable: u64,
     bad_signature: u64,
     ephemeral: u64,
     future: u64,
@@ -140,6 +150,7 @@ impl Job {
             lines: g(&c.lines),
             valid: g(&c.valid),
             malformed: g(&c.malformed),
+            undecodable: g(&c.undecodable),
             bad_signature: g(&c.bad_signature),
             ephemeral: g(&c.ephemeral),
             future: g(&c.future),
@@ -322,7 +333,7 @@ async fn upload(
     if !FORMATS.iter().any(|f| lower.ends_with(f)) {
         return fail(
             StatusCode::BAD_REQUEST,
-            "name must end in .jsonl, .jsonl.zst, .jsonl.gz or .jsonl.bz2",
+            "name must end in .jsonl, .jsonl.zst, .jsonl.gz, .jsonl.bz2, .mdb, .mdb.zst or .mdb.gz",
         );
     }
 
@@ -471,6 +482,9 @@ fn process(
     rt: &tokio::runtime::Handle,
 ) -> anyhow::Result<()> {
     let mut reader = BufReader::with_capacity(1 << 20, open_decoded(path)?);
+    if crate::strfry::has_lmdb_magic(reader.fill_buf()?) {
+        return process_lmdb(st, job, path, reader, rt);
+    }
     let c = &job.counts;
     let mut buf = Vec::new();
     loop {
@@ -491,44 +505,129 @@ fn process(
             continue;
         }
         c.lines.fetch_add(1, Ordering::Relaxed);
-        let Ok(ev) = serde_json::from_slice::<Event>(line) else {
-            c.malformed.fetch_add(1, Ordering::Relaxed);
-            continue;
-        };
-        if ev.verify().is_err() {
-            c.bad_signature.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
-        if ev.kind.is_ephemeral() {
-            c.ephemeral.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
-        if ev.created_at.as_secs() > nip98::unix_now() + FUTURE_SLACK_SECS {
-            c.future.fetch_add(1, Ordering::Relaxed);
-            continue;
-        }
-        c.valid.fetch_add(1, Ordering::Relaxed);
+        ingest_line(st, job, line, rt)?;
+    }
+    Ok(())
+}
 
-        if st
-            .dedupe
-            .as_ref()
-            .is_some_and(|d| d.contains(&ev.id.to_bytes()))
-        {
-            c.duplicate.fetch_add(1, Ordering::Relaxed);
-            continue;
+fn is_compressed(path: &std::path::Path) -> bool {
+    let name = path.to_string_lossy();
+    name.ends_with(".zst") || name.ends_with(".gz") || name.ends_with(".bz2")
+}
+
+fn unpack_to_disk(
+    st: &SubmitState,
+    mut reader: impl Read,
+    dest: &std::path::Path,
+) -> anyhow::Result<()> {
+    use std::io::Write;
+    let cap = st.cfg.max_bytes.saturating_mul(4);
+    let mut out = std::fs::File::create(dest)?;
+    let mut buf = vec![0u8; 1 << 20];
+    let mut total = 0u64;
+    let mut since_check = 0u64;
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
         }
-        match rt.block_on(st.db.save_event(&ev)) {
-            Ok(SaveEventStatus::Success) => {
-                rt.block_on(st.sink.send(to_core(&ev)));
-                c.new.fetch_add(1, Ordering::Relaxed);
+        total += n as u64;
+        since_check += n as u64;
+        if total > cap {
+            anyhow::bail!("decompressed database exceeds the size limit");
+        }
+        if since_check >= 64 << 20 {
+            since_check = 0;
+            if free_bytes(&st.cfg.dir).unwrap_or(0) < st.cfg.min_free_bytes {
+                anyhow::bail!("disk free space floor reached while unpacking");
             }
-            Ok(_) => {
-                c.duplicate.fetch_add(1, Ordering::Relaxed);
+        }
+        out.write_all(&buf[..n])?;
+    }
+    Ok(())
+}
+
+fn process_lmdb(
+    st: &SubmitState,
+    job: &Job,
+    path: &std::path::Path,
+    reader: impl Read,
+    rt: &tokio::runtime::Handle,
+) -> anyhow::Result<()> {
+    let unpacked = path.with_extension("unpacked.mdb");
+    let db_path = if is_compressed(path) {
+        let res = unpack_to_disk(st, reader, &unpacked);
+        if let Err(e) = res {
+            let _ = std::fs::remove_file(&unpacked);
+            return Err(e);
+        }
+        unpacked.as_path()
+    } else {
+        drop(reader);
+        path
+    };
+    let c = &job.counts;
+    let result = (|| {
+        let db = crate::strfry::Lmdb::open(db_path)?;
+        db.for_each_event(MAX_LINE_BYTES as usize, |payload| {
+            c.lines.fetch_add(1, Ordering::Relaxed);
+            match payload {
+                crate::strfry::Payload::Json(json) => ingest_line(st, job, json.trim_ascii(), rt),
+                crate::strfry::Payload::Undecodable => {
+                    c.undecodable.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                }
             }
-            Err(e) => {
-                tracing::warn!(error = %e, "archive save failed during submission");
-                return Err(anyhow::anyhow!("archive save failed: {e}"));
-            }
+        })
+    })();
+    let _ = std::fs::remove_file(&unpacked);
+    result
+}
+
+fn ingest_line(
+    st: &SubmitState,
+    job: &Job,
+    line: &[u8],
+    rt: &tokio::runtime::Handle,
+) -> anyhow::Result<()> {
+    let c = &job.counts;
+    let Ok(ev) = serde_json::from_slice::<Event>(line) else {
+        c.malformed.fetch_add(1, Ordering::Relaxed);
+        return Ok(());
+    };
+    if ev.verify().is_err() {
+        c.bad_signature.fetch_add(1, Ordering::Relaxed);
+        return Ok(());
+    }
+    if ev.kind.is_ephemeral() {
+        c.ephemeral.fetch_add(1, Ordering::Relaxed);
+        return Ok(());
+    }
+    if ev.created_at.as_secs() > nip98::unix_now() + FUTURE_SLACK_SECS {
+        c.future.fetch_add(1, Ordering::Relaxed);
+        return Ok(());
+    }
+    c.valid.fetch_add(1, Ordering::Relaxed);
+
+    if st
+        .dedupe
+        .as_ref()
+        .is_some_and(|d| d.contains(&ev.id.to_bytes()))
+    {
+        c.duplicate.fetch_add(1, Ordering::Relaxed);
+        return Ok(());
+    }
+    match rt.block_on(st.db.save_event(&ev)) {
+        Ok(SaveEventStatus::Success) => {
+            rt.block_on(st.sink.send(to_core(&ev)));
+            c.new.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(_) => {
+            c.duplicate.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "archive save failed during submission");
+            return Err(anyhow::anyhow!("archive save failed: {e}"));
         }
     }
     Ok(())

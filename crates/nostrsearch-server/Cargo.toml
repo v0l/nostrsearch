@@ -41,4 +41,5 @@ libc = "0.2"
 
 [dev-dependencies]
 tempfile = "3"
+heed = "0.23"
 reqwest = { workspace = true, features = ["json"] }

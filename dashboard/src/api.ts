@@ -158,6 +158,7 @@ export interface Submission {
   lines: number;
   valid: number;
   malformed: number;
+  undecodable: number;
   bad_signature: number;
   ephemeral: number;
   future: number;
