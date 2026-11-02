@@ -29,6 +29,18 @@ pub enum ShardError {
     Io(#[from] std::io::Error),
     #[error("open directory: {0}")]
     OpenDirectory(#[from] tantivy::directory::error::OpenDirectoryError),
+    #[error("created_at {0} is in the future")]
+    FutureTimestamp(u64),
+}
+
+pub const MAX_FUTURE_SKEW_SECS: u64 = 86_400;
+
+fn is_future(ts: u64) -> bool {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    ts > now.saturating_add(MAX_FUTURE_SKEW_SECS)
 }
 
 /// Tunables for a shard writer.
@@ -309,6 +321,9 @@ impl ShardManager {
 
     /// Index one event.
     pub fn index_event(&self, ev: &NostrEvent) -> Result<ShardId, ShardError> {
+        if is_future(ev.created_at) {
+            return Err(ShardError::FutureTimestamp(ev.created_at));
+        }
         let wot = self.wot_lookup.as_ref().map(|f| f(&ev.pubkey)).unwrap_or(0);
 
         // Language is detected here, not in the schema, because it is a
@@ -471,6 +486,28 @@ mod tests {
         // shard dirs exist on disk
         assert!(dir.path().join(s1.name()).exists());
         assert!(dir.path().join(s2.name()).exists());
+    }
+
+    #[test]
+    fn millisecond_created_at_is_rejected_without_opening_a_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = ShardManager::new(dir.path(), ShardWriterConfig::default());
+        let millis = 1_700_000_000_000u64;
+        assert!(matches!(
+            mgr.index_event(&ev(millis, "x")),
+            Err(ShardError::FutureTimestamp(_))
+        ));
+        assert_eq!(mgr.open_shard_count(), 0);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn old_backdated_events_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = ShardManager::new(dir.path(), ShardWriterConfig::default());
+        let tweet_2006 = 1_142_899_200u64;
+        assert_eq!(mgr.index_event(&ev(tweet_2006, "x")).unwrap(), ShardId::new(2006, 3));
+        assert_eq!(mgr.index_event(&ev(0, "y")).unwrap(), ShardId::new(1970, 1));
     }
 
     #[test]
