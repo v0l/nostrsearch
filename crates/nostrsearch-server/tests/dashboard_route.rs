@@ -72,7 +72,7 @@ async fn console_is_served_on_the_root_path_and_by_name() -> anyhow::Result<()> 
     let base = serve(true).await?;
     let http = reqwest::Client::new();
 
-    for path in ["/", "/dashboard", "/dashboard/"] {
+    for path in ["/", "/dashboard", "/dashboard/", "/upload"] {
         let r = http.get(format!("{base}{path}")).send().await?;
         assert_eq!(r.status(), 200, "{path} should serve the console");
         assert!(

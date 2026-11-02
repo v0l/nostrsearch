@@ -988,3 +988,55 @@ body.page .readout .v.mute {
   border: 1px solid var(--rule); border-radius: 3px; overflow: hidden; }
 .hbar > span { display: block; height: 100%; background: var(--patina);
   transition: width .4s ease; }
+
+/* ------------------------------------------------------------ upload page -- */
+
+.upload-page {
+  max-width: 920px;
+  margin: 0 auto;
+  padding: 36px 20px 60px;
+  display: flex;
+  flex-direction: column;
+  gap: 44px;
+}
+
+.upload-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+}
+
+.upload-head .wordmark {
+  text-decoration: none;
+  color: inherit;
+}
+
+.lede {
+  font-size: 14px;
+  line-height: 1.6;
+  max-width: 72ch;
+  margin: 0 0 8px;
+}
+
+.upload-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 8px 32px;
+  margin-bottom: 22px;
+}
+
+ul.plain {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--slate);
+  line-height: 1.6;
+}
+
+ul.plain code {
+  color: var(--ink);
+}
+
+.upload-form {
+  border-top: 1px solid var(--rule-strong);
+  padding-top: 18px;
+}

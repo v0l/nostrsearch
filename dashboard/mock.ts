@@ -133,6 +133,15 @@ Bun.serve({
       return new Response(r.body, { status: r.status, headers: r.headers });
     }
 
+    if (p === "/submit/limits")
+      return json({
+        max_bytes: 20e9,
+        daily_bytes: 40e9,
+        max_concurrent: 2,
+        accepting: true,
+        formats: [".jsonl", ".jsonl.zst", ".jsonl.gz", ".jsonl.bz2", ".mdb", ".mdb.zst", ".mdb.gz"],
+      });
+
     if (p === "/stats")
       return json({
         total_docs: 812_449_301,

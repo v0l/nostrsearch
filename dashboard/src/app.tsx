@@ -6,7 +6,7 @@ import type { RegistryStats, SyncStatus } from "./types";
 import { Analyses } from "./sections/Analyses";
 import { Corpus } from "./sections/Corpus";
 import { Ingest } from "./sections/Ingest";
-import { Submit } from "./sections/Submit";
+import { UploadPage } from "./sections/Submit";
 import { IndexPanel } from "./sections/IndexPanel";
 import { Relays } from "./sections/Relays";
 import { Reports } from "./sections/Reports";
@@ -17,6 +17,7 @@ const SECTIONS = [
   { id: "today", label: "Today" },
   { id: "reports", label: "Reports" },
   { id: "corpus", label: "Corpus" },
+  { id: "submit", label: "Submit a dump" },
   { id: "ingest", label: "Replay" },
   { id: "analyses", label: "Analyses" },
   { id: "relays", label: "Relays" },
@@ -202,7 +203,14 @@ function Console() {
         <Today reports={reports} />
         <Reports reports={reports} />
         <Corpus stats={stats.data} />
-        <Submit />
+        <section id="submit" class="panel">
+          <div class="plate">
+            <span>Submit a dump</span>
+          </div>
+          <p class="panel-note">
+            Have a relay export, a personal backup or a strfry database? <a href="/upload">Send it to the archive</a>.
+          </p>
+        </section>
         {/* Operator controls, not public status: these panels are actions
             with a status readout attached, so they are hidden entirely rather
             than shown disabled. */}
@@ -222,9 +230,10 @@ function Console() {
 }
 
 export function App() {
+  const upload = window.location.pathname.replace(/\/+$/, "") === "/upload";
   return (
     <Toasts>
-      <Console />
+      {upload ? <UploadPage /> : <Console />}
     </Toasts>
   );
 }

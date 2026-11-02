@@ -120,6 +120,19 @@ async fn unauthenticated_upload_is_refused() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn limits_are_public_so_the_upload_page_can_show_them() -> anyhow::Result<()> {
+    let node = serve(12_345, 0, HashSet::new()).await?;
+    let r = reqwest::get(format!("{}/submit/limits", node.base)).await?;
+    assert_eq!(r.status(), 200);
+    let v: serde_json::Value = r.json().await?;
+    assert_eq!(v["max_bytes"], 12_345);
+    assert!(v["daily_bytes"].as_u64().is_some());
+    assert!(v["accepting"].as_bool().is_some());
+    assert!(v["formats"].as_array().is_some_and(|f| f.iter().any(|x| x == ".mdb")));
+    Ok(())
+}
+
+#[tokio::test]
 async fn oversized_upload_is_refused() -> anyhow::Result<()> {
     let node = serve(100, 0, HashSet::new()).await?;
     let keys = Keys::generate();

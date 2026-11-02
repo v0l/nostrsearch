@@ -266,6 +266,7 @@ fn fail(code: StatusCode, msg: &str) -> Response {
 pub fn router(state: SubmitState) -> Router {
     Router::new()
         .route("/submit", get(list).post(upload))
+        .route("/submit/limits", get(limits))
         .route("/submit/{id}", get(status))
         .with_state(state)
 }
@@ -304,6 +305,18 @@ async fn list(
         .map(|j| j.view())
         .collect();
     Json(views).into_response()
+}
+
+async fn limits(State(st): State<SubmitState>) -> Response {
+    let free = free_bytes(&st.cfg.dir).unwrap_or(0);
+    Json(serde_json::json!({
+        "max_bytes": st.cfg.max_bytes,
+        "daily_bytes": st.cfg.daily_bytes_per_pubkey,
+        "max_concurrent": st.cfg.max_concurrent,
+        "accepting": free >= st.cfg.min_free_bytes,
+        "formats": FORMATS,
+    }))
+    .into_response()
 }
 
 async fn status(State(st): State<SubmitState>, Path(id): Path<String>) -> Response {

@@ -45,4 +45,5 @@ pub fn routes() -> Router {
     Router::new()
         .route("/dashboard", get(page))
         .route("/dashboard/", get(page))
+        .route("/upload", get(page))
 }

@@ -146,6 +146,14 @@ async function signed<T>(path: string, method: "GET" | "POST" = "GET"): Promise<
   return unwrap<T>(res);
 }
 
+export interface SubmitLimits {
+  max_bytes: number;
+  daily_bytes: number;
+  max_concurrent: number;
+  accepting: boolean;
+  formats: string[];
+}
+
 export interface Submission {
   id: string;
   pubkey: string;
@@ -199,6 +207,7 @@ export const api = {
   uploadDump,
   submission: (id: string) => open<Submission>(`/submit/${encodeURIComponent(id)}`),
   submissions: () => signed<Submission[]>("/submit"),
+  submitLimits: () => open<SubmitLimits>("/submit/limits"),
   stats: () => open<RegistryStats>("/stats"),
   // No trailing slashes: axum's nest("/sync", …) with a "/" child matches the
   // prefix exactly, and 404s on "/sync/".
