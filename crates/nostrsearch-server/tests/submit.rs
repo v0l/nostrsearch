@@ -570,6 +570,44 @@ async fn a_real_strfry_database_uploaded_compressed_is_ingested_in_full() -> any
 }
 
 #[tokio::test]
+#[ignore]
+async fn a_large_real_strfry_database_is_ingested_in_full() -> anyhow::Result<()> {
+    let path = std::env::var("STRFRY_DB").expect("STRFRY_DB points at a data.mdb");
+    let expected: usize = std::env::var("STRFRY_EVENTS").expect("STRFRY_EVENTS").parse()?;
+    let node = serve(u64::MAX / 2, 0, HashSet::new()).await?;
+    let keys = Keys::generate();
+    let url = format!("{}/submit?name=data.mdb", node.base);
+    let file = tokio::fs::File::open(&path).await?;
+    let r = reqwest::Client::new()
+        .post(&url)
+        .header("authorization", nip98(&keys, &url, "POST").await?)
+        .body(reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file)))
+        .send()
+        .await?;
+    assert_eq!(r.status(), 202);
+    let id = r.json::<serde_json::Value>().await?["id"].as_str().unwrap().to_string();
+    let status_url = format!("{}/submit/{id}", node.base);
+    let v = loop {
+        let v: serde_json::Value = reqwest::get(&status_url).await?.json().await?;
+        if v["state"] == "done" || v["state"] == "failed" {
+            break v;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    };
+    assert_eq!(v["state"], "done", "{v}");
+    assert_eq!(v["lines"].as_u64().unwrap() as usize, expected, "{v}");
+    assert_eq!(v["undecodable"], 0, "{v}");
+    assert_eq!(v["malformed"], 0, "{v}");
+    let accounted = ["new", "duplicate", "bad_signature", "ephemeral", "future"]
+        .iter()
+        .map(|k| v[*k].as_u64().unwrap_or(0))
+        .sum::<u64>();
+    assert_eq!(accounted as usize, expected, "{v}");
+    eprintln!("{v}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn shutting_the_node_down_mid_processing_exits_cleanly() -> anyhow::Result<()> {
     let node = serve(1 << 30, 0, HashSet::new()).await?;
     let keys = Keys::generate();
