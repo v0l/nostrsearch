@@ -12,11 +12,25 @@ struct Node {
     base: String,
     writer: Option<nostrsearch_server::WriterHandle>,
     server: tokio::task::JoinHandle<()>,
-    _root: tempfile::TempDir,
+    submit: SubmitState,
+    _root: Arc<tempfile::TempDir>,
+}
+
+type Tweak = Box<dyn FnOnce(&mut SubmitConfig)>;
+
+impl Node {
+    async fn restart(self, tweak: Tweak) -> anyhow::Result<Node> {
+        let root = self._root.clone();
+        self.submit.stop_and_wait().await;
+        drop(self);
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        serve_at(root, 0, None, HashSet::new(), None, tweak).await
+    }
 }
 
 impl Drop for Node {
     fn drop(&mut self) {
+        self.submit.stop();
         self.server.abort();
         if let Some(writer) = self.writer.take() {
             std::thread::spawn(move || {
@@ -50,7 +64,25 @@ async fn serve_deduped(
     admins: HashSet<PublicKey>,
     dedupe: Option<Arc<nostrsearch_indexer::id_store::IdStore>>,
 ) -> anyhow::Result<Node> {
-    let root = tempfile::tempdir()?;
+    serve_at(
+        Arc::new(tempfile::tempdir()?),
+        min_free,
+        free_space,
+        admins,
+        dedupe,
+        Box::new(|_| {}),
+    )
+    .await
+}
+
+async fn serve_at(
+    root: Arc<tempfile::TempDir>,
+    min_free: u64,
+    free_space: Option<Arc<dyn Fn() -> u64 + Send + Sync>>,
+    admins: HashSet<PublicKey>,
+    dedupe: Option<Arc<nostrsearch_indexer::id_store::IdStore>>,
+    tweak: Tweak,
+) -> anyhow::Result<Node> {
     let archive_dir = root.path().join("archive");
     std::fs::create_dir_all(&archive_dir)?;
     let archive = ArchiveState::open_with_index(&archive_dir)?;
@@ -72,17 +104,21 @@ async fn serve_deduped(
         1_000,
         std::time::Duration::from_millis(200),
     )?;
-    let cfg = SubmitConfig {
+    let mut cfg = SubmitConfig {
         dir: root.path().join("submissions"),
         max_concurrent: 2,
+        process_concurrency: 1,
         min_free_bytes: min_free,
+        batch_lines: 4096,
+        batch_pause: std::time::Duration::ZERO,
         free_space,
         origin: None,
         admins,
     };
+    tweak(&mut cfg);
     let submit = SubmitState::new(cfg, (*db).clone(), sink, dedupe);
     let app = nostrsearch_server::http::router_full(state, Some(archive), None)
-        .merge(nostrsearch_server::submit::router(submit));
+        .merge(nostrsearch_server::submit::router(submit.clone()));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let server = tokio::spawn(async move {
@@ -92,6 +128,7 @@ async fn serve_deduped(
         base: format!("http://{addr}"),
         writer: Some(handle),
         server,
+        submit,
         _root: root,
     })
 }
@@ -164,9 +201,10 @@ async fn limits_are_public_so_the_upload_page_can_show_them() -> anyhow::Result<
     assert!(v.get("max_bytes").is_none());
     assert!(v.get("daily_bytes").is_none());
     assert!(v["size_limit"].is_null());
-    assert!(v["disk_note"].as_str().is_some_and(|n| n.contains(".mdb")));
+    assert!(v["disk_note"].as_str().is_some_and(|n| n.contains("stored on disk")));
     assert!(v["resume_note"].as_str().is_some_and(|n| n.contains("again")));
-    assert!(v["streamed_formats"].as_array().is_some_and(|f| f.iter().any(|x| x == ".jsonl.zst")));
+    assert!(v["acceptable_bytes"].as_u64().is_some());
+    assert!(v["queued_jobs"].as_u64().is_some());
     assert!(v["accepting"].as_bool().is_some());
     assert!(v["formats"].as_array().is_some_and(|f| f.iter().any(|x| x == ".mdb")));
     Ok(())
@@ -708,58 +746,190 @@ async fn upload_beyond_the_old_size_cap_is_accepted() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn stored_files(node: &Node) -> Vec<String> {
+    std::fs::read_dir(node._root.path().join("submissions"))
+        .map(|d| {
+            d.flatten()
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| n.ends_with(".upload") || n.ends_with(".mdb") || n.ends_with(".part"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn slow(lines: usize, pause_ms: u64) -> Tweak {
+    Box::new(move |c| {
+        c.batch_lines = lines;
+        c.batch_pause = std::time::Duration::from_millis(pause_ms);
+    })
+}
+
+async fn serve_slow(lines: usize, pause_ms: u64) -> anyhow::Result<Node> {
+    serve_at(
+        Arc::new(tempfile::tempdir()?),
+        0,
+        None,
+        HashSet::new(),
+        None,
+        slow(lines, pause_ms),
+    )
+    .await
+}
+
+async fn post_id(node: &Node, keys: &Keys, name: &str, body: Vec<u8>) -> anyhow::Result<String> {
+    let r = submit(node, keys, name, body).await?;
+    assert_eq!(r.status(), 202);
+    Ok(r.json::<serde_json::Value>().await?["id"].as_str().unwrap().to_string())
+}
+
+async fn state_of(node: &Node, id: &str) -> serde_json::Value {
+    reqwest::get(format!("{}/submit/{id}", node.base)).await.unwrap().json().await.unwrap()
+}
+
 #[tokio::test]
-async fn jsonl_is_ingested_while_it_streams_without_staging_on_disk() -> anyhow::Result<()> {
-    let node = serve(1 << 30, 0, HashSet::new()).await?;
+async fn upload_returns_before_processing_finishes() -> anyhow::Result<()> {
+    let node = serve_slow(10, 200).await?;
     let keys = Keys::generate();
-    let (tx, body) = live_body();
-    let post = start_post(&node, &keys, "live.jsonl.zst", body);
-    let first = lines_of(&keys, "first", 30).await;
-    let mut enc = zstd::stream::write::Encoder::new(Vec::new(), 1)?;
-    enc.write_all(&first)?;
-    enc.flush()?;
-    let part = std::mem::take(enc.get_mut());
-    tx.send(Ok(part)).await?;
-
-    let live = wait_for_job(&node, &keys, "30 events before upload ends", |j| j["new"] == 30).await;
-    assert_ne!(live["state"], "done", "{live}");
-    let staged = std::fs::read_dir(node._root.path().join("submissions"))
-        .map(|d| d.count())
-        .unwrap_or(0);
-    assert_eq!(staged, 0, "nothing may be staged in SUBMIT_DIR");
-
-    let second = lines_of(&keys, "second", 20).await;
-    enc.write_all(&second)?;
-    let tail = enc.finish()?;
-    tx.send(Ok(tail)).await?;
-    drop(tx);
-    post.await?;
-    let done = wait_for_job(&node, &keys, "done", |j| j["state"] == "done").await;
-    assert_eq!(done["new"], 50, "{done}");
+    let id = post_id(&node, &keys, "slow.jsonl", lines_of(&keys, "slow", 100).await).await?;
+    let v = state_of(&node, &id).await;
+    assert!(v["state"] == "queued" || v["state"] == "processing", "{v}");
+    assert!(v["new"].as_u64().unwrap() < 100, "{v}");
+    assert_eq!(stored_files(&node).len(), 1, "the upload is kept on disk until processed");
+    let v = finished(&node, &keys, &id).await?;
+    assert_eq!(v["state"], "done", "{v}");
+    assert_eq!(v["new"], 100, "{v}");
     Ok(())
 }
 
 #[tokio::test]
-async fn dropped_connection_keeps_ingested_events_and_ends_interrupted() -> anyhow::Result<()> {
+async fn processing_job_reports_percent_of_bytes_read() -> anyhow::Result<()> {
+    let node = serve_slow(10, 200).await?;
+    let keys = Keys::generate();
+    let id = post_id(&node, &keys, "slow.jsonl", lines_of(&keys, "pct", 100).await).await?;
+    let mut seen = false;
+    for _ in 0..100 {
+        let v = state_of(&node, &id).await;
+        if v["state"] == "processing" && v["percent"].as_f64().unwrap() > 0.0 {
+            seen = true;
+            assert!(v["bytes_read"].as_u64().unwrap() > 0, "{v}");
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(seen, "never saw live progress");
+    let v = finished(&node, &keys, &id).await?;
+    assert_eq!(v["percent"], 100.0, "{v}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn restart_mid_processing_resumes_from_the_saved_offset_without_re_adding() -> anyhow::Result<()> {
+    let node = serve_slow(10, 150).await?;
+    let keys = Keys::generate();
+    let id = post_id(&node, &keys, "resume.jsonl", lines_of(&keys, "resume", 120).await).await?;
+    for _ in 0..200 {
+        let v = state_of(&node, &id).await;
+        if v["new"].as_u64().unwrap() >= 30 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let node = node.restart(slow(10, 0)).await?;
+    let before = state_of(&node, &id).await;
+    assert!(before["state"] == "queued" || before["state"] == "processing" || before["state"] == "done", "{before}");
+    let new_before = before["new"].as_u64().unwrap();
+    assert!(new_before >= 30 && new_before <= 120, "{before}");
+    let v = finished(&node, &keys, &id).await?;
+    assert_eq!(v["state"], "done", "{v}");
+    assert_eq!(v["new"], 120, "{v}");
+    assert_eq!(v["duplicate"], 0, "resume must skip what was already ingested: {v}");
+    assert_eq!(v["lines"], 120, "{v}");
+    assert!(stored_files(&node).is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn restart_resumes_a_strfry_database_without_re_adding() -> anyhow::Result<()> {
+    let node = serve_slow(10, 150).await?;
+    let keys = Keys::generate();
+    let mut events = vec![];
+    for i in 0..100 {
+        events.push((note(&keys, &format!("mdb resume {i}")).await.as_json(), None));
+    }
+    let id = post_id(&node, &keys, "data.mdb", strfry_db(1, 3, &events, DICT)).await?;
+    for _ in 0..200 {
+        if state_of(&node, &id).await["new"].as_u64().unwrap() >= 20 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let node = node.restart(slow(10, 0)).await?;
+    let v = finished(&node, &keys, &id).await?;
+    assert_eq!(v["state"], "done", "{v}");
+    assert_eq!(v["new"], 100, "{v}");
+    assert_eq!(v["duplicate"], 0, "{v}");
+    assert!(stored_files(&node).is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn completed_job_deletes_its_stored_file() -> anyhow::Result<()> {
+    let node = serve(1 << 30, 0, HashSet::new()).await?;
+    let keys = Keys::generate();
+    let id = post_id(&node, &keys, "a.jsonl.zst", zstd::encode_all(&lines_of(&keys, "del", 20).await[..], 3)?).await?;
+    let v = finished(&node, &keys, &id).await?;
+    assert_eq!(v["state"], "done", "{v}");
+    assert!(stored_files(&node).is_empty(), "{:?}", stored_files(&node));
+    Ok(())
+}
+
+#[tokio::test]
+async fn upload_is_stored_compressed_as_sent() -> anyhow::Result<()> {
+    let node = serve_slow(5, 400).await?;
+    let keys = Keys::generate();
+    let body = zstd::encode_all(&lines_of(&keys, "raw", 60).await[..], 3)?;
+    let id = post_id(&node, &keys, "a.jsonl.zst", body.clone()).await?;
+    let stored = stored_files(&node);
+    assert_eq!(stored.len(), 1, "{stored:?}");
+    let path = node._root.path().join("submissions").join(&stored[0]);
+    assert_eq!(std::fs::read(path)?, body);
+    let _ = id;
+    Ok(())
+}
+
+#[tokio::test]
+async fn upload_that_would_cross_the_floor_is_refused_by_declared_size() -> anyhow::Result<()> {
+    let node = serve_with(5_000, Some(Arc::new(|| 10_000)), HashSet::new()).await?;
+    let keys = Keys::generate();
+    let r = submit(&node, &keys, "big.jsonl", vec![b' '; 6_000]).await?;
+    assert_eq!(r.status(), 507);
+    assert!(stored_files(&node).is_empty());
+    let limits: serde_json::Value = reqwest::get(format!("{}/submit/limits", node.base)).await?.json().await?;
+    assert_eq!(limits["acceptable_bytes"], 5_000);
+    let r = submit(&node, &keys, "ok.jsonl", lines_of(&keys, "fits", 5).await).await?;
+    assert_eq!(r.status(), 202);
+    Ok(())
+}
+
+#[tokio::test]
+async fn dropped_connection_discards_the_partial_upload_and_ends_interrupted() -> anyhow::Result<()> {
     let node = serve(1 << 30, 0, HashSet::new()).await?;
     let keys = Keys::generate();
     let (tx, body) = live_body();
     let post = start_post(&node, &keys, "cut.jsonl", body);
-    let mut chunk = lines_of(&keys, "kept", 25).await;
-    chunk.extend_from_slice(b"{\"id\":\"half a li");
-    tx.send(Ok(chunk)).await?;
-    wait_for_job(&node, &keys, "25 events", |j| j["new"] == 25).await;
+    tx.send(Ok(lines_of(&keys, "kept", 25).await)).await?;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     tx.send(Err(std::io::Error::other("connection reset"))).await?;
     drop(tx);
     post.await?;
     let v = wait_for_job(&node, &keys, "interrupted", |j| j["state"] == "interrupted").await;
-    assert_eq!(v["new"], 25, "{v}");
-    assert_eq!(v["malformed"], 0, "a cut line is not counted: {v}");
+    assert_eq!(v["new"], 0, "{v}");
+    assert!(stored_files(&node).is_empty());
     Ok(())
 }
 
 #[tokio::test]
-async fn free_space_floor_stops_a_stream_midway_and_keeps_what_was_ingested() -> anyhow::Result<()> {
+async fn free_space_floor_stops_an_upload_midway_and_discards_it() -> anyhow::Result<()> {
     let free = Arc::new(std::sync::atomic::AtomicU64::new(10_000));
     let f2 = free.clone();
     let node = serve_with(
@@ -772,31 +942,17 @@ async fn free_space_floor_stops_a_stream_midway_and_keeps_what_was_ingested() ->
     let (tx, body) = live_body();
     let post = start_post(&node, &keys, "floor.jsonl", body);
     tx.send(Ok(lines_of(&keys, "before", 10).await)).await?;
-    wait_for_job(&node, &keys, "10 events", |j| j["new"] == 10).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     free.store(100, std::sync::atomic::Ordering::SeqCst);
     tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
     let _ = tx.send(Ok(lines_of(&keys, "after", 10).await)).await;
     drop(tx);
     post.await?;
     let v = wait_for_job(&node, &keys, "failed", |j| j["state"] == "failed").await;
-    assert_eq!(v["new"], 10, "{v}");
     assert!(v["error"].as_str().unwrap().contains("floor"), "{v}");
+    assert!(stored_files(&node).is_empty());
     Ok(())
 }
-
-#[tokio::test]
-async fn mdb_that_cannot_fit_on_disk_is_refused_but_jsonl_of_that_size_is_not() -> anyhow::Result<()> {
-    let node = serve_with(1_000, Some(Arc::new(|| 50_000)), HashSet::new()).await?;
-    let keys = Keys::generate();
-    let r = submit(&node, &keys, "big.mdb", vec![0u8; 49_500]).await?;
-    assert_eq!(r.status(), 507);
-    let body = lines_of(&keys, "j", 200).await;
-    assert!(body.len() > 49_000);
-    let r = submit(&node, &keys, "big.jsonl", body).await?;
-    assert_eq!(r.status(), 202);
-    Ok(())
-}
-
 
 fn signed_notes(n: usize) -> Vec<Event> {
     let keys = Keys::generate();

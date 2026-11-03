@@ -13,17 +13,16 @@ year like 55913. `ShardManager::index_event` rejects them.
 
 ## Submissions (/submit)
 
-No size or daily quota caps. jsonl uploads (`.jsonl`, `.zst`, `.gz`, `.bz2`)
-are decoded while the body arrives, through a bounded channel into a blocking
-parser, so nothing is staged in SUBMIT_DIR and a 700 GB upload costs only the
-new events it adds. `SUBMIT_MIN_FREE_BYTES` is a floor on free disk, checked
-about once a second while streaming; hitting it fails the job and keeps what
-was already ingested.
+No size or daily quota caps. Uploads (`.jsonl`, `.zst`, `.gz`, `.bz2`, `.mdb`
+and compressed `.mdb`) are written to SUBMIT_DIR exactly as sent, at network
+speed, and `/submit` returns 202 with a job id once the body is stored. A
+background worker (SUBMIT_PROCESS_CONCURRENCY, default 1) ingests queued
+files. Job state is persisted next to the file (`<id>.job.json`) with the line
+cursor, so a restart resumes after the last flushed batch instead of starting
+over. The stored file is deleted when the job ends.
 
-`.mdb` uploads need random access and are written to SUBMIT_DIR first. They
-need a Content-Length and are admitted only when the declared size plus the
-floor fits in free space.
-
-A dropped connection ends the job as `interrupted` with its counts; events
-already ingested stay. Resuming means uploading the file again: duplicates are
-counted, not re-added.
+`SUBMIT_MIN_FREE_BYTES` is a floor on free disk. An upload is refused when its
+declared size plus the floor does not fit, and stopped (file discarded) if free
+space drops below the floor while it arrives. `/submit/limits` reports
+`acceptable_bytes`. A dropped upload connection ends the job as `interrupted`
+and discards the partial file; upload again, duplicates are counted not re-added.

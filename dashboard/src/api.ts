@@ -151,9 +151,11 @@ export interface SubmitLimits {
   accepting: boolean;
   min_free_bytes: number;
   free_bytes: number;
+  acceptable_bytes: number;
+  queued_jobs: number;
+  queued_bytes: number;
+  process_concurrency: number;
   formats: string[];
-  streamed_formats: string[];
-  disk_formats: string[];
   disk_note: string;
   resume_note: string;
 }
@@ -162,11 +164,13 @@ export interface Submission {
   id: string;
   pubkey: string;
   name: string;
-  state: "uploading" | "processing" | "done" | "failed" | "interrupted";
+  state: "uploading" | "queued" | "processing" | "done" | "failed" | "interrupted";
   error: string | null;
   started_at: number;
   finished_at: number;
   bytes: number;
+  bytes_read: number;
+  percent: number;
   lines: number;
   valid: number;
   malformed: number;

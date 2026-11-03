@@ -29,6 +29,7 @@ function Counts({ s }: { s: Submission }) {
         <Chip tone={s.state === "done" ? "ok" : s.state === "failed" || s.state === "interrupted" ? "bad" : "warn"} dot={s.state === "processing"}>
           {s.state}
         </Chip>
+        <Chip tone="mute">{s.state === "queued" ? "waiting in queue" : `${Math.floor(s.percent)}% read`}</Chip>
         <Chip tone="mute">{num(s.lines)} lines</Chip>
         <Chip tone="mute">{num(s.valid)} valid</Chip>
       </div>
@@ -79,7 +80,7 @@ export function Submit({ onDone }: { onDone?: () => void }) {
     setSent({ sent: 0, total: file.size });
     try {
       const { id } = await api.uploadDump(file, (s, t) => setSent({ sent: s, total: t }));
-      notify("ok", "Upload received. Checking signatures and indexing.");
+      notify("ok", "Upload received and queued. It is processed in the background.");
       await follow(id);
     } catch (e) {
       notify("err", e instanceof ApiError || e instanceof Error ? e.message : String(e));
@@ -135,6 +136,7 @@ function History({ reload }: { reload: number }) {
           <tr>
             <th>File</th>
             <th>State</th>
+            <th class="num">Progress</th>
             <th class="num">Size</th>
             <th class="num">Events</th>
             <th class="num">New</th>
@@ -149,6 +151,7 @@ function History({ reload }: { reload: number }) {
               <td>
                 <Chip tone={s.state === "done" ? "ok" : s.state === "failed" || s.state === "interrupted" ? "bad" : "warn"}>{s.state}</Chip>
               </td>
+              <td class="num">{s.state === "processing" || s.state === "done" ? `${Math.floor(s.percent)}%` : "-"}</td>
               <td class="num">{bytes(s.bytes)}</td>
               <td class="num">{num(s.lines)}</td>
               <td class="num">{num(s.new)}</td>
@@ -224,7 +227,8 @@ export function UploadPage() {
                 imports.
               </li>
               <li>
-                JSON lines files are processed while they upload and are never stored. Only the valid events are kept.
+                The file is stored as you send it, then checked and indexed in a background queue. The stored copy is
+                deleted when it is done, and only the valid events are kept.
               </li>
               <li>You sign the upload with your nostr key, so each submission is tied to a pubkey.</li>
             </ul>
@@ -232,14 +236,17 @@ export function UploadPage() {
               <>
                 <h3 class="subhead">Limits</h3>
                 <ul class="plain">
-                  <li>No size limit on JSON lines files, however large.</li>
+                  <li>No size limit, as long as it fits above the free space floor.</li>
                   <li>{limits.disk_note}</li>
                   <li>{limits.resume_note}</li>
                   <li>
                     Uploads stop if free disk space drops below {gb(limits.min_free_bytes)}. {gb(limits.free_bytes)} is
-                    free now.
+                    free now, so up to {gb(limits.acceptable_bytes)} can be accepted.
                   </li>
-                  <li>{limits.max_concurrent} uploads at a time across everyone.</li>
+                  <li>
+                    Queue: {limits.queued_jobs} waiting or processing, {gb(limits.queued_bytes)} stored.
+                  </li>
+                  <li>{limits.max_concurrent} uploads at a time, {limits.process_concurrency} processed at a time.</li>
                 </ul>
               </>
             ) : null}

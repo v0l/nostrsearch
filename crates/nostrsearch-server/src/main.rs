@@ -332,6 +332,7 @@ async fn run() -> anyhow::Result<()> {
         scrape_state,
         admin,
     );
+    let submit_handle = submit.clone();
     let app = match submit {
         Some(s) => app.merge(nostrsearch_server::submit::router(s)),
         None => app,
@@ -351,6 +352,11 @@ async fn run() -> anyhow::Result<()> {
         streams.close_streams();
     })
     .await?;
+
+    if let Some(s) = submit_handle {
+        tracing::info!("pausing submission processing");
+        s.stop_and_wait().await;
+    }
 
     // Flush the index before exiting, otherwise everything since the last
     // commit interval is lost from the search index on every deploy.
