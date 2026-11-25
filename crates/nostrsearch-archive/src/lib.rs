@@ -369,7 +369,7 @@ async fn index(State(st): State<ArchiveState>) -> Result<Html<String>, Response>
     // says "0" when the answer is "not measurable here" is a lie -- so it says
     // where the number went instead.
     let events = match total_events {
-        Some(n) => format!("<div class=\"v\">{n}</div>"),
+        Some(n) => format!("<div class=\"v\">{}</div>", theme::format_int(n)),
         None => "<div class=\"v mute\">not indexed here</div>".to_string(),
     };
 
@@ -415,7 +415,7 @@ async fn index(State(st): State<ArchiveState>) -> Result<Html<String>, Response>
 </main>
 </body></html>"#,
         head = theme::head("nostr event archive", "/archive/style.css"),
-        files_n = files.len(),
+        files_n = theme::format_int(files.len() as u64),
         total = theme::human_size(total_size),
         events = events,
         rows = rows,
