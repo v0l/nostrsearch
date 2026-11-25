@@ -61,16 +61,40 @@ async fn stylesheet() -> impl IntoResponse {
 
 /// Bytes as a human-readable size.
 ///
-/// Archive shards run from a few MiB to tens of GiB, and a listing that prints
-/// every one of them in GiB is a column of `0.00`.
+/// The unit is picked by magnitude (MiB, GiB, TiB, PiB), so a 1,488 GiB corpus
+/// reads as `1.45 TiB` rather than a four-digit GiB. Precision follows the
+/// value: 2 decimals under 10, 1 under 100, none above. A thin space separates
+/// number and unit so the unit never reads as a bigger number.
 pub fn human_size(bytes: u64) -> String {
     const MIB: f64 = 1024.0 * 1024.0;
     let mib = bytes as f64 / MIB;
-    if mib >= 1024.0 {
-        format!("{:.2} GiB", mib / 1024.0)
+    let (value, unit) = if mib >= 1024.0 * 1024.0 * 1024.0 {
+        (mib / (1024.0 * 1024.0 * 1024.0), "PiB")
+    } else if mib >= 1024.0 * 1024.0 {
+        (mib / (1024.0 * 1024.0), "TiB")
+    } else if mib >= 1024.0 {
+        (mib / 1024.0, "GiB")
     } else {
-        format!("{mib:.1} MiB")
+        (mib, "MiB")
+    };
+    let decimals = if value < 10.0 { 2 } else if value < 100.0 { 1 } else { 0 };
+    format!("{value:.prec$}\u{2009}{unit}", prec = decimals)
+}
+
+/// An integer with thousands separators, `en-US` style: `1,332,983,500`.
+///
+/// Fixed locale so the server-rendered pages and the browser's
+/// `Intl.NumberFormat("en-US")` agree, with no hydration flicker.
+pub fn format_int(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
     }
+    out
 }
 
 #[cfg(test)]
@@ -78,15 +102,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sizes_switch_unit_at_a_gibibyte() {
-        assert_eq!(human_size(0), "0.0 MiB");
-        assert_eq!(human_size(1024 * 1024), "1.0 MiB");
-        assert_eq!(human_size(1024 * 1024 * 1023), "1023.0 MiB");
-        assert_eq!(human_size(1024 * 1024 * 1024), "1.00 GiB");
+    fn sizes_pick_unit_by_magnitude() {
+        assert_eq!(human_size(0), "0.00\u{2009}MiB");
+        assert_eq!(human_size(1024 * 1024), "1.00\u{2009}MiB");
+        assert_eq!(human_size(1024 * 1024 * 1023), "1023\u{2009}MiB");
+        assert_eq!(human_size(1024 * 1024 * 1024), "1.00\u{2009}GiB");
         assert_eq!(
             human_size(3 * 1024 * 1024 * 1024 + 512 * 1024 * 1024),
-            "3.50 GiB"
+            "3.50\u{2009}GiB"
         );
+        // 1488.35 GiB reads as 1.45 TiB, not a four-digit GiB.
+        let gib = 1488.35_f64 * 1024.0 * 1024.0 * 1024.0;
+        assert_eq!(human_size(gib as u64), "1.45\u{2009}TiB");
+    }
+
+    #[test]
+    fn size_precision_follows_magnitude() {
+        // 2 decimals under 10, 1 under 100, none above.
+        assert_eq!(
+            human_size((9.996_f64 * 1024.0 * 1024.0 * 1024.0) as u64),
+            "10.00\u{2009}GiB"
+        );
+        assert_eq!(
+            human_size((15.45_f64 * 1024.0 * 1024.0 * 1024.0) as u64),
+            "15.4\u{2009}GiB"
+        );
+        // 1023.9 MiB stays in MiB (below 1 GiB) and rounds to 1024.
+        assert_eq!(
+            human_size((1023.9_f64 * 1024.0 * 1024.0) as u64),
+            "1024\u{2009}MiB"
+        );
+    }
+
+    #[test]
+    fn integers_get_thousands_separators() {
+        assert_eq!(format_int(0), "0");
+        assert_eq!(format_int(1), "1");
+        assert_eq!(format_int(999), "999");
+        assert_eq!(format_int(1000), "1,000");
+        assert_eq!(format_int(1332983500), "1,332,983,500");
     }
 
     /// The whole point of `include_str!` here: if the console's tokens stop
