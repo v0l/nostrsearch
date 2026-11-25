@@ -343,11 +343,15 @@ async fn serve_file(
 async fn index(State(st): State<ArchiveState>) -> Result<Html<String>, Response> {
     let mut files = list(&st).await?;
     files.sort_by_key(|f| std::cmp::Reverse(f.timestamp));
-
     let total_size: u64 = files.iter().map(|f| f.size).sum();
     // Only known when this process holds the index (i.e. relay mode).
     let total_events = st.event_count();
+    Ok(Html(render_index(&files, total_size, total_events)))
+}
 
+/// The archive page body, from the file listing and totals. Pure, so the
+/// formatting it applies is testable without a live index.
+fn render_index(files: &[ArchiveFileInfo], total_size: u64, total_events: Option<u64>) -> String {
     let rows = if files.is_empty() {
         "<li class=\"empty\">no archive files yet</li>".to_string()
     } else {
@@ -373,7 +377,7 @@ async fn index(State(st): State<ArchiveState>) -> Result<Html<String>, Response>
         None => "<div class=\"v mute\">not indexed here</div>".to_string(),
     };
 
-    Ok(Html(format!(
+    format!(
         r#"<!doctype html>
 <html lang="en"><head>{head}
 <style>
@@ -419,12 +423,15 @@ async fn index(State(st): State<ArchiveState>) -> Result<Html<String>, Response>
         total = theme::human_size(total_size),
         events = events,
         rows = rows,
-    )))
+    )
 }
 
 #[cfg(test)]
 mod listing_tests {
     use super::is_archive_dump;
+    use super::render_index;
+    use super::ArchiveFileInfo;
+    use std::io::Write;
 
     #[test]
     fn publishes_dumps_whatever_they_are_named() {
@@ -455,5 +462,32 @@ mod listing_tests {
         ] {
             assert!(!is_archive_dump(name), "would have published {name}");
         }
+    }
+
+    #[test]
+    fn the_index_page_formats_counts_and_sizes() {
+        let gib = 1024.0 * 1024.0 * 1024.0;
+        let a = (8.70 * gib) as u64;
+        let b = (15.45 * gib) as u64;
+        let c = (1488.35 * gib) as u64 - a - b;
+        let files = vec![
+            ArchiveFileInfo { name: "events_2024-01.jsonl.zst".into(), size: a, timestamp: 1 },
+            ArchiveFileInfo { name: "events_2024-02.jsonl.zst".into(), size: b, timestamp: 2 },
+            ArchiveFileInfo { name: "combined.jsonl".into(), size: c, timestamp: 3 },
+        ];
+        let total = a + b + c;
+        let html = render_index(&files, total, Some(1_332_983_500));
+        assert!(html.contains("1,332,983,500"), "event count unformatted: {html}");
+        assert!(html.contains("1.45\u{2009}TiB"), "total size unformatted: {html}");
+        assert!(html.contains("8.70\u{2009}GiB"), "file size unformatted: {html}");
+        assert!(html.contains("15.4\u{2009}GiB"), "file size unformatted: {html}");
+        assert!(html.contains(">3<"), "file count unformatted: {html}");
+        let shot = html.replace(
+            "<link rel=\"stylesheet\" href=\"/archive/style.css\">",
+            &format!("<style>{}</style>", super::theme::CONSOLE_CSS),
+        );
+        let out = std::env::temp_dir().join("nsarchive-index.html");
+        let mut f = std::fs::File::create(&out).unwrap();
+        f.write_all(shot.as_bytes()).unwrap();
     }
 }
