@@ -59,32 +59,28 @@ async fn stylesheet() -> impl IntoResponse {
     )
 }
 
-/// Bytes as a human-readable size.
-///
-/// The unit is picked by magnitude (MiB, GiB, TiB, PiB), so a 1,488 GiB corpus
-/// reads as `1.45 TiB` rather than a four-digit GiB. Precision follows the
-/// value: 2 decimals under 10, 1 under 100, none above. A thin space separates
-/// number and unit so the unit never reads as a bigger number.
 pub fn human_size(bytes: u64) -> String {
     const MIB: f64 = 1024.0 * 1024.0;
-    let mib = bytes as f64 / MIB;
-    let (value, unit) = if mib >= 1024.0 * 1024.0 * 1024.0 {
-        (mib / (1024.0 * 1024.0 * 1024.0), "PiB")
-    } else if mib >= 1024.0 * 1024.0 {
-        (mib / (1024.0 * 1024.0), "TiB")
-    } else if mib >= 1024.0 {
-        (mib / 1024.0, "GiB")
-    } else {
-        (mib, "MiB")
-    };
-    let decimals = if value < 10.0 { 2 } else if value < 100.0 { 1 } else { 0 };
-    format!("{value:.prec$}\u{2009}{unit}", prec = decimals)
+    let units = ["MiB", "GiB", "TiB", "PiB"];
+    let mut value = bytes as f64 / MIB;
+    let mut unit = 0;
+    loop {
+        let decimals = if value < 10.0 { 2 } else if value < 100.0 { 1 } else { 0 };
+        let text = format!("{value:.decimals$}");
+        let rounded: f64 = text.parse().unwrap();
+        let wanted = if rounded < 10.0 { 2 } else if rounded < 100.0 { 1 } else { 0 };
+        if wanted != decimals {
+            return format!("{rounded:.wanted$}\u{2009}{}", units[unit]);
+        }
+        if rounded >= 1024.0 && unit + 1 < units.len() {
+            value = value / 1024.0;
+            unit += 1;
+            continue;
+        }
+        return format!("{text}\u{2009}{}", units[unit]);
+    }
 }
 
-/// An integer with thousands separators, `en-US` style: `1,332,983,500`.
-///
-/// Fixed locale so the server-rendered pages and the browser's
-/// `Intl.NumberFormat("en-US")` agree, with no hydration flicker.
 pub fn format_int(n: u64) -> String {
     let s = n.to_string();
     let mut out = String::with_capacity(s.len() + s.len() / 3);

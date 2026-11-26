@@ -349,8 +349,6 @@ async fn index(State(st): State<ArchiveState>) -> Result<Html<String>, Response>
     Ok(Html(render_index(&files, total_size, total_events)))
 }
 
-/// The archive page body, from the file listing and totals. Pure, so the
-/// formatting it applies is testable without a live index.
 fn render_index(files: &[ArchiveFileInfo], total_size: u64, total_events: Option<u64>) -> String {
     let rows = if files.is_empty() {
         "<li class=\"empty\">no archive files yet</li>".to_string()
