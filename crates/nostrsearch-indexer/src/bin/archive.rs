@@ -101,10 +101,7 @@ async fn main() -> anyhow::Result<()> {
         let total: u64 = files.iter().map(|f| f.size).sum();
         println!("archive dir : {}", dir.display());
         println!("files       : {}", files.len());
-        println!(
-            "total size  : {:.2} GiB",
-            total as f64 / 1024.0 / 1024.0 / 1024.0
-        );
+        println!("total size  : {}", nostrsearch_archive::theme::human_size(total));
         println!("indexed ids : {}", db.count_keys());
         println!("index empty : {}", db.is_index_empty());
     }
