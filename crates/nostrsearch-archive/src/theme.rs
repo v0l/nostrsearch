@@ -104,6 +104,7 @@ mod tests {
     #[test]
     fn sizes_pick_unit_by_magnitude() {
         assert_eq!(human_size(0), "0.00\u{2009}MiB");
+        assert_eq!(human_size(1), "0.00\u{2009}MiB");
         assert_eq!(human_size(1024 * 1024), "1.00\u{2009}MiB");
         assert_eq!(human_size(1024 * 1024 * 1023), "1023\u{2009}MiB");
         assert_eq!(human_size(1024 * 1024 * 1024), "1.00\u{2009}GiB");
@@ -111,27 +112,21 @@ mod tests {
             human_size(3 * 1024 * 1024 * 1024 + 512 * 1024 * 1024),
             "3.50\u{2009}GiB"
         );
-        // 1488.35 GiB reads as 1.45 TiB, not a four-digit GiB.
         let gib = 1488.35_f64 * 1024.0 * 1024.0 * 1024.0;
         assert_eq!(human_size(gib as u64), "1.45\u{2009}TiB");
     }
 
     #[test]
-    fn size_precision_follows_magnitude() {
-        // 2 decimals under 10, 1 under 100, none above.
-        assert_eq!(
-            human_size((9.996_f64 * 1024.0 * 1024.0 * 1024.0) as u64),
-            "10.00\u{2009}GiB"
-        );
-        assert_eq!(
-            human_size((15.45_f64 * 1024.0 * 1024.0 * 1024.0) as u64),
-            "15.4\u{2009}GiB"
-        );
-        // 1023.9 MiB stays in MiB (below 1 GiB) and rounds to 1024.
-        assert_eq!(
-            human_size((1023.9_f64 * 1024.0 * 1024.0) as u64),
-            "1024\u{2009}MiB"
-        );
+    fn sizes_round_before_picking_precision() {
+        let gib = |g: f64| (g * 1024.0 * 1024.0 * 1024.0) as u64;
+        let mib = |m: f64| (m * 1024.0 * 1024.0) as u64;
+        assert_eq!(human_size(mib(999.96)), "1000\u{2009}MiB");
+        assert_eq!(human_size(mib(1023.4)), "1023\u{2009}MiB");
+        assert_eq!(human_size(mib(1023.9)), "1.00\u{2009}GiB");
+        assert_eq!(human_size(gib(9.996)), "10.0\u{2009}GiB");
+        assert_eq!(human_size(gib(15.45)), "15.4\u{2009}GiB");
+        assert_eq!(human_size(gib(99.96)), "100\u{2009}GiB");
+        assert_eq!(human_size(gib(1023.96)), "1.00\u{2009}TiB");
     }
 
     #[test]
